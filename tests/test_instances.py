@@ -182,7 +182,7 @@ class InstanceCommandTests(unittest.TestCase):
                 )
                 app(["instance", "list"], result_action="return_value")
                 app(["instance", "show", "server"], result_action="return_value")
-                app(["instance", "delete", "server"], result_action="return_value")
+                app(["instance", "remove", "server"], result_action="return_value")
                 with self.assertRaises(SystemExit) as exit_error:
                     app(["instance", "show", "server"], result_action="return_value")
 
