@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from ._common import get_registry
+from ._support import get_registry
 
 
 def add(name: str, location: Path, *, set_default: bool = False) -> None:

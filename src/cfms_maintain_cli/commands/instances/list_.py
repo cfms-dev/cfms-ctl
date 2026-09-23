@@ -1,4 +1,4 @@
-from ._common import get_registry
+from ._support import get_registry
 
 
 def list_() -> None:
