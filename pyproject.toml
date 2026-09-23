@@ -1,0 +1,29 @@
+[project]
+name = "cfms-maintain-cli"
+version = "0.1.0"
+description = "A completely refactored CLI designed for CFMS server-side maintenance."
+readme = "README.md"
+authors = [
+    { name = "Creeper19472", email = "creeper19472@crpteam.club" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "cyclopts>=5.0.0b3,<6",
+]
+
+[project.scripts]
+cfms-maintain-cli = "cfms_maintain_cli:app"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.2",
+    "ruff>=0.16.8",
+]
+
+[tool.ruff]
+target-version = "py315"
+line-length = 88
