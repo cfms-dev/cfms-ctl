@@ -1,10 +1,17 @@
 from cyclopts import App
+from rich.console import Console
+from rich.traceback import install as install_rich_traceback
 
 from .commands.backups import backup_app
 from .commands.extensions import extension_app
 from .commands.instances import instance_app
 
-app = App()  # Root application for the CLI
+console = Console(stderr=True)
+app = App(console=console, error_console=console)  # Root application for the CLI
+
+# Install rich traceback handler using the error console
+install_rich_traceback(console=console)
+
 app.command(backup_app)
 app.command(instance_app)
 app.command(extension_app)

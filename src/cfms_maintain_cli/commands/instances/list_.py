@@ -1,11 +1,11 @@
-from ._common import get_registry, run
+from ._common import get_registry
 
 
 def list_() -> None:
     """List registered instances and mark the default."""
     registry = get_registry()
-    instances = run(registry.list)
-    default_name = run(registry.default_name)
+    instances = registry.list()
+    default_name = registry.default_name()
     if not instances:
         print("No instances registered.")
         return

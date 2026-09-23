@@ -27,6 +27,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cyclopts" },
     { name = "platformdirs" },
+    { name = "rich" },
     { name = "tomlkit" },
 ]
 
@@ -41,6 +42,7 @@ dev = [
 requires-dist = [
     { name = "cyclopts", specifier = ">=5.0.0b3,<6" },
     { name = "platformdirs", specifier = ">=4.11.12" },
+    { name = "rich", specifier = ">=15.0.0" },
     { name = "tomlkit", specifier = ">=0.15.1" },
 ]
 
