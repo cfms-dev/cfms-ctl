@@ -1,6 +1,6 @@
 [package]
 name = "cfms-ctl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Standalone, high-performance, multi-database maintenance CLI for CFMS servers."
 license = "Apache-2.0"

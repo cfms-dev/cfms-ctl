@@ -51,3 +51,12 @@ cargo test
 cargo clippy --all-targets
 cargo audit
 ```
+
+## Changelog & Release Workflow
+
+- `CHANGELOG.md` follows Keep a Changelog and is managed by `git-cliff` via `cliff.toml`.
+- Preserve historical manually curated entries (such as `0.1.0`) by prepending new releases below `<!-- git-cliff: end of header -->` instead of overwriting the entire file:
+  ```powershell
+  git-cliff -u --bump --prepend CHANGELOG.md
+  ```
+- Releases are built and published by `cargo-dist` (`.github/workflows/release.yml`), which extracts release notes for the tagged version from `CHANGELOG.md`. Verify with `dist generate --check` and `dist plan --output-format=json` when updating release files.
