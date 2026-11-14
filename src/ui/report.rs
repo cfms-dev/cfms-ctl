@@ -1,7 +1,6 @@
 //! Dual-mode output renderer (`Human` vs `Json`) and table formatting helpers.
 
 use clap::ValueEnum;
-use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, Color, ContentArrangement, Table};
 use console::style;
@@ -129,8 +128,7 @@ impl KeyValueTable {
         println!("\n{}", style(&self.title).bold().underlined());
         let mut table = Table::new();
         table
-            .load_preset(UTF8_FULL)
-            .apply_modifier(UTF8_ROUND_CORNERS)
+            .load_style(UTF8_FULL.with_rounded_corners())
             .set_content_arrangement(ContentArrangement::Dynamic);
         for (k, v) in &self.rows {
             table.add_row(vec![
@@ -147,8 +145,7 @@ impl KeyValueTable {
 pub fn styled_table(headers: &[&str]) -> Table {
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(
             headers

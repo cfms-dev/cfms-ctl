@@ -15,40 +15,40 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI & Terminal UI
-clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
-comfy-table = "7.1"
-console = "0.15"
-dialoguer = "0.11"
+clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
+comfy-table = "8.0"
+console = "0.16"
+dialoguer = "0.12"
 indicatif = "0.18"
 
 # Async Runtime & Multi-Database Backends (SQLite, MySQL, PostgreSQL)
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "process", "signal", "sync", "time"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "fs", "process", "signal", "sync", "time"] }
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "mysql", "postgres", "chrono", "uuid", "json"], git = "https://github.com/transact-rs/sqlx", branch = "release/0.9.1" }
-sea-query = { version = "0.32", features = ["backend-sqlite", "backend-mysql", "backend-postgres"] }
+sea-query = { version = "1.0", features = ["backend-sqlite", "backend-mysql", "backend-postgres"] }
 
 # Serialization & Lossless Config Editing
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
-toml_edit = "0.22"
+toml = "1.2"
+toml_edit = "0.25"
 
 # Cryptography, Hashing & Archives (for Backup/Deployment/User credentials)
-aes-gcm = "0.10"
-argon2 = { version = "0.5", features = ["std"] }
-base64 = "0.22"
+aes-gcm = "0.11"
+argon2 = "0.6"
+base64 = "0.23"
 hex = "0.4"
-rand = "0.8"
-sha2 = "0.10"
+rand = "0.10"
+sha2 = "0.11"
 
 # System, File Locking, Time, Identifiers & Diagnostics
 chrono = { version = "0.4", features = ["serde"] }
-fs4 = "0.12"
+fs4 = "1.1"
 semver = { version = "1.0", features = ["serde"] }
-tempfile = "3.13"
+tempfile = "3.27"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1.11", features = ["v4", "serde"] }
+uuid = { version = "1.29", features = ["v4", "serde"] }
 
 [dev-dependencies]
-tempfile = "3.13"
+tempfile = "3.27"

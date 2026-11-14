@@ -1,7 +1,7 @@
 //! `cfms-ctl config`: Lossless `config.toml` template synchronization, `security.pepper`
 //! generation, and database-backed `options` CRUD with optimistic concurrency.
 
-use rand::RngCore;
+use rand::Rng;
 use serde::Serialize;
 use toml_edit::{Item, Table, value};
 use crate::cli::config::{
@@ -67,7 +67,7 @@ fn handle_fill_pepper(ctx: &AppContext) -> Result<()> {
     }
 
     let mut random_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut random_bytes);
+    rand::rng().fill_bytes(&mut random_bytes);
     let pepper_hex = hex::encode(random_bytes);
 
     let root = doc.document_mut();

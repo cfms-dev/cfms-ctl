@@ -3,7 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use crate::core::error::{CfmsError, Result};
 use crate::core::paths::WorkspacePaths;
 
@@ -16,7 +16,7 @@ pub struct ServerLockGuard {
 
 impl Drop for ServerLockGuard {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -58,7 +58,7 @@ impl RuntimeLock {
         }
         file.seek(SeekFrom::Start(0))?;
 
-        file.try_lock_exclusive()
+        FileExt::try_lock(&file)
             .map_err(|_| CfmsError::RuntimeLocked(paths.server_root.clone()))?;
 
         let metadata = serde_json::json!({ "pid": std::process::id() }).to_string();
@@ -83,8 +83,8 @@ impl RuntimeLock {
         let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
             return false;
         };
-        if file.try_lock_exclusive().is_ok() {
-            let _ = file.unlock();
+        if FileExt::try_lock(&file).is_ok() {
+            let _ = FileExt::unlock(&file);
             false
         } else {
             true
