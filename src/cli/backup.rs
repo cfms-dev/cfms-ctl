@@ -1,20 +1,36 @@
 //! CLI arguments for `cfms-ctl backup`.
 
 use std::path::PathBuf;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
+
+/// Logical backup components supported by `cfms-ctl backup export`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, ValueEnum)]
+pub enum BackupComponentArg {
+    /// Users, credentials, groups, permissions, keyrings, userblocks, schedules, and account extensions.
+    Accounts,
+    /// Nodes, folders, documents, revisions, metadata, access entries, and compiled access rules.
+    Documents,
+    /// Audit log entries (`audit_entries`).
+    Audit,
+    /// IP/subnet bans (`banned_subnets`) and linked reason comments.
+    #[value(name = "banned_subnets", alias = "banned-subnets")]
+    BannedSubnets,
+    /// Database `options` and security secrets (`security.pepper`, `server.secret_key`).
+    Configuration,
+}
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum BackupCommand {
-    /// Export an encrypted CFMS logical backup archive (.confbak, Format v2).
+    /// Export an encrypted CFMS logical backup archive (.confbak).
     Export(BackupExportArgs),
 
-    /// Import an encrypted CFMS logical backup into an empty database.
+    /// Import an encrypted CFMS logical backup into an empty or blank database.
     Import(BackupImportArgs),
 
     /// Read and display unencrypted header metadata from a backup file.
     Info(BackupInfoArgs),
 
-    /// Decrypt and verify archive manifest and file SHA-256 digests without writing to the database.
+    /// Decrypt and verify archive manifest, table digests, and file SHA-256 digests without touching DB or storage.
     Verify(BackupVerifyArgs),
 }
 
@@ -28,8 +44,18 @@ pub struct BackupExportArgs {
     #[arg(long = "key-out", value_name = "FILE")]
     pub key_out: Option<PathBuf>,
 
+    /// Components to include (comma-separated; dependencies added automatically). Defaults to all.
+    #[arg(
+        long = "components",
+        value_enum,
+        value_delimiter = ',',
+        value_name = "LIST",
+        conflicts_with = "interactive"
+    )]
+    pub components: Vec<BackupComponentArg>,
+
     /// Run the interactive backup component and key export wizard.
-    #[arg(long = "interactive", short = 'i', conflicts_with_all = ["output_path", "key_out"])]
+    #[arg(long = "interactive", short = 'i', conflicts_with_all = ["output_path", "key_out", "components"])]
     pub interactive: bool,
 }
 

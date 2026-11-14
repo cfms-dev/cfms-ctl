@@ -26,8 +26,8 @@ use crate::db::schema::{
 
 const MAX_INSERT_ROWS_PER_BATCH: usize = 500;
 const MAX_BIND_PARAMS_PER_BATCH: usize = 9_500;
-const NODE_BATCH_SIZE: usize = 200;
-const DEFERRED_UPDATE_BATCH_SIZE: usize = 200;
+pub(crate) const NODE_BATCH_SIZE: usize = 200;
+pub(crate) const DEFERRED_UPDATE_BATCH_SIZE: usize = 200;
 
 /// Per-table verification summary during cross-backend or distinct-target cloning (`database migrate`).
 #[derive(Debug, Clone, Serialize)]
@@ -85,14 +85,15 @@ pub(crate) enum SqlValue {
 }
 
 #[derive(Debug, Clone)]
-struct TransferColumn {
-    name: String,
-    col_type: ColumnType,
-    is_generated: bool,
+pub(crate) struct TransferColumn {
+    pub(crate) name: String,
+    pub(crate) col_type: ColumnType,
+    pub(crate) is_generated: bool,
 }
 
 impl TransferColumn {
-    fn from_def(col: &ColumnDef) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn from_def(col: &ColumnDef) -> Self {
         Self {
             name: col.name.to_string(),
             col_type: col.col_type,
@@ -100,7 +101,7 @@ impl TransferColumn {
         }
     }
 
-    fn from_ir(col: &ColumnIr) -> Self {
+    pub(crate) fn from_ir(col: &ColumnIr) -> Self {
         Self {
             name: col.name.clone(),
             col_type: canonical_to_transfer_type(&col.canonical_type),
@@ -110,14 +111,14 @@ impl TransferColumn {
 }
 
 #[derive(Debug, Clone)]
-struct TransferTable {
-    name: String,
-    columns: Vec<TransferColumn>,
-    pk_columns: Vec<String>,
+pub(crate) struct TransferTable {
+    pub(crate) name: String,
+    pub(crate) columns: Vec<TransferColumn>,
+    pub(crate) pk_columns: Vec<String>,
 }
 
 impl TransferTable {
-    fn from_ir(table: &TableIr) -> Self {
+    pub(crate) fn from_ir(table: &TableIr) -> Self {
         Self {
             name: table.name.clone(),
             columns: table.columns.iter().map(TransferColumn::from_ir).collect(),
@@ -125,12 +126,12 @@ impl TransferTable {
         }
     }
 
-    fn data_columns(&self) -> impl Iterator<Item = &TransferColumn> {
+    pub(crate) fn data_columns(&self) -> impl Iterator<Item = &TransferColumn> {
         self.columns.iter().filter(|c| !c.is_generated)
     }
 }
 
-fn canonical_to_transfer_type(ct: &CanonicalType) -> ColumnType {
+pub(crate) fn canonical_to_transfer_type(ct: &CanonicalType) -> ColumnType {
     match ct {
         CanonicalType::Varchar { length } => {
             ColumnType::Varchar(length.unwrap_or(255).min(u32::from(u16::MAX)) as u16)
@@ -163,7 +164,7 @@ fn canonical_to_transfer_type(ct: &CanonicalType) -> ColumnType {
     }
 }
 
-fn active_schema_subset(base: &SchemaIr, active_extensions: &[String]) -> SchemaIr {
+pub(crate) fn active_schema_subset(base: &SchemaIr, active_extensions: &[String]) -> SchemaIr {
     let ext_set: BTreeSet<&str> = active_extensions.iter().map(String::as_str).collect();
     let mut sub = SchemaIr::new(base.source, base.schema_revision.clone());
     for (name, table) in &base.tables {
@@ -397,7 +398,7 @@ async fn cleanup_target_schema(target: &DbPool) -> Result<()> {
     drop_all_cfms_tables(target, &existing).await
 }
 
-async fn validate_oidc_table(source: &DbPool) -> Result<()> {
+pub(crate) async fn validate_oidc_table(source: &DbPool) -> Result<()> {
     let sql = "SELECT id, issuer, subject, identity_digest FROM user_oidc_credentials";
     const VALIDATE_COLS: &[ColumnDef] = &[
         ColumnDef {
@@ -507,14 +508,14 @@ pub(crate) fn validate_oidc_binding(
     Ok(())
 }
 
-enum TargetTx<'c> {
+pub(crate) enum TargetTx<'c> {
     Sqlite(Transaction<'c, Sqlite>),
     Mysql(Transaction<'c, MySql>),
     Postgres(Transaction<'c, Postgres>),
 }
 
 impl TargetTx<'_> {
-    async fn begin(pool: &DbPool) -> Result<Self> {
+    pub(crate) async fn begin(pool: &DbPool) -> Result<Self> {
         match pool {
             DbPool::Sqlite(p) => Ok(Self::Sqlite(p.begin().await?)),
             DbPool::Mysql(p) => Ok(Self::Mysql(p.begin().await?)),
@@ -522,7 +523,7 @@ impl TargetTx<'_> {
         }
     }
 
-    async fn commit(self) -> Result<()> {
+    pub(crate) async fn commit(self) -> Result<()> {
         match self {
             Self::Sqlite(tx) => tx.commit().await?,
             Self::Mysql(tx) => tx.commit().await?,
@@ -671,35 +672,7 @@ async fn copy_node_tables(
         .map(|(i, _)| i)
         .collect();
 
-    // Prepend synthetic `migration_depth` column to decode alongside `nodes` data columns.
-    let mut cte_cols = Vec::with_capacity(1 + node_cols.len());
-    cte_cols.push(TransferColumn {
-        name: "migration_depth".to_string(),
-        col_type: ColumnType::BigInt,
-        is_generated: false,
-    });
-    cte_cols.extend(node_cols.iter().cloned());
-
-    let qualified_node_cols = node_cols
-        .iter()
-        .map(|c| format!("child.{}", quote_ident(source.kind(), &c.name)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let order_id_col = text_order_expr(source.kind(), "child.id");
-
-    let cte_sql = format!(
-        "WITH RECURSIVE migration_node_hierarchy (id, migration_depth) AS (\n\
-            SELECT id, 0 AS migration_depth FROM nodes WHERE parent_id IS NULL\n\
-            UNION ALL\n\
-            SELECT child.id, parent.migration_depth + 1 AS migration_depth \
-            FROM nodes child \
-            JOIN migration_node_hierarchy parent ON child.parent_id = parent.id\n\
-        )\n\
-        SELECT h.migration_depth, {qualified_node_cols} \
-        FROM migration_node_hierarchy h \
-        JOIN nodes child ON child.id = h.id \
-        ORDER BY h.migration_depth ASC, {order_id_col} ASC"
-    );
+    let (cte_cols, cte_sql) = build_node_hierarchy_cte_sql(source.kind(), &node_cols);
 
     let batch_limit = NODE_BATCH_SIZE.min(insert_batch_size(node_cols.len()));
     let mut current_depth: Option<i64> = None;
@@ -894,7 +867,7 @@ async fn restore_deferred_columns(
     Ok(())
 }
 
-async fn sync_target_sequences(target: &DbPool, serial_cols: &[(String, String)]) -> Result<()> {
+pub(crate) async fn sync_target_sequences(target: &DbPool, serial_cols: &[(String, String)]) -> Result<()> {
     let DbPool::Postgres(pg) = target else {
         return Ok(());
     };
@@ -1068,11 +1041,46 @@ pub(crate) fn write_canonical_json(val: &serde_json::Value, out: &mut String) ->
     Ok(())
 }
 
-fn insert_batch_size(col_count: usize) -> usize {
+pub(crate) fn build_node_hierarchy_cte_sql(
+    kind: DatabaseKind,
+    node_cols: &[TransferColumn],
+) -> (Vec<TransferColumn>, String) {
+    let mut cte_cols = Vec::with_capacity(1 + node_cols.len());
+    cte_cols.push(TransferColumn {
+        name: "migration_depth".to_string(),
+        col_type: ColumnType::BigInt,
+        is_generated: false,
+    });
+    cte_cols.extend(node_cols.iter().cloned());
+
+    let qualified_node_cols = node_cols
+        .iter()
+        .map(|c| format!("child.{}", quote_ident(kind, &c.name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order_id_col = text_order_expr(kind, "child.id");
+
+    let cte_sql = format!(
+        "WITH RECURSIVE migration_node_hierarchy (id, migration_depth) AS (\n\
+            SELECT id, 0 AS migration_depth FROM nodes WHERE parent_id IS NULL\n\
+            UNION ALL\n\
+            SELECT child.id, parent.migration_depth + 1 AS migration_depth \
+            FROM nodes child \
+            JOIN migration_node_hierarchy parent ON child.parent_id = parent.id\n\
+        )\n\
+        SELECT h.migration_depth, {qualified_node_cols} \
+        FROM migration_node_hierarchy h \
+        JOIN nodes child ON child.id = h.id \
+        ORDER BY h.migration_depth ASC, {order_id_col} ASC"
+    );
+    (cte_cols, cte_sql)
+}
+
+pub(crate) fn insert_batch_size(col_count: usize) -> usize {
     MAX_INSERT_ROWS_PER_BATCH.min((MAX_BIND_PARAMS_PER_BATCH / col_count.max(1)).max(1))
 }
 
-fn quote_ident(kind: DatabaseKind, ident: &str) -> String {
+pub(crate) fn quote_ident(kind: DatabaseKind, ident: &str) -> String {
     match kind {
         DatabaseKind::Mysql => format!("`{}`", ident.replace('`', "``")),
         DatabaseKind::Sqlite | DatabaseKind::Postgresql => {
@@ -1081,14 +1089,14 @@ fn quote_ident(kind: DatabaseKind, ident: &str) -> String {
     }
 }
 
-fn placeholder(kind: DatabaseKind, idx_1_based: usize) -> String {
+pub(crate) fn placeholder(kind: DatabaseKind, idx_1_based: usize) -> String {
     match kind {
         DatabaseKind::Postgresql => format!("${idx_1_based}"),
         DatabaseKind::Sqlite | DatabaseKind::Mysql => "?".to_string(),
     }
 }
 
-fn text_order_expr(kind: DatabaseKind, col_expr: &str) -> String {
+pub(crate) fn text_order_expr(kind: DatabaseKind, col_expr: &str) -> String {
     match kind {
         DatabaseKind::Sqlite => format!("{col_expr} COLLATE BINARY"),
         DatabaseKind::Mysql => format!("{col_expr} COLLATE utf8mb4_bin"),
@@ -1096,10 +1104,20 @@ fn text_order_expr(kind: DatabaseKind, col_expr: &str) -> String {
     }
 }
 
-fn build_select_sql(
+pub(crate) fn build_select_sql(
     kind: DatabaseKind,
     table: &TransferTable,
     columns: &[TransferColumn],
+    order_by_pk: bool,
+) -> String {
+    build_filtered_select_sql(kind, table, columns, None, order_by_pk)
+}
+
+pub(crate) fn build_filtered_select_sql(
+    kind: DatabaseKind,
+    table: &TransferTable,
+    columns: &[TransferColumn],
+    where_clause: Option<&str>,
     order_by_pk: bool,
 ) -> String {
     let col_list = columns
@@ -1108,6 +1126,10 @@ fn build_select_sql(
         .collect::<Vec<_>>()
         .join(", ");
     let mut sql = format!("SELECT {col_list} FROM {}", quote_ident(kind, &table.name));
+    if let Some(clause) = where_clause {
+        sql.push_str(" WHERE ");
+        sql.push_str(clause);
+    }
     if order_by_pk && !table.pk_columns.is_empty() {
         let mut order_terms = Vec::with_capacity(table.pk_columns.len());
         for pk_name in &table.pk_columns {
@@ -1134,7 +1156,7 @@ fn build_select_sql(
     sql
 }
 
-async fn count_table_rows(pool: &DbPool, table_name: &str) -> Result<u64> {
+pub(crate) async fn count_table_rows(pool: &DbPool, table_name: &str) -> Result<u64> {
     let sql = format!("SELECT COUNT(*) FROM {}", quote_ident(pool.kind(), table_name));
     let cnt: i64 = match pool {
         DbPool::Sqlite(p) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_one(p).await?,
@@ -1144,7 +1166,7 @@ async fn count_table_rows(pool: &DbPool, table_name: &str) -> Result<u64> {
     u64::try_from(cnt).map_err(|_| CfmsError::Database(format!("Negative row count: {cnt}")))
 }
 
-async fn fetch_rows_by_str_ids(
+pub(crate) async fn fetch_rows_by_str_ids(
     pool: &DbPool,
     table_name: &str,
     columns: &[TransferColumn],
@@ -1163,10 +1185,11 @@ async fn fetch_rows_by_str_ids(
         .map(|i| placeholder(kind, i))
         .collect::<Vec<_>>()
         .join(", ");
+    let id_col = quote_ident(kind, "id");
+    let order_id = text_order_expr(kind, &id_col);
     let sql = format!(
-        "SELECT {col_list} FROM {} WHERE {} IN ({placeholders})",
+        "SELECT {col_list} FROM {} WHERE {id_col} IN ({placeholders}) ORDER BY {order_id} ASC",
         quote_ident(kind, table_name),
-        quote_ident(kind, "id")
     );
 
     let out = match pool {
@@ -1204,7 +1227,7 @@ async fn fetch_rows_by_str_ids(
     Ok(out)
 }
 
-async fn stream_query<'a>(
+pub(crate) async fn stream_query<'a>(
     pool: &'a DbPool,
     sql: &str,
     columns: &'a [TransferColumn],
@@ -1361,7 +1384,7 @@ fn decode_opt_uuid_str(col_name: &str, opt: Option<String>) -> Result<SqlValue> 
     Ok(SqlValue::Uuid(*u.as_bytes()))
 }
 
-async fn insert_batch(
+pub(crate) async fn insert_batch(
     tx: &mut TargetTx<'_>,
     table_name: &str,
     columns: &[TransferColumn],
@@ -1431,7 +1454,7 @@ async fn insert_batch(
     Ok(())
 }
 
-async fn apply_deferred_update_batch(
+pub(crate) async fn apply_deferred_update_batch(
     tx: &mut TargetTx<'_>,
     table_name: &str,
     pk_col: &TransferColumn,

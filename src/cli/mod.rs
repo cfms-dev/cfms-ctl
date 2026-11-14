@@ -76,7 +76,7 @@ pub enum Commands {
     #[command(subcommand)]
     Database(database::DatabaseCommand),
 
-    /// Export, import, inspect, and verify encrypted CFMS logical backups (Format v2).
+    /// Export, import, inspect, and verify encrypted CFMS logical backups.
     #[command(subcommand)]
     Backup(backup::BackupCommand),
 

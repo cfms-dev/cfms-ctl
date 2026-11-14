@@ -20,7 +20,7 @@ mod tests {
     use std::io::Write;
     use clap::CommandFactory;
     use crate::cli::Cli;
-    use crate::ops::backup::{BACKUP_V2_MAGIC, read_backup_v2_header};
+    use crate::ops::backup::{BACKUP_MAGIC, read_backup_header};
 
     #[test]
     fn verify_cli_command_tree() {
@@ -28,15 +28,18 @@ mod tests {
     }
 
     #[test]
-    fn test_read_backup_v2_header_roundtrip() {
+    fn test_read_backup_header_roundtrip() {
         let mut temp = tempfile::NamedTempFile::new().expect("temp file");
         let header_json = serde_json::json!({
-            "format_version": 2,
+            "format_version": 1,
             "created_at": "2026-11-14T12:00:00Z",
             "server_version": "0.14.0",
             "schema_revision": "e952c02c1454",
-            "components": ["database", "files", "config"],
-            "cipher": "AES-256-GCM",
+            "components": ["accounts", "documents", "configuration"],
+            "cipher": "aes-256-gcm-hkdf-sha256-chunked-v1",
+            "compression": "zstd",
+            "container": "cfms-stream-v1",
+            "kdf": "hkdf-sha256",
             "future_metadata_field": "tolerated"
         });
         let header_bytes = serde_json::to_vec(&header_json).expect("serialize header");
@@ -44,16 +47,18 @@ mod tests {
             .expect("header len")
             .to_be_bytes();
 
-        temp.write_all(BACKUP_V2_MAGIC).expect("write magic");
+        temp.write_all(BACKUP_MAGIC).expect("write magic");
         temp.write_all(&len_be).expect("write len");
         temp.write_all(&header_bytes).expect("write header");
         temp.flush().expect("flush");
 
-        let parsed = read_backup_v2_header(temp.path()).expect("parse v2 header");
-        assert_eq!(parsed.format_version, 2);
+        let parsed = read_backup_header(temp.path()).expect("parse backup header");
+        assert_eq!(parsed.format_version, 1);
         assert_eq!(parsed.server_version, "0.14.0");
         assert_eq!(parsed.schema_revision, "e952c02c1454");
         assert_eq!(parsed.components.len(), 3);
+        assert_eq!(parsed.compression, "zstd");
+        assert_eq!(parsed.container, "cfms-stream-v1");
         assert!(parsed.extra.contains_key("future_metadata_field"));
     }
 }
