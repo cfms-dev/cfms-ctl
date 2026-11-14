@@ -1,4 +1,4 @@
-//! `cfms-ctl backup`: Streaming encrypted CFMS logical backup (`CFMSCBK1`) inspection,
+//! `cfms-ctl backup`: Streaming encrypted CFMS logical backup (`CFMSCBK2`) inspection,
 //! cryptographic verification, export, and transactional import.
 
 pub mod export;
@@ -331,10 +331,11 @@ secret_key = "{secret_key}"
 
         // Header inspection works without key
         let header = read_backup_header(&archive_path).unwrap();
-        assert_eq!(header.format_version, 1);
+        assert_eq!(header.content_type, "cfms-backup");
+        assert_eq!(header.version, 2);
         assert_eq!(header.server_version, "0.14.0-test");
         assert_eq!(header.compression, "zstd");
-        assert_eq!(header.container, "cfms-stream-v1");
+        assert_eq!(header.container, "cfms-stream-v2");
         assert_eq!(header.components.len(), 5);
 
         // No sibling temp files left behind
@@ -762,5 +763,283 @@ secret_key = "{secret_key}"
         assert!(matches!(key_err, CfmsError::Backup(_)));
         assert!(!out.exists());
         assert_eq!(fs::read_to_string(&existing_key).unwrap(), "DO NOT OVERWRITE\n");
+    }
+
+    #[tokio::test]
+    async fn info_verify_and_import_enforce_critical_headers_and_tolerate_non_critical() {
+        use std::collections::BTreeMap;
+        use std::io::{Cursor, Read, Write};
+        use sha2::{Digest, Sha256};
+        use zstd::stream::read::Decoder as ZstdDecoder;
+        use zstd::stream::write::Encoder as ZstdEncoder;
+        use crate::ops::backup::format::{
+            BACKUP_MAGIC, ChunkedDecryptReader, ChunkedEncryptWriter, DEFAULT_CHUNK_SIZE,
+            EnvelopeHeaderSpec, read_envelope_and_hash, read_key_from_args,
+        };
+        use crate::ops::backup::stream::MsgPackMetaValue;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src_ws = create_test_workspace(
+            &tmp.path().join("src_ws"),
+            "src.db",
+            "local",
+            "pepper-crit",
+            "secret-crit",
+        );
+        let pool = open_sqlite_pool(&src_ws).await;
+        create_head_schema(&pool, false).await.unwrap();
+        set_alembic_version(&pool, LATEST_SCHEMA_REVISION)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let base_archive = tmp.path().join("base.confbak");
+        let key_path = tmp.path().join("base.key");
+        export::run_export(
+            &test_ctx(&src_ws),
+            BackupExportArgs {
+                output_path: Some(base_archive.clone()),
+                key_out: Some(key_path.clone()),
+                components: vec![],
+                interactive: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let base_wire = fs::read(&base_archive).unwrap();
+        let master_key = read_key_from_args(None, Some(&key_path)).unwrap();
+        let mut cursor = Cursor::new(&base_wire);
+        let (orig_env, orig_sha256) =
+            read_envelope_and_hash(&mut cursor, "base", base_wire.len() as u64).unwrap();
+        let dec = ChunkedDecryptReader::new(cursor, &master_key, &orig_env, orig_sha256).unwrap();
+        let mut z_dec = ZstdDecoder::new(dec).unwrap();
+        let mut base_stream = Vec::new();
+        z_dec.read_to_end(&mut base_stream).unwrap();
+
+        type EnvMutator = dyn Fn(&mut serde_json::Map<String, serde_json::Value>);
+        type ManifestMutator = dyn Fn(&mut Vec<(String, MsgPackMetaValue)>);
+
+        let rewrite_archive =
+            |out_path: &PathBuf, mutate_env: &EnvMutator, mutate_manifest: &ManifestMutator| {
+                let old_len = u32::from_le_bytes([
+                    base_stream[1],
+                    base_stream[2],
+                    base_stream[3],
+                    base_stream[4],
+                ]) as usize;
+                let manifest_map: BTreeMap<String, MsgPackMetaValue> =
+                    rmp_serde::from_slice(&base_stream[5..5 + old_len]).unwrap();
+                let mut entries: Vec<(String, MsgPackMetaValue)> =
+                    manifest_map.into_iter().collect();
+                mutate_manifest(&mut entries);
+
+                let mut new_manifest_payload = Vec::new();
+                if entries.len() <= 15 {
+                    new_manifest_payload.push(0x80 | (entries.len() as u8));
+                } else {
+                    new_manifest_payload.push(0xde);
+                    new_manifest_payload.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+                }
+                for (k, v) in entries {
+                    new_manifest_payload.extend_from_slice(&rmp_serde::to_vec_named(&k).unwrap());
+                    new_manifest_payload.extend_from_slice(&rmp_serde::to_vec_named(&v).unwrap());
+                }
+
+                let mut new_stream = Vec::with_capacity(base_stream.len() + 128);
+                new_stream.push(base_stream[0]);
+                new_stream
+                    .extend_from_slice(&(new_manifest_payload.len() as u32).to_le_bytes());
+                new_stream.extend_from_slice(&new_manifest_payload);
+                new_stream.extend_from_slice(&base_stream[5 + old_len..]);
+
+                let mut z_enc = ZstdEncoder::new(Vec::new(), 0).unwrap();
+                z_enc.write_all(&new_stream).unwrap();
+                let compressed = z_enc.finish().unwrap();
+
+                let spec = EnvelopeHeaderSpec::new(
+                    orig_env.created_at.clone(),
+                    orig_env.server_version.clone(),
+                    orig_env.schema_revision.clone(),
+                    orig_env.components.clone(),
+                    orig_env.storage_provider.clone(),
+                    DEFAULT_CHUNK_SIZE,
+                );
+                let mut env_obj = serde_json::to_value(&spec)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .clone();
+                mutate_env(&mut env_obj);
+                let new_env_bytes =
+                    serde_json::to_vec(&serde_json::Value::Object(env_obj)).unwrap();
+
+                let mut out_wire = Vec::new();
+                out_wire.extend_from_slice(BACKUP_MAGIC);
+                out_wire.extend_from_slice(&(new_env_bytes.len() as u32).to_le_bytes());
+                out_wire.extend_from_slice(&new_env_bytes);
+                let new_sha256: [u8; 32] = Sha256::digest(&out_wire).into();
+
+                let mut enc =
+                    ChunkedEncryptWriter::new(&mut out_wire, &master_key, &spec, new_sha256)
+                        .unwrap();
+                enc.write_all(&compressed).unwrap();
+                enc.finish().unwrap();
+                fs::write(out_path, &out_wire).unwrap();
+            };
+
+        // 1. Unknown non-critical fields in BOTH outer envelope and inner manifest are tolerated
+        let tolerated_path = tmp.path().join("tolerated.confbak");
+        rewrite_archive(
+            &tolerated_path,
+            &|env_obj| {
+                env_obj.insert("future_env_note".to_string(), serde_json::json!("ok"));
+            },
+            &|entries| {
+                entries.push((
+                    "future_manifest_note".to_string(),
+                    MsgPackMetaValue::Str("ok".to_string()),
+                ));
+            },
+        );
+        let parsed = read_backup_header(&tolerated_path).unwrap();
+        assert_eq!(
+            parsed
+                .non_critical_fields
+                .get("future_env_note")
+                .and_then(|v| v.as_str()),
+            Some("ok")
+        );
+        verify::run_verify(
+            &test_ctx(&src_ws),
+            BackupVerifyArgs {
+                backup_path: tolerated_path.clone(),
+                key: None,
+                key_file: Some(key_path.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        let dst_ok_ws = create_test_workspace(
+            &tmp.path().join("dst_ok_ws"),
+            "fresh.db",
+            "local",
+            "old-p",
+            "old-s",
+        );
+        import::run_import(
+            &test_ctx(&dst_ok_ws),
+            BackupImportArgs {
+                backup_path: tolerated_path,
+                key: None,
+                key_file: Some(key_path.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 2. Unknown CRITICAL field in outer envelope is rejected by info, verify, and import
+        let outer_crit_path = tmp.path().join("outer_crit.confbak");
+        rewrite_archive(
+            &outer_crit_path,
+            &|env_obj| {
+                env_obj.insert("future_cipher_suite".to_string(), serde_json::json!(true));
+                if let Some(serde_json::Value::Array(arr)) = env_obj.get_mut("critical") {
+                    arr.push(serde_json::json!("future_cipher_suite"));
+                }
+            },
+            &|_entries| {},
+        );
+        let info_err = read_backup_header(&outer_crit_path).unwrap_err();
+        assert!(matches!(info_err, CfmsError::Backup(_)));
+        assert!(info_err.to_string().contains("future_cipher_suite"));
+
+        let verify_err = verify::run_verify(
+            &test_ctx(&src_ws),
+            BackupVerifyArgs {
+                backup_path: outer_crit_path.clone(),
+                key: None,
+                key_file: Some(key_path.clone()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(verify_err, CfmsError::Backup(_)));
+        assert!(verify_err.to_string().contains("future_cipher_suite"));
+
+        let dst_outer_ws = create_test_workspace(
+            &tmp.path().join("dst_outer_ws"),
+            "fresh.db",
+            "local",
+            "old-p",
+            "old-s",
+        );
+        let import_err = import::run_import(
+            &test_ctx(&dst_outer_ws),
+            BackupImportArgs {
+                backup_path: outer_crit_path,
+                key: None,
+                key_file: Some(key_path.clone()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(import_err, CfmsError::Backup(_)));
+        assert!(import_err.to_string().contains("future_cipher_suite"));
+
+        // 3. Unknown CRITICAL field in inner ManifestHeader is rejected by verify and import
+        let inner_crit_path = tmp.path().join("inner_crit.confbak");
+        rewrite_archive(
+            &inner_crit_path,
+            &|_env_obj| {},
+            &|entries| {
+                for (k, v) in entries.iter_mut() {
+                    if k == "critical"
+                        && let MsgPackMetaValue::Array(arr) = v
+                    {
+                        arr.push(MsgPackMetaValue::Str("future_manifest_rule".to_string()));
+                    }
+                }
+                entries.push((
+                    "future_manifest_rule".to_string(),
+                    MsgPackMetaValue::Bool(true),
+                ));
+            },
+        );
+        // Outer header remains readable by `info`
+        read_backup_header(&inner_crit_path).unwrap();
+
+        let inner_verify_err = verify::run_verify(
+            &test_ctx(&src_ws),
+            BackupVerifyArgs {
+                backup_path: inner_crit_path.clone(),
+                key: None,
+                key_file: Some(key_path.clone()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(inner_verify_err, CfmsError::ArchiveIntegrity(_)));
+        assert!(inner_verify_err.to_string().contains("future_manifest_rule"));
+
+        let dst_inner_ws = create_test_workspace(
+            &tmp.path().join("dst_inner_ws"),
+            "fresh.db",
+            "local",
+            "old-p",
+            "old-s",
+        );
+        let inner_import_err = import::run_import(
+            &test_ctx(&dst_inner_ws),
+            BackupImportArgs {
+                backup_path: inner_crit_path,
+                key: None,
+                key_file: Some(key_path.clone()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(inner_import_err, CfmsError::ArchiveIntegrity(_)));
+        assert!(inner_import_err.to_string().contains("future_manifest_rule"));
     }
 }

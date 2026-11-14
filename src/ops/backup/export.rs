@@ -268,19 +268,18 @@ async fn stream_archive_payload(
         .map_err(|e| CfmsError::Backup(format!("Failed to initialize Zstd encoder: {e}")))?;
     let mut record_writer = StreamRecordWriter::new(zstd_writer);
 
-    let manifest = ManifestHeader {
-        format_version: BACKUP_FORMAT_VERSION,
-        created_at: created_at.to_string(),
-        server_version: server_version.to_string(),
-        schema_revision: plan.schema_revision.clone(),
-        components: component_names.to_vec(),
-        storage_provider: storage.kind().to_string(),
-        extension_tables: plan.extension_tables.clone(),
-        table_order: plan.table_order.clone(),
-        tables: plan.table_specs.clone(),
-        schema_ir: plan.export_ir.clone(),
-        configuration: configuration.clone(),
-    };
+    let manifest = ManifestHeader::new(
+        created_at.to_string(),
+        server_version.to_string(),
+        plan.schema_revision.clone(),
+        component_names.to_vec(),
+        storage.kind().to_string(),
+        plan.extension_tables.clone(),
+        plan.table_order.clone(),
+        plan.table_specs.clone(),
+        plan.export_ir.clone(),
+        configuration.clone(),
+    );
     record_writer.write_manifest_header(&manifest)?;
 
     let mut state = ExportStreamState::default();

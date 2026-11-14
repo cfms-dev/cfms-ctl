@@ -851,7 +851,7 @@ pub async fn run_verify(ctx: &AppContext, args: BackupVerifyArgs) -> Result<()> 
     let report = BackupVerifyReport {
         archive_path: envelope.path,
         file_size: envelope.file_size,
-        format_version: manifest.format_version,
+        format_version: manifest.version,
         created_at: manifest.created_at,
         server_version: manifest.server_version,
         schema_revision: manifest.schema_revision,

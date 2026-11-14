@@ -260,7 +260,7 @@ pub async fn run_import(ctx: &AppContext, args: BackupImportArgs) -> Result<()> 
                 archive_path: envelope.path,
                 target_endpoint,
                 target_dialect: pool.kind().to_string(),
-                format_version: manifest.format_version,
+                format_version: manifest.version,
                 schema_revision: manifest.schema_revision,
                 components: manifest.components,
                 blank_target_initialized,

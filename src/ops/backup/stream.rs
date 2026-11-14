@@ -1,14 +1,49 @@
-//! Typed single-pass streaming container codec (`cfms-stream-v1`) wrapped inside Zstd +
+//! Typed single-pass streaming container codec (`cfms-stream-v2`) wrapped inside Zstd +
 //! chunked AEAD, eliminating intermediate plaintext staging files and upfront size requirements.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
+use chrono::DateTime;
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use crate::core::error::{CfmsError, Result};
 use crate::db::schema::ddl::ColumnType;
-use crate::db::schema::ir::SchemaIr;
+use crate::db::schema::ir::{SCHEMA_IR_VERSION, SchemaIr};
 use crate::db::transfer::{SqlValue, TransferColumn};
-use crate::ops::backup::format::{BACKUP_FORMAT_VERSION, BackupHeaderReport};
+use crate::ops::backup::format::{
+    BACKUP_FORMAT_VERSION, BackupHeaderReport, validate_critical_key_list,
+};
+
+pub const MANIFEST_CONTENT_TYPE: &str = "cfms-manifest";
+const SUPPORTED_MANIFEST_STORAGE_PROVIDER: &str = "local";
+
+const MANDATORY_MANIFEST_FIELDS: &[&str] = &[
+    "content_type",
+    "version",
+    "schema_revision",
+    "components",
+    "storage_provider",
+    "extension_tables",
+    "table_order",
+    "tables",
+    "schema_ir",
+    "configuration",
+];
+
+const KNOWN_MANIFEST_FIELDS: &[&str] = &[
+    "content_type",
+    "version",
+    "schema_revision",
+    "components",
+    "storage_provider",
+    "extension_tables",
+    "table_order",
+    "tables",
+    "schema_ir",
+    "configuration",
+    "created_at",
+    "server_version",
+];
 
 pub const MAX_HEADER_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TABLE_BATCH_BYTES: usize = 32 * 1024 * 1024;
@@ -64,7 +99,7 @@ mod msgpack_bytes {
     }
 }
 
-/// Lossless canonical SQL value serialized directly inside `cfms-stream-v1` row batches.
+/// Lossless canonical SQL value serialized directly inside `cfms-stream-v2` row batches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackupValue {
     Null,
@@ -264,11 +299,124 @@ pub struct ConfigurationPayload {
     pub secret_key: Option<String>,
 }
 
+/// Lossless representation of unknown non-critical MessagePack metadata inside [`ManifestHeader`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum MsgPackMetaValue {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64Bits(u64),
+    Str(String),
+    Bytes(#[serde(with = "msgpack_bytes")] Vec<u8>),
+    Array(Vec<Self>),
+    Map(BTreeMap<String, Self>),
+}
+
+impl<'de> Deserialize<'de> for MsgPackMetaValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct MetaVisitor;
+
+        impl<'de> Visitor<'de> for MetaVisitor {
+            type Value = MsgPackMetaValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any valid MessagePack metadata value")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E> {
+                Ok(MsgPackMetaValue::Bool(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(MsgPackMetaValue::I64(v))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(MsgPackMetaValue::U64(v))
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                if !v.is_finite() {
+                    return Err(de::Error::custom("Non-finite float in manifest metadata"));
+                }
+                Ok(MsgPackMetaValue::F64Bits(v.to_bits()))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(MsgPackMetaValue::Str(v.to_owned()))
+            }
+
+            fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E> {
+                Ok(MsgPackMetaValue::Str(v))
+            }
+
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> std::result::Result<Self::Value, E> {
+                Ok(MsgPackMetaValue::Bytes(v.to_vec()))
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> std::result::Result<Self::Value, E> {
+                Ok(MsgPackMetaValue::Bytes(v))
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(MsgPackMetaValue::Null)
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(MsgPackMetaValue::Null)
+            }
+
+            fn visit_some<D2: Deserializer<'de>>(
+                self,
+                deserializer: D2,
+            ) -> std::result::Result<Self::Value, D2::Error> {
+                MsgPackMetaValue::deserialize(deserializer)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(item) = seq.next_element::<MsgPackMetaValue>()? {
+                    out.push(item);
+                }
+                Ok(MsgPackMetaValue::Array(out))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if out.contains_key(&key) {
+                        return Err(de::Error::custom(format!(
+                            "Duplicate manifest metadata key '{key}'"
+                        )));
+                    }
+                    let val = map.next_value::<MsgPackMetaValue>()?;
+                    out.insert(key, val);
+                }
+                Ok(MsgPackMetaValue::Map(out))
+            }
+        }
+
+        deserializer.deserialize_any(MetaVisitor)
+    }
+}
+
 /// First stream frame inside the encrypted/compressed archive (`0x01`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestHeader {
-    pub format_version: u32,
+    pub content_type: String,
+    pub version: u32,
+    pub critical: Vec<String>,
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
     pub server_version: String,
     pub schema_revision: String,
     pub components: Vec<String>,
@@ -278,6 +426,46 @@ pub struct ManifestHeader {
     pub tables: BTreeMap<String, TableSchemaSpec>,
     pub schema_ir: SchemaIr,
     pub configuration: ConfigurationPayload,
+    #[serde(skip)]
+    pub non_critical_fields: BTreeMap<String, MsgPackMetaValue>,
+}
+
+impl ManifestHeader {
+    /// Construct a new [`ManifestHeader`] populated with the canonical `content_type`,
+    /// `version`, and `critical` declarations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        created_at: String,
+        server_version: String,
+        schema_revision: String,
+        components: Vec<String>,
+        storage_provider: String,
+        extension_tables: Vec<ExtensionTableBackupSpec>,
+        table_order: Vec<String>,
+        tables: BTreeMap<String, TableSchemaSpec>,
+        schema_ir: SchemaIr,
+        configuration: ConfigurationPayload,
+    ) -> Self {
+        Self {
+            content_type: MANIFEST_CONTENT_TYPE.to_string(),
+            version: BACKUP_FORMAT_VERSION,
+            critical: MANDATORY_MANIFEST_FIELDS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            created_at,
+            server_version,
+            schema_revision,
+            components,
+            storage_provider,
+            extension_tables,
+            table_order,
+            tables,
+            schema_ir,
+            configuration,
+            non_critical_fields: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,11 +549,104 @@ pub fn validate_manifest_header(
     envelope: &BackupHeaderReport,
     expected_tables_for_selection: &BTreeSet<String>,
 ) -> Result<()> {
-    if manifest.format_version != BACKUP_FORMAT_VERSION {
+    let mut present_keys: BTreeSet<String> = MANDATORY_MANIFEST_FIELDS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    if !manifest.created_at.is_empty() {
+        present_keys.insert("created_at".to_string());
+    }
+    if !manifest.server_version.is_empty() {
+        present_keys.insert("server_version".to_string());
+    }
+    for extra_key in manifest.non_critical_fields.keys() {
+        present_keys.insert(extra_key.clone());
+    }
+
+    let critical_set = validate_critical_key_list(
+        Some(&manifest.critical),
+        &present_keys,
+        MANDATORY_MANIFEST_FIELDS,
+        KNOWN_MANIFEST_FIELDS,
+        "manifest header",
+    )
+    .map_err(CfmsError::ArchiveIntegrity)?;
+
+    if manifest.content_type != MANIFEST_CONTENT_TYPE {
         return Err(CfmsError::ArchiveIntegrity(format!(
-            "Unsupported manifest format version {}",
-            manifest.format_version
+            "Unsupported manifest content_type '{}' (expected '{}')",
+            manifest.content_type, MANIFEST_CONTENT_TYPE
         )));
+    }
+    if manifest.version != BACKUP_FORMAT_VERSION {
+        return Err(CfmsError::ArchiveIntegrity(format!(
+            "Unsupported manifest format version {} (expected {})",
+            manifest.version, BACKUP_FORMAT_VERSION
+        )));
+    }
+    if manifest.version != envelope.version {
+        return Err(CfmsError::ArchiveIntegrity(format!(
+            "Archive manifest version {} does not match envelope version {}",
+            manifest.version, envelope.version
+        )));
+    }
+    if manifest.schema_ir.ir_version != SCHEMA_IR_VERSION {
+        return Err(CfmsError::ArchiveIntegrity(format!(
+            "Unsupported manifest schema IR version {} (expected {SCHEMA_IR_VERSION})",
+            manifest.schema_ir.ir_version
+        )));
+    }
+    if manifest.storage_provider != SUPPORTED_MANIFEST_STORAGE_PROVIDER {
+        return Err(CfmsError::ArchiveIntegrity(format!(
+            "Unsupported manifest storage_provider '{}' (expected '{}')",
+            manifest.storage_provider, SUPPORTED_MANIFEST_STORAGE_PROVIDER
+        )));
+    }
+    if !envelope.storage_provider.is_empty()
+        && manifest.storage_provider != envelope.storage_provider
+    {
+        return Err(CfmsError::ArchiveIntegrity(
+            "Archive manifest storage_provider does not match unencrypted envelope header"
+                .to_string(),
+        ));
+    }
+    if critical_set.contains("created_at") {
+        if manifest.created_at.trim().is_empty() {
+            return Err(CfmsError::ArchiveIntegrity(
+                "Critical manifest header field 'created_at' cannot be empty".to_string(),
+            ));
+        }
+        DateTime::parse_from_rfc3339(&manifest.created_at).map_err(|e| {
+            CfmsError::ArchiveIntegrity(format!(
+                "Critical manifest header field 'created_at' is not valid RFC 3339: {e}"
+            ))
+        })?;
+    }
+    if !envelope.created_at.is_empty()
+        && !manifest.created_at.is_empty()
+        && manifest.created_at != envelope.created_at
+    {
+        return Err(CfmsError::ArchiveIntegrity(
+            "Archive manifest created_at does not match unencrypted envelope header".to_string(),
+        ));
+    }
+    if critical_set.contains("server_version") && manifest.server_version.trim().is_empty() {
+        return Err(CfmsError::ArchiveIntegrity(
+            "Critical manifest header field 'server_version' cannot be empty".to_string(),
+        ));
+    }
+    if !envelope.server_version.is_empty()
+        && !manifest.server_version.is_empty()
+        && manifest.server_version != envelope.server_version
+    {
+        return Err(CfmsError::ArchiveIntegrity(
+            "Archive manifest server_version does not match unencrypted envelope header".to_string(),
+        ));
+    }
+    if manifest.schema_revision.trim().is_empty() {
+        return Err(CfmsError::ArchiveIntegrity(
+            "Archive manifest has empty `schema_revision`".to_string(),
+        ));
     }
     if manifest.components != envelope.components {
         return Err(CfmsError::ArchiveIntegrity(
@@ -468,7 +749,7 @@ pub(crate) fn sql_val_to_id(val: &SqlValue, field: &str) -> Result<String> {
     }
 }
 
-/// Streaming writer for `cfms-stream-v1` records.
+/// Streaming writer for `cfms-stream-v2` records.
 pub struct StreamRecordWriter<W: Write> {
     inner: W,
 }
@@ -599,15 +880,264 @@ impl<W: Write> StreamRecordWriter<W> {
     }
 }
 
-/// Streaming reader for `cfms-stream-v1` records that validates record lengths before allocation
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum StrictMapKey {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64Bits(u64),
+    Str(String),
+    Bytes(Vec<u8>),
+}
+
+impl<'de> Deserialize<'de> for StrictMapKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct KeyVisitor;
+
+        impl<'de> Visitor<'de> for KeyVisitor {
+            type Value = StrictMapKey;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("primitive MessagePack map key")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E> {
+                Ok(StrictMapKey::Bool(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(StrictMapKey::I64(v))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(StrictMapKey::U64(v))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                Ok(StrictMapKey::F64Bits(v.to_bits()))
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(StrictMapKey::Str(v.to_owned()))
+            }
+
+            fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E> {
+                Ok(StrictMapKey::Str(v))
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> std::result::Result<Self::Value, E> {
+                Ok(StrictMapKey::Bytes(v.to_vec()))
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> std::result::Result<Self::Value, E> {
+                Ok(StrictMapKey::Bytes(v))
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(StrictMapKey::Null)
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(StrictMapKey::Null)
+            }
+        }
+
+        deserializer.deserialize_any(KeyVisitor)
+    }
+}
+
+struct StrictSkipValue;
+
+impl<'de> Deserialize<'de> for StrictSkipValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct SkipVisitor;
+
+        impl<'de> Visitor<'de> for SkipVisitor {
+            type Value = StrictSkipValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any valid MessagePack value without duplicate map keys")
+            }
+
+            fn visit_bool<E>(self, _v: bool) -> std::result::Result<Self::Value, E> {
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_i64<E>(self, _v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_u64<E>(self, _v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_f64<E>(self, _v: f64) -> std::result::Result<Self::Value, E> {
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_str<E>(self, _v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_string<E>(self, _v: String) -> std::result::Result<Self::Value, E> {
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_bytes<E>(self, _v: &[u8]) -> std::result::Result<Self::Value, E> {
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_byte_buf<E>(self, _v: Vec<u8>) -> std::result::Result<Self::Value, E> {
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_some<D2: Deserializer<'de>>(
+                self,
+                deserializer: D2,
+            ) -> std::result::Result<Self::Value, D2::Error> {
+                StrictSkipValue::deserialize(deserializer)
+            }
+
+            fn visit_newtype_struct<D2: Deserializer<'de>>(
+                self,
+                deserializer: D2,
+            ) -> std::result::Result<Self::Value, D2::Error> {
+                StrictSkipValue::deserialize(deserializer)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<StrictSkipValue>()?.is_some() {}
+                Ok(StrictSkipValue)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut seen = BTreeSet::new();
+                while let Some(key) = map.next_key::<StrictMapKey>()? {
+                    if !seen.insert(key) {
+                        return Err(de::Error::custom(
+                            "Duplicate map key inside manifest header payload",
+                        ));
+                    }
+                    let _ = map.next_value::<StrictSkipValue>()?;
+                }
+                Ok(StrictSkipValue)
+            }
+        }
+
+        deserializer.deserialize_any(SkipVisitor)
+    }
+}
+
+struct ManifestPreScan {
+    critical: Option<Vec<String>>,
+    present_keys: BTreeSet<String>,
+    non_critical_fields: BTreeMap<String, MsgPackMetaValue>,
+}
+
+fn scan_manifest_header_bytes(bytes: &[u8]) -> Result<ManifestPreScan> {
+    struct TopMapSeed;
+
+    impl<'de> de::DeserializeSeed<'de> for TopMapSeed {
+        type Value = ManifestPreScan;
+
+        fn deserialize<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error> {
+            struct TopMapVisitor;
+
+            impl<'de> Visitor<'de> for TopMapVisitor {
+                type Value = ManifestPreScan;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("MessagePack manifest header map")
+                }
+
+                fn visit_map<A: MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut critical: Option<Vec<String>> = None;
+                    let mut present_keys = BTreeSet::new();
+                    let mut non_critical_fields = BTreeMap::new();
+
+                    while let Some(key) = map.next_key::<String>()? {
+                        if key == "critical" {
+                            if critical.is_some() {
+                                return Err(de::Error::custom(
+                                    "Duplicate 'critical' key in manifest header",
+                                ));
+                            }
+                            critical = Some(map.next_value::<Vec<String>>()?);
+                            continue;
+                        }
+                        if !present_keys.insert(key.clone()) {
+                            return Err(de::Error::custom(format!(
+                                "Duplicate manifest header key '{key}'"
+                            )));
+                        }
+                        if KNOWN_MANIFEST_FIELDS.contains(&key.as_str()) {
+                            let _ = map.next_value::<StrictSkipValue>()?;
+                        } else {
+                            let val = map.next_value::<MsgPackMetaValue>()?;
+                            non_critical_fields.insert(key, val);
+                        }
+                    }
+
+                    Ok(ManifestPreScan {
+                        critical,
+                        present_keys,
+                        non_critical_fields,
+                    })
+                }
+            }
+
+            deserializer.deserialize_map(TopMapVisitor)
+        }
+    }
+
+    let mut cursor = Cursor::new(bytes);
+    let scan = {
+        let mut de = rmp_serde::Deserializer::new(&mut cursor);
+        de::DeserializeSeed::deserialize(TopMapSeed, &mut de).map_err(|e| {
+            CfmsError::ArchiveIntegrity(format!("Malformed manifest header payload: {e}"))
+        })?
+    };
+    if cursor.position() as usize != bytes.len() {
+        return Err(CfmsError::ArchiveIntegrity(format!(
+            "Manifest header payload contains {} trailing bytes",
+            bytes.len() - cursor.position() as usize
+        )));
+    }
+    Ok(scan)
+}
+
+/// Streaming reader for `cfms-stream-v2` records that validates record lengths before allocation
 /// and reads `ManifestHeader` upfront before exposing subsequent records.
+#[derive(Debug)]
 pub struct StreamRecordReader<R: Read> {
     inner: R,
     saw_footer: bool,
 }
 
 impl<R: Read> StreamRecordReader<R> {
-    /// Open a stream reader and parse the mandatory leading [`ManifestHeader`].
+    /// Open a stream reader and parse the mandatory leading [`ManifestHeader`], enforcing
+    /// `CRITICAL` field semantics before full struct decoding.
     pub fn open(mut inner: R) -> Result<(ManifestHeader, Self)> {
         let mut hdr_tag = [0u8; 5];
         inner.read_exact(&mut hdr_tag).map_err(|e| {
@@ -631,9 +1161,21 @@ impl<R: Read> StreamRecordReader<R> {
         inner.read_exact(&mut buf).map_err(|e| {
             CfmsError::ArchiveIntegrity(format!("Truncated manifest header frame: {e}"))
         })?;
-        let header: ManifestHeader = rmp_serde::from_slice(&buf).map_err(|e| {
+
+        let pre_scan = scan_manifest_header_bytes(&buf)?;
+        validate_critical_key_list(
+            pre_scan.critical.as_deref(),
+            &pre_scan.present_keys,
+            MANDATORY_MANIFEST_FIELDS,
+            KNOWN_MANIFEST_FIELDS,
+            "manifest header",
+        )
+        .map_err(CfmsError::ArchiveIntegrity)?;
+
+        let mut header: ManifestHeader = rmp_serde::from_slice(&buf).map_err(|e| {
             CfmsError::ArchiveIntegrity(format!("Malformed manifest header payload: {e}"))
         })?;
+        header.non_critical_fields = pre_scan.non_critical_fields;
         Ok((
             header,
             Self {
@@ -807,24 +1349,62 @@ mod tests {
         );
     }
 
+    fn test_manifest_header() -> ManifestHeader {
+        let ir = builtin_schema_ir(false);
+        ManifestHeader::new(
+            "2026-11-14T00:00:00Z".to_string(),
+            "0.14.0".to_string(),
+            "e952c02c1454".to_string(),
+            vec!["accounts".to_string(), "audit".to_string()],
+            "local".to_string(),
+            vec![],
+            vec![
+                "accounts".to_string(),
+                "audit_entries".to_string(),
+            ],
+            BTreeMap::new(),
+            ir,
+            ConfigurationPayload::default(),
+        )
+    }
+
+    fn encode_msgpack_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.push(tag);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn encode_custom_manifest_map(
+        base: &ManifestHeader,
+        mutate: impl FnOnce(&mut Vec<(String, MsgPackMetaValue)>),
+    ) -> Vec<u8> {
+        let raw = rmp_serde::to_vec_named(base).unwrap();
+        let map: BTreeMap<String, MsgPackMetaValue> = rmp_serde::from_slice(&raw).unwrap();
+        let mut entries: Vec<(String, MsgPackMetaValue)> = map.into_iter().collect();
+        mutate(&mut entries);
+
+        let mut payload = Vec::new();
+        let count = entries.len();
+        if count <= 15 {
+            payload.push(0x80 | (count as u8));
+        } else {
+            payload.push(0xde);
+            payload.extend_from_slice(&(count as u16).to_be_bytes());
+        }
+        for (k, v) in entries {
+            payload.extend_from_slice(&rmp_serde::to_vec_named(&k).unwrap());
+            payload.extend_from_slice(&rmp_serde::to_vec_named(&v).unwrap());
+        }
+        payload
+    }
+
     #[test]
     fn stream_codec_rejects_oversized_or_unterminated_frames() {
         // Frame claiming 1 GiB length must be rejected before allocating buffer
         let mut buf = Vec::new();
-        let ir = builtin_schema_ir(false);
-        let manifest = ManifestHeader {
-            format_version: BACKUP_FORMAT_VERSION,
-            created_at: "2026-11-14T00:00:00Z".to_string(),
-            server_version: "0.14.0".to_string(),
-            schema_revision: "e952c02c1454".to_string(),
-            components: vec!["audit".to_string()],
-            storage_provider: "local".to_string(),
-            extension_tables: vec![],
-            table_order: vec!["audit_entries".to_string()],
-            tables: BTreeMap::new(),
-            schema_ir: ir,
-            configuration: ConfigurationPayload::default(),
-        };
+        let manifest = test_manifest_header();
         let mut w = StreamRecordWriter::new(&mut buf);
         w.write_manifest_header(&manifest).unwrap();
         buf.push(TAG_TABLE_ROW_BATCH);
@@ -833,5 +1413,194 @@ mod tests {
         let (_, mut r) = StreamRecordReader::open(Cursor::new(&buf)).unwrap();
         let err = r.next_record().unwrap_err();
         assert!(err.to_string().contains("outside valid range"));
+    }
+
+    #[test]
+    fn manifest_header_tolerates_unknown_non_critical_fields() {
+        let base = test_manifest_header();
+        let payload = encode_custom_manifest_map(&base, |entries| {
+            entries.push((
+                "future_note".to_string(),
+                MsgPackMetaValue::Str("tolerated-v2".to_string()),
+            ));
+            entries.push((
+                "future_blob".to_string(),
+                MsgPackMetaValue::Bytes(vec![0xca, 0xfe, 0xba, 0xbe]),
+            ));
+            let mut nested = BTreeMap::new();
+            nested.insert("flag".to_string(), MsgPackMetaValue::Bool(true));
+            entries.push(("future_map".to_string(), MsgPackMetaValue::Map(nested)));
+        });
+        let frame = encode_msgpack_frame(TAG_MANIFEST_HEADER, &payload);
+
+        let (header, _) = StreamRecordReader::open(Cursor::new(&frame)).unwrap();
+        assert_eq!(header.content_type, MANIFEST_CONTENT_TYPE);
+        assert_eq!(header.version, BACKUP_FORMAT_VERSION);
+        assert_eq!(
+            header.non_critical_fields.get("future_note"),
+            Some(&MsgPackMetaValue::Str("tolerated-v2".to_string()))
+        );
+        assert_eq!(
+            header.non_critical_fields.get("future_blob"),
+            Some(&MsgPackMetaValue::Bytes(vec![0xca, 0xfe, 0xba, 0xbe]))
+        );
+        assert!(header.non_critical_fields.contains_key("future_map"));
+    }
+
+    fn push_critical_field(entries: &mut [(String, MsgPackMetaValue)], field: &str) {
+        for (k, v) in entries.iter_mut() {
+            if k == "critical"
+                && let MsgPackMetaValue::Array(arr) = v
+            {
+                arr.push(MsgPackMetaValue::Str(field.to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_header_rejects_unknown_critical_and_malformed_declarations() {
+        let base = test_manifest_header();
+
+        // 1. Unknown critical field (even when its value is present in MessagePack)
+        let payload_unknown = encode_custom_manifest_map(&base, |entries| {
+            push_critical_field(entries, "future_critical_ext");
+            entries.push((
+                "future_critical_ext".to_string(),
+                MsgPackMetaValue::Bool(true),
+            ));
+        });
+        let err = StreamRecordReader::open(Cursor::new(&encode_msgpack_frame(
+            TAG_MANIFEST_HEADER,
+            &payload_unknown,
+        )))
+        .unwrap_err();
+        assert!(matches!(err, CfmsError::ArchiveIntegrity(_)));
+        assert!(err.to_string().contains("future_critical_ext"));
+
+        // 2. Dangling critical optional field (`created_at` in `critical`, omitted from map)
+        let payload_dangling = encode_custom_manifest_map(&base, |entries| {
+            entries.retain(|(k, _)| k != "created_at");
+            push_critical_field(entries, "created_at");
+        });
+        let err = StreamRecordReader::open(Cursor::new(&encode_msgpack_frame(
+            TAG_MANIFEST_HEADER,
+            &payload_dangling,
+        )))
+        .unwrap_err();
+        assert!(matches!(err, CfmsError::ArchiveIntegrity(_)));
+        assert!(err.to_string().contains("created_at"));
+
+        // 3. Omitting `critical` key completely must fail
+        let payload_no_critical = encode_custom_manifest_map(&base, |entries| {
+            entries.retain(|(k, _)| k != "critical");
+        });
+        let err = StreamRecordReader::open(Cursor::new(&encode_msgpack_frame(
+            TAG_MANIFEST_HEADER,
+            &payload_no_critical,
+        )))
+        .unwrap_err();
+        assert!(matches!(err, CfmsError::ArchiveIntegrity(_)));
+        assert!(err.to_string().contains("critical"));
+
+        // 4. Omitting a mandatory baseline field (`schema_revision`) from the map must fail
+        let payload_missing_mandatory = encode_custom_manifest_map(&base, |entries| {
+            entries.retain(|(k, _)| k != "schema_revision");
+        });
+        let err = StreamRecordReader::open(Cursor::new(&encode_msgpack_frame(
+            TAG_MANIFEST_HEADER,
+            &payload_missing_mandatory,
+        )))
+        .unwrap_err();
+        assert!(matches!(err, CfmsError::ArchiveIntegrity(_)));
+        assert!(err.to_string().contains("schema_revision"));
+
+        // 4b. Self-referential `critical` array must fail
+        let payload_self_critical = encode_custom_manifest_map(&base, |entries| {
+            push_critical_field(entries, "critical");
+        });
+        let err = StreamRecordReader::open(Cursor::new(&encode_msgpack_frame(
+            TAG_MANIFEST_HEADER,
+            &payload_self_critical,
+        )))
+        .unwrap_err();
+        assert!(matches!(err, CfmsError::ArchiveIntegrity(_)));
+        assert!(err.to_string().contains("self-reference"));
+
+        // 5. Duplicate MessagePack top-level key must fail
+        let payload_dup = encode_custom_manifest_map(&base, |entries| {
+            entries.push((
+                "future_note".to_string(),
+                MsgPackMetaValue::Str("first".to_string()),
+            ));
+            entries.push((
+                "future_note".to_string(),
+                MsgPackMetaValue::Str("second".to_string()),
+            ));
+        });
+        let err = StreamRecordReader::open(Cursor::new(&encode_msgpack_frame(
+            TAG_MANIFEST_HEADER,
+            &payload_dup,
+        )))
+        .unwrap_err();
+        assert!(matches!(err, CfmsError::ArchiveIntegrity(_)));
+        assert!(err.to_string().contains("Duplicate"));
+
+        // 6. Trailing bytes after MessagePack map must fail
+        let mut payload_trailing = rmp_serde::to_vec_named(&base).unwrap();
+        payload_trailing.extend_from_slice(&[0x01, 0x02]);
+        let err = StreamRecordReader::open(Cursor::new(&encode_msgpack_frame(
+            TAG_MANIFEST_HEADER,
+            &payload_trailing,
+        )))
+        .unwrap_err();
+        assert!(matches!(err, CfmsError::ArchiveIntegrity(_)));
+        assert!(err.to_string().contains("trailing bytes"));
+    }
+
+    #[test]
+    fn validate_manifest_header_checks_content_type_version_ir_and_critical_semantics() {
+        let base = test_manifest_header();
+        let envelope = BackupHeaderReport {
+            path: "test.confbak".to_string(),
+            file_size: 1024,
+            content_type: crate::ops::backup::format::BACKUP_CONTENT_TYPE.to_string(),
+            version: BACKUP_FORMAT_VERSION,
+            critical: vec![],
+            created_at: base.created_at.clone(),
+            server_version: base.server_version.clone(),
+            schema_revision: base.schema_revision.clone(),
+            components: base.components.clone(),
+            cipher: crate::ops::backup::format::BACKUP_CIPHER.to_string(),
+            compression: "zstd".to_string(),
+            container: crate::ops::backup::format::BACKUP_CONTAINER.to_string(),
+            kdf: crate::ops::backup::format::BACKUP_KDF.to_string(),
+            chunk_size: 1024,
+            kdf_salt: "salt".to_string(),
+            nonce_prefix: "prefix".to_string(),
+            storage_provider: "local".to_string(),
+            non_critical_fields: BTreeMap::new(),
+        };
+        let expected_tables = BTreeSet::new();
+
+        // Wrong content_type
+        let mut bad_ct = base.clone();
+        bad_ct.content_type = "wrong-type".to_string();
+        assert!(validate_manifest_header(&bad_ct, &envelope, &expected_tables).is_err());
+
+        // Unsupported schema_ir.ir_version
+        let mut bad_ir = base.clone();
+        bad_ir.schema_ir.ir_version = SCHEMA_IR_VERSION + 1;
+        let err = validate_manifest_header(&bad_ir, &envelope, &expected_tables).unwrap_err();
+        assert!(err.to_string().contains("schema IR version"));
+
+        // Critical optional field `created_at` set to invalid timestamp must fail
+        let mut bad_created = base.clone();
+        bad_created.critical.push("created_at".to_string());
+        bad_created.created_at = "not-an-rfc3339-time".to_string();
+        let mut env_bad_created = envelope.clone();
+        env_bad_created.created_at = bad_created.created_at.clone();
+        let err =
+            validate_manifest_header(&bad_created, &env_bad_created, &expected_tables).unwrap_err();
+        assert!(err.to_string().contains("RFC 3339"));
     }
 }
