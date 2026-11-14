@@ -14,6 +14,12 @@ Key modules under `src/`:
 - `src/ops/`: Domain operation orchestrators and typed reports.
 - `src/ui/`: Dual-mode (`Human` / `Json`) console output, tables, and interactive prompts.
 
+## Planning & Research Rules
+
+1. **Conduct thorough online research when formulating plans**
+   - When formulating a plan, search the web as extensively as possible for relevant materials—such as official documentation, standards, library/crate behaviors, best practices, and known caveats—to provide a comprehensive analysis.
+   - Do not rely solely on prior knowledge or assumptions when online sources can verify current details, surface alternative approaches, or uncover edge cases and compatibility risks.
+
 ## Dependency Management Rules
 
 1. **Always use the latest versions when adding dependencies**
