@@ -323,6 +323,7 @@ dependencies = [
  "console",
  "dialoguer",
  "fs4",
+ "futures-util",
  "hex",
  "indicatif",
  "jsonschema",

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, Key, TableLike, Value};
 use crate::core::atomic::write_with_timestamped_backup;
 use crate::core::error::{CfmsError, Result};
+use crate::core::paths::WorkspacePaths;
 use crate::core::schema::{
     evaluate_schema_invariants, load_json_schema_file, validate_instance_against_schema,
 };
@@ -54,6 +55,133 @@ fn default_db_name() -> String {
 }
 fn default_charset() -> String {
     "utf8mb4".to_string()
+}
+
+impl DatabaseSectionConfig {
+    /// Validate that this `[database]` configuration contains complete, non-memory settings
+    /// suitable as a `database migrate` target, using the raw TOML table to verify required keys.
+    pub fn validate_as_migration_target(&self, raw_table: &dyn TableLike) -> Result<()> {
+        match self.kind {
+            DatabaseKind::Sqlite => {
+                let raw_file = raw_table.get("file").and_then(|v| v.as_str());
+                let Some(file) = raw_file else {
+                    return Err(CfmsError::Config(
+                        "Target SQLite configuration requires database.file".to_string(),
+                    ));
+                };
+                if file.trim().is_empty() {
+                    return Err(CfmsError::Config(
+                        "Target SQLite configuration requires a non-empty database.file".to_string(),
+                    ));
+                }
+                if file == ":memory:" {
+                    return Err(CfmsError::Config(
+                        "An in-memory SQLite database cannot be used as a migration target"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            DatabaseKind::Mysql | DatabaseKind::Postgresql => {
+                let label = match self.kind {
+                    DatabaseKind::Mysql => "MySQL",
+                    DatabaseKind::Postgresql => "PostgreSQL",
+                    DatabaseKind::Sqlite => unreachable!(),
+                };
+                for field in ["host", "username", "name"] {
+                    let val = raw_table.get(field).and_then(|v| v.as_str());
+                    if val.is_none_or(|s| s.trim().is_empty()) {
+                        return Err(CfmsError::Config(format!(
+                            "Target {label} configuration requires database.{field}"
+                        )));
+                    }
+                }
+                if raw_table.get("password").and_then(|v| v.as_str()).is_none() {
+                    return Err(CfmsError::Config(format!(
+                        "Target {label} configuration requires string database.password"
+                    )));
+                }
+                let port_valid = raw_table
+                    .get("port")
+                    .and_then(|v| v.as_integer())
+                    .is_some_and(|p| (1..=65535).contains(&p));
+                if !port_valid {
+                    return Err(CfmsError::Config(format!(
+                        "Target {label} database.port must be an integer from 1 to 65535"
+                    )));
+                }
+                if self.kind == DatabaseKind::Mysql && self.charset != "utf8mb4" {
+                    return Err(CfmsError::Config(
+                        "Target MySQL database.charset must be 'utf8mb4'".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Ensure source and target do not resolve to the exact same physical database.
+    pub fn ensure_distinct_from(
+        &self,
+        target: &Self,
+        paths: &WorkspacePaths,
+    ) -> Result<()> {
+        if self.kind != target.kind {
+            return Ok(());
+        }
+        match self.kind {
+            DatabaseKind::Sqlite => {
+                let src_path = normalize_target_path(&paths.resolve_sqlite_path(&self.file));
+                let dst_path = normalize_target_path(&paths.resolve_sqlite_path(&target.file));
+                if src_path == dst_path {
+                    return Err(CfmsError::Config(format!(
+                        "Source and target SQLite databases resolve to the same file: '{}'",
+                        dst_path.display()
+                    )));
+                }
+            }
+            DatabaseKind::Mysql | DatabaseKind::Postgresql => {
+                let same_host = self.host.trim().eq_ignore_ascii_case(target.host.trim());
+                let same_port = self.port == target.port;
+                let same_db = self.name.trim() == target.name.trim();
+                if same_host && same_port && same_db {
+                    return Err(CfmsError::Config(format!(
+                        "Source and target {} databases resolve to the same endpoint '{}:{}/{}'",
+                        self.kind, target.host, target.port, target.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Human-readable display endpoint without credentials.
+    #[must_use]
+    pub fn display_endpoint(&self, paths: &WorkspacePaths) -> String {
+        match self.kind {
+            DatabaseKind::Sqlite => paths.resolve_sqlite_path(&self.file).display().to_string(),
+            DatabaseKind::Mysql | DatabaseKind::Postgresql => {
+                format!("{}:{}/{}", self.host, self.port, self.name)
+            }
+        }
+    }
+}
+
+fn normalize_target_path(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) {
+        let base = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(canon_parent) = std::fs::canonicalize(base) {
+            return canon_parent.join(file_name);
+        }
+    }
+    path.to_path_buf()
 }
 
 /// High-level summary of `config.toml` for diagnostics and operations.
@@ -205,6 +333,45 @@ impl ConfigDocument {
     pub fn save_with_backup(&self) -> Result<PathBuf> {
         let rendered = self.doc.to_string();
         write_with_timestamped_backup(&self.path, &self.raw_source, rendered.as_bytes())
+    }
+
+    /// Replace this document's `[database]` section with the `[database]` section from `target`,
+    /// validating the resulting document (including optional JSON Schema) before mutating `self`.
+    pub fn replace_database_section(
+        &mut self,
+        target: &Self,
+        schema_path: Option<&Path>,
+    ) -> Result<()> {
+        if paths_refer_to_same_file(&self.path, &target.path) {
+            return Err(CfmsError::Config(
+                "Target database configuration must be different from config.toml".to_string(),
+            ));
+        }
+        let Some(target_db_item) = target.doc.get("database") else {
+            return Err(CfmsError::Config(
+                "Target configuration must contain a [database] table".to_string(),
+            ));
+        };
+        if !target_db_item.is_table_like() {
+            return Err(CfmsError::Config(
+                "Target configuration [database] entry must be a table".to_string(),
+            ));
+        }
+
+        let mut cloned_db = target_db_item.clone();
+        clear_table_positions(&mut cloned_db);
+
+        let mut candidate = self.doc.clone();
+        candidate["database"] = cloned_db;
+
+        let candidate_wrapper = Self {
+            path: self.path.clone(),
+            raw_source: self.raw_source.clone(),
+            doc: candidate,
+        };
+        candidate_wrapper.validate_with_schema(schema_path)?;
+        self.doc = candidate_wrapper.doc;
+        Ok(())
     }
 
     /// Synchronize this configuration document in-place with `template` using `toml_edit` CST merging.
@@ -931,5 +1098,79 @@ file = "app.db"
             err.to_string()
                 .contains("max_connections_per_ip must not exceed max_connections")
         );
+    }
+
+    #[test]
+    fn migration_target_validation_and_distinct_checks_work() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).expect("src dir");
+        std::fs::write(src_dir.join("main.py"), "# cfms").expect("main.py");
+        let cfg_path = src_dir.join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "# keep operator comment\n[server]\nhost = \"127.0.0.1\"\nport = 5104\n\n[database]\ntype = \"sqlite\"\nfile = \"app.db\"\n",
+        )
+        .expect("write config");
+        let paths = WorkspacePaths::discover(Some(dir.path()), None).expect("paths");
+        let mut source_doc = ConfigDocument::load(&cfg_path).expect("load source");
+        let source_cfg = source_doc.database_config().expect("source db");
+
+        // Same SQLite file via relative vs explicit path rejected
+        let same_target = dir.path().join("same.toml");
+        std::fs::write(
+            &same_target,
+            "[database]\ntype = \"sqlite\"\nfile = \"./app.db\"\n",
+        )
+        .expect("same toml");
+        let same_doc = ConfigDocument::load(&same_target).expect("load same");
+        let same_cfg = same_doc.database_config().expect("same db");
+        same_cfg
+            .validate_as_migration_target(same_doc.document()["database"].as_table_like().unwrap())
+            .expect("valid target shape");
+        let err = source_cfg
+            .ensure_distinct_from(&same_cfg, &paths)
+            .expect_err("same sqlite file rejected");
+        assert!(err.to_string().contains("same file"));
+
+        // Incomplete PostgreSQL target missing host/password rejected
+        let incomplete_pg = dir.path().join("bad_pg.toml");
+        std::fs::write(
+            &incomplete_pg,
+            "[database]\ntype = \"postgresql\"\nname = \"cfms\"\n",
+        )
+        .expect("bad pg");
+        let bad_pg_doc = ConfigDocument::load(&incomplete_pg).expect("load bad pg");
+        let bad_pg_cfg = bad_pg_doc.database_config().expect("bad pg cfg");
+        let err = bad_pg_cfg
+            .validate_as_migration_target(bad_pg_doc.document()["database"].as_table_like().unwrap())
+            .expect_err("incomplete pg rejected");
+        assert!(err.to_string().contains("PostgreSQL"));
+
+        // Valid PostgreSQL activation replaces [database] cleanly preserving comments & backing up
+        let good_pg = dir.path().join("good_pg.toml");
+        std::fs::write(
+            &good_pg,
+            "[database]\ntype = \"postgresql\"\nhost = \"127.0.0.1\"\nport = 5432\nusername = \"cfms\"\npassword = \"secret\"\nname = \"cfms_prod\"\n\n[database.pool]\nsize = 10\n",
+        )
+        .expect("good pg");
+        let pg_doc = ConfigDocument::load(&good_pg).expect("load good pg");
+        let pg_cfg = pg_doc.database_config().expect("pg cfg");
+        pg_cfg
+            .validate_as_migration_target(pg_doc.document()["database"].as_table_like().unwrap())
+            .expect("valid pg");
+        source_cfg
+            .ensure_distinct_from(&pg_cfg, &paths)
+            .expect("distinct dialect");
+
+        source_doc
+            .replace_database_section(&pg_doc, None)
+            .expect("replace database section");
+        let backup_path = source_doc.save_with_backup().expect("save with backup");
+        assert!(backup_path.is_file());
+        let saved = std::fs::read_to_string(&cfg_path).expect("read updated config");
+        assert!(saved.contains("# keep operator comment"));
+        assert!(saved.contains("name = \"cfms_prod\""));
+        assert!(saved.contains("[database.pool]"));
     }
 }

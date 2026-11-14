@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 use crate::core::error::Result;
 use crate::db::backend::{DatabaseKind, DbPool};
-use crate::db::schema::registry::{APPLICATION_TABLE_NAMES, LATEST_SCHEMA_REVISION};
+use crate::db::schema::registry::{
+    APPLICATION_TABLE_NAMES, KNOWN_EXTENSION_TABLES, LATEST_SCHEMA_REVISION,
+};
 
 /// Report comparing a live database schema against the expected CFMS schema contract.
 #[derive(Debug, Clone, Serialize)]
@@ -19,6 +21,23 @@ pub struct SchemaDriftReport {
     pub extra_tables: Vec<String>,
     pub is_empty_database: bool,
     pub healthy: bool,
+}
+
+impl SchemaDriftReport {
+    /// Split `extra_tables` into recognized built-in extension tables and unknown tables.
+    #[must_use]
+    pub fn partition_extra_tables(&self) -> (Vec<String>, Vec<String>) {
+        let mut known_ext = Vec::new();
+        let mut unknown = Vec::new();
+        for name in &self.extra_tables {
+            if KNOWN_EXTENSION_TABLES.contains(&name.as_str()) {
+                known_ext.push(name.clone());
+            } else {
+                unknown.push(name.clone());
+            }
+        }
+        (known_ext, unknown)
+    }
 }
 
 /// Inspects live database tables and detects schema drift before migrations or upgrades.

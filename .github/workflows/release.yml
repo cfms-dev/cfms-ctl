@@ -294,7 +294,7 @@ jobs:
           ANNOUNCEMENT_BODY: "${{ fromJson(needs.plan.outputs.val).announcement_changelog }}"
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
-          # Write andUpload files to a GitHub Release
+          # Write and upload files to a GitHub Release
 
           body_file=$(mktemp)
           echo "$ANNOUNCEMENT_BODY" > "$body_file"
