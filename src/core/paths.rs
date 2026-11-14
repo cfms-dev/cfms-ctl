@@ -7,6 +7,14 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use crate::core::error::{CfmsError, Result};
 
+/// Located Alembic configuration and script directories in a CFMS server root.
+#[derive(Debug, Clone, Serialize)]
+pub struct AlembicPaths {
+    pub ini_path: PathBuf,
+    pub script_location: PathBuf,
+    pub versions_dir: PathBuf,
+}
+
 /// Resolved directory layout for a target CFMS installation.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspacePaths {
@@ -65,10 +73,34 @@ impl WorkspacePaths {
         Err(CfmsError::WorkspaceNotFound(start))
     }
 
+    /// Construct a temporary [`WorkspacePaths`] rooted at a specific source or project checkout
+    /// directory (used for comparing arbitrary `--from`/`--to` directories without requiring `config.toml`).
+    pub fn from_code_dir(dir: &Path) -> Result<Self> {
+        if !dir.is_dir() {
+            return Err(CfmsError::WorkspaceNotFound(dir.to_path_buf()));
+        }
+        let clean = Self::canonicalize_clean(dir);
+        let candidate_src = clean.join("src");
+        if candidate_src.is_dir()
+            && (Self::is_server_root(&candidate_src) || clean.join("pyproject.toml").is_file())
+        {
+            return Ok(Self::from_roots(clean, candidate_src, None));
+        }
+        let project_root = if clean.file_name().is_some_and(|n| n == "src") {
+            clean.parent().map_or_else(|| clean.clone(), Path::to_path_buf)
+        } else {
+            clean.clone()
+        };
+        Ok(Self::from_roots(project_root, clean, None))
+    }
+
     fn is_server_root(candidate: &Path) -> bool {
         candidate.join("main.py").is_file()
             || candidate.join("config.toml").is_file()
             || candidate.join("config.toml.sample").is_file()
+            || candidate.join("include").join("database").is_dir()
+            || candidate.join("schema.ir.json").is_file()
+            || candidate.join("alembic.ini").is_file()
             || candidate
                 .join(".maintenance")
                 .join("transaction.json")
@@ -158,16 +190,17 @@ impl WorkspacePaths {
         }
     }
 
-    /// Discover the external `config.schema.json` file in the workspace or validate an explicit override.
-    pub fn discover_config_schema_path(
+    fn discover_named_schema_file(
         &self,
+        filename: &str,
+        label: &str,
         override_path: Option<&Path>,
     ) -> Result<Option<PathBuf>> {
         if let Some(explicit) = override_path {
             let resolved = self.resolve_file_override(explicit);
             if !resolved.is_file() {
                 return Err(CfmsError::Config(format!(
-                    "Configuration schema file not found: '{}'",
+                    "{label} file not found: '{}'",
                     resolved.display()
                 )));
             }
@@ -175,14 +208,26 @@ impl WorkspacePaths {
         }
 
         let candidates = [
-            self.server_root.join("config.schema.json"),
+            self.server_root.join(filename),
             self.server_root
                 .join("include")
                 .join("schemas")
-                .join("config.schema.json"),
-            self.project_root.join("schemas").join("config.schema.json"),
+                .join(filename),
+            self.project_root.join("schemas").join(filename),
         ];
         Ok(candidates.into_iter().find(|p| p.is_file()))
+    }
+
+    /// Discover the external `config.schema.json` file in the workspace or validate an explicit override.
+    pub fn discover_config_schema_path(
+        &self,
+        override_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        self.discover_named_schema_file(
+            "config.schema.json",
+            "Configuration schema",
+            override_path,
+        )
     }
 
     /// Discover the external `options.schema.json` file in the workspace or validate an explicit override.
@@ -190,28 +235,34 @@ impl WorkspacePaths {
         &self,
         override_path: Option<&Path>,
     ) -> Result<Option<PathBuf>> {
-        if let Some(explicit) = override_path {
-            let resolved = self.resolve_file_override(explicit);
-            if !resolved.is_file() {
-                return Err(CfmsError::Config(format!(
-                    "Options schema file not found: '{}'",
-                    resolved.display()
-                )));
-            }
-            return Ok(Some(resolved));
-        }
+        self.discover_named_schema_file("options.schema.json", "Options schema", override_path)
+    }
 
-        let candidates = [
-            self.server_root.join("options.schema.json"),
-            self.server_root
-                .join("include")
-                .join("schemas")
-                .join("options.schema.json"),
-            self.project_root
-                .join("schemas")
-                .join("options.schema.json"),
-        ];
-        Ok(candidates.into_iter().find(|p| p.is_file()))
+    /// Discover a pre-exported `schema.ir.json` file in the workspace or validate an explicit override.
+    pub fn discover_schema_ir_path(
+        &self,
+        override_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        self.discover_named_schema_file("schema.ir.json", "Schema IR", override_path)
+    }
+
+    /// Discover Alembic configuration (`alembic.ini`) and `alembic/versions/` directory if present.
+    #[must_use]
+    pub fn discover_alembic_paths(&self) -> Option<AlembicPaths> {
+        let roots = [&self.server_root, &self.project_root];
+        for root in roots {
+            let ini_path = root.join("alembic.ini");
+            let script_location = root.join("alembic");
+            let versions_dir = script_location.join("versions");
+            if versions_dir.is_dir() && (ini_path.is_file() || script_location.join("env.py").is_file()) {
+                return Some(AlembicPaths {
+                    ini_path,
+                    script_location,
+                    versions_dir,
+                });
+            }
+        }
+        None
     }
 }
 
@@ -240,5 +291,38 @@ mod tests {
             from_src.resolve_sqlite_path("app.db"),
             from_src.server_root.join("app.db")
         );
+    }
+
+    #[test]
+    fn discover_schema_ir_alembic_and_from_code_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let src = temp.path().join("src");
+        let alembic_versions = src.join("alembic").join("versions");
+        let include_schemas = src.join("include").join("schemas");
+        std::fs::create_dir_all(&alembic_versions).unwrap();
+        std::fs::create_dir_all(&include_schemas).unwrap();
+        std::fs::write(src.join("main.py"), "# cfms").unwrap();
+        std::fs::write(src.join("alembic.ini"), "[alembic]\n").unwrap();
+        std::fs::write(src.join("alembic").join("env.py"), "# env\n").unwrap();
+        std::fs::write(include_schemas.join("schema.ir.json"), "{}").unwrap();
+
+        // Notice `config.toml` is absent: `from_code_dir` still works cleanly.
+        let code_paths = WorkspacePaths::from_code_dir(&src).expect("from_code_dir");
+        assert_eq!(
+            code_paths.server_root,
+            WorkspacePaths::canonicalize_clean(&src)
+        );
+        let ir_path = code_paths
+            .discover_schema_ir_path(None)
+            .expect("discover ir")
+            .expect("some schema.ir.json");
+        assert_eq!(ir_path, WorkspacePaths::canonicalize_clean(&include_schemas.join("schema.ir.json")));
+
+        let ap = code_paths.discover_alembic_paths().expect("alembic paths");
+        assert_eq!(ap.ini_path, code_paths.server_root.join("alembic.ini"));
+        assert_eq!(ap.versions_dir, code_paths.server_root.join("alembic").join("versions"));
+
+        let missing = code_paths.discover_schema_ir_path(Some(Path::new("does-not-exist.json")));
+        assert!(missing.is_err());
     }
 }

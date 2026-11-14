@@ -5,7 +5,9 @@ use serde::Serialize;
 use crate::cli::doctor::DoctorArgs;
 use crate::core::{ConfigDocument, Result, RuntimeLock, ServerConfigSummary, WorkspacePaths};
 use crate::db::DbPool;
-use crate::db::schema::{SchemaDriftReport, SchemaInspector};
+use crate::db::schema::{
+    ExtractorMode, SchemaDriftReport, SchemaInspector, builtin_schema_ir, extract_code_schema_ir,
+};
 use crate::ops::AppContext;
 use crate::ui::{CommandReport, KeyValueTable, UiConsole};
 
@@ -99,6 +101,21 @@ impl CommandReport for DoctorReport {
                         schema.missing_tables.join(", ")
                     },
                 );
+            if !schema.column_mismatches.is_empty() {
+                db_table.row("Column Drift", schema.column_mismatches.join("; "));
+            }
+            if !schema.constraint_mismatches.is_empty() {
+                db_table.row(
+                    "Constraint Drift",
+                    format!("{} difference(s)", schema.constraint_mismatches.len()),
+                );
+            }
+            if !schema.index_mismatches.is_empty() {
+                db_table.row(
+                    "Index Drift",
+                    format!("{} difference(s)", schema.index_mismatches.len()),
+                );
+            }
             db_table.print();
         } else if let Some(err) = &self.database_error {
             ui.print_warning(&format!("Database inspection failed: {err}"));
@@ -129,8 +146,18 @@ pub async fn handle(ctx: &AppContext, args: DoctorArgs) -> Result<()> {
         match ConfigDocument::load(&paths.config_path).and_then(|doc| doc.summary()) {
             Ok(summary) => {
                 if !args.skip_db {
+                    let target_ir = extract_code_schema_ir(
+                        &paths,
+                        ExtractorMode::Auto,
+                        None,
+                        None,
+                        false,
+                        true,
+                    )
+                    .await
+                    .unwrap_or_else(|_| builtin_schema_ir(false));
                     match DbPool::connect(&summary.database, &paths).await {
-                        Ok(pool) => match SchemaInspector::inspect(&pool).await {
+                        Ok(pool) => match SchemaInspector::inspect_against_ir(&pool, &target_ir).await {
                             Ok(report) => database_schema = Some(report),
                             Err(e) => database_error = Some(e.to_string()),
                         },

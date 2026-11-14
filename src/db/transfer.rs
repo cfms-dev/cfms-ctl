@@ -1,7 +1,7 @@
 //! Cross-database streaming table transfer, node tree topological copy, and
 //! canonical SHA-256 verification across SQLite, MySQL, and PostgreSQL.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::time::Instant;
 
@@ -13,10 +13,13 @@ use uuid::Uuid;
 
 use crate::core::error::{CfmsError, Result};
 use crate::db::backend::{DatabaseKind, DbPool};
-use crate::db::schema::ddl::{ColumnDef, ColumnType, TableDef, ordered_tables_for, table_def};
-use crate::db::schema::registry::{
-    DEFERRED_COLUMNS, DEFERRED_UPDATE_ORDER, LATEST_SCHEMA_REVISION, SERIAL_IDENTITY_COLUMNS,
+use crate::db::schema::ddl::{
+    ColumnDef, ColumnType, builtin_schema_ir, execute_ddl_statements,
 };
+use crate::db::schema::graph::infer_transfer_metadata;
+use crate::db::schema::ir::{CanonicalType, ColumnIr, SchemaIr, TableIr, TableOwnership};
+use crate::db::schema::registry::LATEST_SCHEMA_REVISION;
+use crate::db::schema::render::compile_full_schema_ddl;
 use crate::db::schema::{
     SchemaInspector, create_head_schema, drop_all_cfms_tables, set_alembic_version,
 };
@@ -81,10 +84,113 @@ pub(crate) enum SqlValue {
     Json(serde_json::Value),
 }
 
+#[derive(Debug, Clone)]
+struct TransferColumn {
+    name: String,
+    col_type: ColumnType,
+    is_generated: bool,
+}
+
+impl TransferColumn {
+    fn from_def(col: &ColumnDef) -> Self {
+        Self {
+            name: col.name.to_string(),
+            col_type: col.col_type,
+            is_generated: col.generated_expr.is_some(),
+        }
+    }
+
+    fn from_ir(col: &ColumnIr) -> Self {
+        Self {
+            name: col.name.clone(),
+            col_type: canonical_to_transfer_type(&col.canonical_type),
+            is_generated: col.computed.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TransferTable {
+    name: String,
+    columns: Vec<TransferColumn>,
+    pk_columns: Vec<String>,
+}
+
+impl TransferTable {
+    fn from_ir(table: &TableIr) -> Self {
+        Self {
+            name: table.name.clone(),
+            columns: table.columns.iter().map(TransferColumn::from_ir).collect(),
+            pk_columns: table.primary_key.columns.clone(),
+        }
+    }
+
+    fn data_columns(&self) -> impl Iterator<Item = &TransferColumn> {
+        self.columns.iter().filter(|c| !c.is_generated)
+    }
+}
+
+fn canonical_to_transfer_type(ct: &CanonicalType) -> ColumnType {
+    match ct {
+        CanonicalType::Varchar { length } => {
+            ColumnType::Varchar(length.unwrap_or(255).min(u32::from(u16::MAX)) as u16)
+        }
+        CanonicalType::Char { .. }
+        | CanonicalType::Text
+        | CanonicalType::MediumText
+        | CanonicalType::Enum { .. }
+        | CanonicalType::DateTime { .. }
+        | CanonicalType::Date
+        | CanonicalType::Time { .. }
+        | CanonicalType::Custom { .. } => ColumnType::Text,
+        CanonicalType::LongText => ColumnType::LongText,
+        CanonicalType::SmallInt => ColumnType::SmallInt,
+        CanonicalType::Integer => ColumnType::Integer,
+        CanonicalType::BigInt => ColumnType::BigInt,
+        CanonicalType::SqliteIntElseBigInt => ColumnType::SqliteIntElseBigInt,
+        CanonicalType::Serial => ColumnType::Serial,
+        CanonicalType::BigSerial => ColumnType::BigSerial,
+        CanonicalType::Float | CanonicalType::Double | CanonicalType::Numeric { .. } => {
+            ColumnType::Double
+        }
+        CanonicalType::Boolean => ColumnType::Boolean,
+        CanonicalType::Uuid => ColumnType::Uuid,
+        CanonicalType::Json | CanonicalType::Jsonb => ColumnType::Json,
+        CanonicalType::FixedBinary { length: Some(32) } => ColumnType::FixedBinary32,
+        CanonicalType::Blob | CanonicalType::FixedBinary { .. } | CanonicalType::VarBinary { .. } => {
+            ColumnType::Blob
+        }
+    }
+}
+
+fn active_schema_subset(base: &SchemaIr, active_extensions: &[String]) -> SchemaIr {
+    let ext_set: BTreeSet<&str> = active_extensions.iter().map(String::as_str).collect();
+    let mut sub = SchemaIr::new(base.source, base.schema_revision.clone());
+    for (name, table) in &base.tables {
+        let include = match &table.ownership {
+            TableOwnership::Core => true,
+            TableOwnership::Extension(_) => ext_set.contains(name.as_str()),
+        };
+        if include {
+            sub.tables.insert(name.clone(), table.clone());
+        }
+    }
+    sub
+}
+
 /// Inspect and validate source & target readiness before mutating anything on the target database.
 pub async fn inspect_migration_readiness(
     source: &DbPool,
     target: &DbPool,
+) -> Result<MigrationPlan> {
+    inspect_migration_readiness_with_ir(source, target, None).await
+}
+
+/// Inspect and validate source & target readiness against an explicit or built-in [`SchemaIr`].
+pub async fn inspect_migration_readiness_with_ir(
+    source: &DbPool,
+    target: &DbPool,
+    schema_ir: Option<&SchemaIr>,
 ) -> Result<MigrationPlan> {
     let mut warnings = Vec::new();
     let src_compat = source.validate_server_compatibility().await?;
@@ -92,12 +198,21 @@ pub async fn inspect_migration_readiness(
     let dst_compat = target.validate_server_compatibility().await?;
     warnings.extend(dst_compat.warnings);
 
-    let report = SchemaInspector::inspect(source).await?;
+    let effective_ir = match schema_ir {
+        Some(ir) => ir.clone(),
+        None => builtin_schema_ir(true),
+    };
+    let expected_revision = effective_ir
+        .schema_revision
+        .as_deref()
+        .unwrap_or(LATEST_SCHEMA_REVISION);
+
+    let report = SchemaInspector::inspect_against_ir(source, &effective_ir).await?;
     let source_revision = match report.current_revision.as_deref() {
-        Some(rev) if rev == LATEST_SCHEMA_REVISION => rev.to_string(),
+        Some(rev) if rev == expected_revision => rev.to_string(),
         Some(rev) => {
             return Err(CfmsError::SchemaDrift(format!(
-                "Source database revision is '{rev}', expected HEAD '{LATEST_SCHEMA_REVISION}'. Run `cfms-ctl database upgrade` first."
+                "Source database revision is '{rev}', expected HEAD '{expected_revision}'. Run `cfms-ctl database upgrade` first."
             )));
         }
         None => {
@@ -112,6 +227,12 @@ pub async fn inspect_migration_readiness(
         return Err(CfmsError::SchemaDrift(format!(
             "Source database is missing required CFMS tables: {}",
             report.missing_tables.join(", ")
+        )));
+    }
+    if !report.column_mismatches.is_empty() {
+        return Err(CfmsError::SchemaDrift(format!(
+            "Source database has column drift against expected schema: {}",
+            report.column_mismatches.join("; ")
         )));
     }
 
@@ -135,7 +256,8 @@ pub async fn inspect_migration_readiness(
         )));
     }
 
-    let ordered = ordered_tables_for(&known_extensions);
+    let active_ir = active_schema_subset(&effective_ir, &known_extensions);
+    let (_, _, ordered_names) = infer_transfer_metadata(&active_ir, target.kind());
 
     Ok(MigrationPlan {
         source_dialect: source.kind(),
@@ -143,7 +265,7 @@ pub async fn inspect_migration_readiness(
         source_revision,
         extension_tables: known_extensions,
         warnings,
-        table_count: ordered.len(),
+        table_count: ordered_names.len(),
     })
 }
 
@@ -152,14 +274,53 @@ pub async fn inspect_migration_readiness(
 pub async fn migrate_database_contents<F>(
     source: &DbPool,
     target: &DbPool,
+    on_progress: F,
+) -> Result<DatabaseTransferSummary>
+where
+    F: FnMut(MigrationProgress<'_>),
+{
+    migrate_database_contents_with_ir(source, target, None, on_progress).await
+}
+
+/// Migrate full CFMS database schema and contents using an explicit or built-in [`SchemaIr`].
+pub async fn migrate_database_contents_with_ir<F>(
+    source: &DbPool,
+    target: &DbPool,
+    schema_ir: Option<&SchemaIr>,
     mut on_progress: F,
 ) -> Result<DatabaseTransferSummary>
 where
     F: FnMut(MigrationProgress<'_>),
 {
     let started = Instant::now();
-    let plan = inspect_migration_readiness(source, target).await?;
-    let tables = ordered_tables_for(&plan.extension_tables);
+    let plan = inspect_migration_readiness_with_ir(source, target, schema_ir).await?;
+    let base_ir = match schema_ir {
+        Some(ir) => ir.clone(),
+        None => builtin_schema_ir(true),
+    };
+    let active_ir = active_schema_subset(&base_ir, &plan.extension_tables);
+    let (serial_cols, mut deferred_cols, ordered_names) =
+        infer_transfer_metadata(&active_ir, target.kind());
+
+    let use_node_hierarchy_copy = active_ir.tables.contains_key("nodes")
+        && active_ir.tables.contains_key("folders")
+        && active_ir.tables.contains_key("documents")
+        && active_ir
+            .tables
+            .get("nodes")
+            .is_some_and(|n| n.column("parent_id").is_some());
+    if use_node_hierarchy_copy
+        && let Some(node_deferred) = deferred_cols.get_mut("nodes")
+    {
+        // Depth-ordered CTE insertion guarantees every parent folder already exists;
+        // nulling `nodes.parent_id` would violate `ck_nodes_root_parent`.
+        node_deferred.retain(|col| col != "parent_id");
+    }
+
+    let tables: Vec<TransferTable> = ordered_names
+        .iter()
+        .filter_map(|name| active_ir.tables.get(name).map(TransferTable::from_ir))
+        .collect();
     let include_oidc = plan
         .extension_tables
         .iter()
@@ -179,7 +340,13 @@ where
     };
 
     report_progress("Creating target head schema");
-    if let Err(err) = create_head_schema(target, include_oidc).await {
+    let create_res = if schema_ir.is_some() {
+        let stmts = compile_full_schema_ddl(&active_ir, target.kind());
+        execute_ddl_statements(target, &stmts).await
+    } else {
+        create_head_schema(target, include_oidc).await
+    };
+    if let Err(err) = create_res {
         let _ = cleanup_target_schema(target).await;
         return Err(err);
     }
@@ -187,9 +354,9 @@ where
     let copy_and_verify: Result<Vec<TableTransferSummary>> = async {
         // Transfer all data rows & deferred columns within a single target write transaction
         // (for atomic/fast bulk ingestion), then verify committed target rows.
-        copy_all_tables(source, target, &tables, &mut report_progress).await?;
+        copy_all_tables(source, target, &tables, &deferred_cols, &mut report_progress).await?;
         set_alembic_version(target, &plan.source_revision).await?;
-        sync_target_sequences(target).await?;
+        sync_target_sequences(target, &serial_cols).await?;
 
         let mut summaries = Vec::with_capacity(tables.len());
         for table in &tables {
@@ -266,7 +433,11 @@ async fn validate_oidc_table(source: &DbPool) -> Result<()> {
             comment: None,
         },
     ];
-    let mut rows = stream_query(source, sql, VALIDATE_COLS).await?;
+    let validate_cols: Vec<TransferColumn> = VALIDATE_COLS
+        .iter()
+        .map(TransferColumn::from_def)
+        .collect();
+    let mut rows = stream_query(source, sql, &validate_cols).await?;
     while let Some(res) = rows.next().await {
         let row = res?;
         let cred_id = match &row[0] {
@@ -364,34 +535,54 @@ impl TargetTx<'_> {
 async fn copy_all_tables<F>(
     source: &DbPool,
     target: &DbPool,
-    tables: &[&'static TableDef],
+    tables: &[TransferTable],
+    deferred_cols: &BTreeMap<String, Vec<String>>,
     report_progress: &mut F,
 ) -> Result<()>
 where
     F: FnMut(&str),
 {
     let mut tx = TargetTx::begin(target).await?;
+    let nodes_tbl = tables.iter().find(|t| t.name == "nodes");
+    let folders_tbl = tables.iter().find(|t| t.name == "folders");
+    let documents_tbl = tables.iter().find(|t| t.name == "documents");
+    let use_node_hierarchy_copy = nodes_tbl.is_some()
+        && folders_tbl.is_some()
+        && documents_tbl.is_some()
+        && nodes_tbl.is_some_and(|n| n.columns.iter().any(|c| c.name == "parent_id"));
 
     for table in tables {
-        match table.name {
-            "nodes" => {
+        match table.name.as_str() {
+            "nodes" if use_node_hierarchy_copy => {
                 report_progress("Copying nodes, folders, documents");
-                copy_node_tables(source, &mut tx).await?;
+                copy_node_tables(
+                    source,
+                    &mut tx,
+                    nodes_tbl.unwrap(),
+                    folders_tbl.unwrap(),
+                    documents_tbl.unwrap(),
+                    deferred_cols,
+                )
+                .await?;
                 report_progress("Copied folders");
                 report_progress("Copied documents");
             }
-            "folders" | "documents" => {
+            "folders" | "documents" if use_node_hierarchy_copy => {
                 // Already copied depth-by-depth together with `nodes`.
             }
             _ => {
                 report_progress(&format!("Copying {}", table.name));
-                copy_regular_table(source, &mut tx, table).await?;
+                let deferred = deferred_cols
+                    .get(&table.name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                copy_regular_table(source, &mut tx, table, deferred).await?;
             }
         }
     }
 
     report_progress("Restoring deferred foreign keys");
-    restore_deferred_columns(source, &mut tx).await?;
+    restore_deferred_columns(source, &mut tx, tables, deferred_cols).await?;
 
     tx.commit().await?;
     Ok(())
@@ -400,15 +591,15 @@ where
 async fn copy_regular_table(
     source: &DbPool,
     tx: &mut TargetTx<'_>,
-    table: &'static TableDef,
+    table: &TransferTable,
+    deferred: &[String],
 ) -> Result<()> {
-    let data_cols: Vec<ColumnDef> = table.data_columns().copied().collect();
+    let data_cols: Vec<TransferColumn> = table.data_columns().cloned().collect();
     let select_sql = build_select_sql(source.kind(), table, &data_cols, false);
-    let deferred = deferred_cols_for(table.name);
     let deferred_indices: Vec<usize> = data_cols
         .iter()
         .enumerate()
-        .filter(|(_, c)| deferred.contains(&c.name))
+        .filter(|(_, c)| deferred.iter().any(|d| d == &c.name))
         .map(|(i, _)| i)
         .collect();
 
@@ -423,58 +614,75 @@ async fn copy_regular_table(
         }
         batch.push(row);
         if batch.len() >= batch_size {
-            insert_batch(tx, table.name, &data_cols, &batch).await?;
+            insert_batch(tx, &table.name, &data_cols, &batch).await?;
             batch.clear();
         }
     }
 
     if !batch.is_empty() {
-        insert_batch(tx, table.name, &data_cols, &batch).await?;
+        insert_batch(tx, &table.name, &data_cols, &batch).await?;
     }
     Ok(())
 }
 
-async fn copy_node_tables(source: &DbPool, tx: &mut TargetTx<'_>) -> Result<()> {
-    let nodes_def = table_def("nodes")
-        .ok_or_else(|| CfmsError::Database("Missing 'nodes' table definition".to_string()))?;
-    let folders_def = table_def("folders")
-        .ok_or_else(|| CfmsError::Database("Missing 'folders' table definition".to_string()))?;
-    let documents_def = table_def("documents")
-        .ok_or_else(|| CfmsError::Database("Missing 'documents' table definition".to_string()))?;
-
-    let node_cols: Vec<ColumnDef> = nodes_def.data_columns().copied().collect();
-    let folder_cols: Vec<ColumnDef> = folders_def.data_columns().copied().collect();
-    let doc_cols: Vec<ColumnDef> = documents_def.data_columns().copied().collect();
+async fn copy_node_tables(
+    source: &DbPool,
+    tx: &mut TargetTx<'_>,
+    nodes_def: &TransferTable,
+    folders_def: &TransferTable,
+    documents_def: &TransferTable,
+    deferred_cols: &BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    let node_cols: Vec<TransferColumn> = nodes_def.data_columns().cloned().collect();
+    let folder_cols: Vec<TransferColumn> = folders_def.data_columns().cloned().collect();
+    let doc_cols: Vec<TransferColumn> = documents_def.data_columns().cloned().collect();
 
     let total_source_nodes = count_table_rows(source, "nodes").await?;
     if total_source_nodes == 0 {
         return Ok(());
     }
 
-    let node_rule_idx = node_cols.iter().position(|c| c.name == "access_rule_set_id");
+    let node_deferred = deferred_cols.get("nodes").map(Vec::as_slice).unwrap_or(&[]);
+    let folder_deferred = deferred_cols.get("folders").map(Vec::as_slice).unwrap_or(&[]);
+    let doc_deferred = deferred_cols.get("documents").map(Vec::as_slice).unwrap_or(&[]);
+
+    // Note `full_row` prepends synthetic `migration_depth` at index 0, so deferred indices shift +1!
+    let node_deferred_indices: Vec<usize> = node_cols
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| node_deferred.iter().any(|d| d == &c.name) || c.name == "access_rule_set_id")
+        .map(|(i, _)| i + 1)
+        .collect();
     let node_id_idx = node_cols
         .iter()
         .position(|c| c.name == "id")
-        .ok_or_else(|| CfmsError::Database("Missing nodes.id column".to_string()))?;
-    let doc_rev_idx = doc_cols
+        .ok_or_else(|| CfmsError::Database("Missing nodes.id column".to_string()))?
+        + 1;
+    let folder_deferred_indices: Vec<usize> = folder_cols
         .iter()
-        .position(|c| c.name == "current_revision_id");
+        .enumerate()
+        .filter(|(_, c)| folder_deferred.iter().any(|d| d == &c.name))
+        .map(|(i, _)| i)
+        .collect();
+    let doc_deferred_indices: Vec<usize> = doc_cols
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| doc_deferred.iter().any(|d| d == &c.name) || c.name == "current_revision_id")
+        .map(|(i, _)| i)
+        .collect();
 
     // Prepend synthetic `migration_depth` column to decode alongside `nodes` data columns.
     let mut cte_cols = Vec::with_capacity(1 + node_cols.len());
-    cte_cols.push(ColumnDef {
-        name: "migration_depth",
+    cte_cols.push(TransferColumn {
+        name: "migration_depth".to_string(),
         col_type: ColumnType::BigInt,
-        nullable: false,
-        default: crate::db::schema::ddl::DefaultClause::None,
-        generated_expr: None,
-        comment: None,
+        is_generated: false,
     });
-    cte_cols.extend_from_slice(&node_cols);
+    cte_cols.extend(node_cols.iter().cloned());
 
     let qualified_node_cols = node_cols
         .iter()
-        .map(|c| format!("child.{}", quote_ident(source.kind(), c.name)))
+        .map(|c| format!("child.{}", quote_ident(source.kind(), &c.name)))
         .collect::<Vec<_>>()
         .join(", ");
     let order_id_col = text_order_expr(source.kind(), "child.id");
@@ -502,8 +710,8 @@ async fn copy_node_tables(source: &DbPool, tx: &mut TargetTx<'_>) -> Result<()> 
     let mut rows = stream_query(source, &cte_sql, &cte_cols).await?;
     while let Some(res) = rows.next().await {
         let mut full_row = res?;
-        let depth = match full_row.remove(0) {
-            SqlValue::I64(d) => d,
+        let depth = match &full_row[0] {
+            SqlValue::I64(d) => *d,
             other => {
                 return Err(CfmsError::Database(format!(
                     "Unexpected CTE migration_depth value: {other:?}"
@@ -524,7 +732,8 @@ async fn copy_node_tables(source: &DbPool, tx: &mut TargetTx<'_>) -> Result<()> 
                 &node_cols,
                 &folder_cols,
                 &doc_cols,
-                doc_rev_idx,
+                &folder_deferred_indices,
+                &doc_deferred_indices,
             )
             .await?;
             pending_nodes.clear();
@@ -532,7 +741,7 @@ async fn copy_node_tables(source: &DbPool, tx: &mut TargetTx<'_>) -> Result<()> 
         }
         current_depth = Some(depth);
 
-        if let Some(idx) = node_rule_idx {
+        for &idx in &node_deferred_indices {
             full_row[idx] = SqlValue::Null;
         }
         let node_id = match &full_row[node_id_idx] {
@@ -544,7 +753,7 @@ async fn copy_node_tables(source: &DbPool, tx: &mut TargetTx<'_>) -> Result<()> 
             }
         };
         pending_ids.push(node_id);
-        pending_nodes.push(full_row);
+        pending_nodes.push(full_row[1..].to_vec());
     }
 
     if !pending_nodes.is_empty() {
@@ -556,7 +765,8 @@ async fn copy_node_tables(source: &DbPool, tx: &mut TargetTx<'_>) -> Result<()> 
             &node_cols,
             &folder_cols,
             &doc_cols,
-            doc_rev_idx,
+            &folder_deferred_indices,
+            &doc_deferred_indices,
         )
         .await?;
     }
@@ -576,14 +786,20 @@ async fn flush_node_batch(
     tx: &mut TargetTx<'_>,
     node_rows: &[Vec<SqlValue>],
     node_ids: &[String],
-    node_cols: &[ColumnDef],
-    folder_cols: &[ColumnDef],
-    doc_cols: &[ColumnDef],
-    doc_rev_idx: Option<usize>,
+    node_cols: &[TransferColumn],
+    folder_cols: &[TransferColumn],
+    doc_cols: &[TransferColumn],
+    folder_deferred_indices: &[usize],
+    doc_deferred_indices: &[usize],
 ) -> Result<u64> {
-    let folder_rows = fetch_rows_by_str_ids(source, "folders", folder_cols, node_ids).await?;
+    let mut folder_rows = fetch_rows_by_str_ids(source, "folders", folder_cols, node_ids).await?;
+    for &idx in folder_deferred_indices {
+        for row in &mut folder_rows {
+            row[idx] = SqlValue::Null;
+        }
+    }
     let mut doc_rows = fetch_rows_by_str_ids(source, "documents", doc_cols, node_ids).await?;
-    if let Some(idx) = doc_rev_idx {
+    for &idx in doc_deferred_indices {
         for row in &mut doc_rows {
             row[idx] = SqlValue::Null;
         }
@@ -609,35 +825,52 @@ async fn flush_node_batch(
     Ok(node_rows.len() as u64)
 }
 
-async fn restore_deferred_columns(source: &DbPool, tx: &mut TargetTx<'_>) -> Result<()> {
-    for &(table_name, pk_col_name, deferred_cols) in DEFERRED_UPDATE_ORDER {
-        let def = table_def(table_name)
+async fn restore_deferred_columns(
+    source: &DbPool,
+    tx: &mut TargetTx<'_>,
+    tables: &[TransferTable],
+    deferred_cols: &BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    for (table_name, cols) in deferred_cols {
+        if cols.is_empty() {
+            continue;
+        }
+        let table = tables
+            .iter()
+            .find(|t| t.name == *table_name)
             .ok_or_else(|| CfmsError::Database(format!("Unknown table '{table_name}'")))?;
-        let pk_def = *def
+        let pk_col_name = table.pk_columns.first().ok_or_else(|| {
+            CfmsError::Database(format!(
+                "Deferred table '{table_name}' has no primary key for deferred FK restoration"
+            ))
+        })?;
+        let pk_def = table
             .columns
             .iter()
-            .find(|c| c.name == pk_col_name)
+            .find(|c| c.name == *pk_col_name)
+            .cloned()
             .ok_or_else(|| {
                 CfmsError::Database(format!("Missing PK column '{table_name}.{pk_col_name}'"))
             })?;
 
-        for &deferred_col_name in deferred_cols {
-            let val_def = *def
+        for deferred_col_name in cols {
+            let val_def = table
                 .columns
                 .iter()
-                .find(|c| c.name == deferred_col_name)
+                .find(|c| c.name == *deferred_col_name)
+                .cloned()
                 .ok_or_else(|| {
                     CfmsError::Database(format!(
                         "Missing deferred column '{table_name}.{deferred_col_name}'"
                     ))
                 })?;
-            let pair_cols = [pk_def, val_def];
+            let pair_cols = [pk_def.clone(), val_def.clone()];
             let sql = format!(
                 "SELECT {}, {} FROM {} WHERE {} IS NOT NULL",
-                quote_ident(source.kind(), pk_def.name),
-                quote_ident(source.kind(), val_def.name),
+                quote_ident(source.kind(), &pk_def.name),
+                quote_ident(source.kind(), &val_def.name),
                 quote_ident(source.kind(), table_name),
-                quote_ident(source.kind(), val_def.name),
+                quote_ident(source.kind(), &val_def.name),
             );
 
             let mut pairs: Vec<(SqlValue, SqlValue)> =
@@ -649,23 +882,23 @@ async fn restore_deferred_columns(source: &DbPool, tx: &mut TargetTx<'_>) -> Res
                 let pk = row.pop().expect("pair pk");
                 pairs.push((pk, val));
                 if pairs.len() >= DEFERRED_UPDATE_BATCH_SIZE {
-                    apply_deferred_update_batch(tx, table_name, pk_def, val_def, &pairs).await?;
+                    apply_deferred_update_batch(tx, table_name, &pk_def, &val_def, &pairs).await?;
                     pairs.clear();
                 }
             }
             if !pairs.is_empty() {
-                apply_deferred_update_batch(tx, table_name, pk_def, val_def, &pairs).await?;
+                apply_deferred_update_batch(tx, table_name, &pk_def, &val_def, &pairs).await?;
             }
         }
     }
     Ok(())
 }
 
-async fn sync_target_sequences(target: &DbPool) -> Result<()> {
+async fn sync_target_sequences(target: &DbPool, serial_cols: &[(String, String)]) -> Result<()> {
     let DbPool::Postgres(pg) = target else {
         return Ok(());
     };
-    for &(table, col) in SERIAL_IDENTITY_COLUMNS {
+    for (table, col) in serial_cols {
         let sql = format!(
             "SELECT setval(pg_get_serial_sequence('{table}', '{col}'), \
              COALESCE((SELECT MAX({col}) FROM {table}), 1), \
@@ -679,14 +912,14 @@ async fn sync_target_sequences(target: &DbPool) -> Result<()> {
 async fn verify_table_parity(
     source: &DbPool,
     target: &DbPool,
-    table: &'static TableDef,
+    table: &TransferTable,
 ) -> Result<TableTransferSummary> {
-    let src_sql = build_select_sql(source.kind(), table, table.columns, true);
-    let dst_sql = build_select_sql(target.kind(), table, table.columns, true);
+    let src_sql = build_select_sql(source.kind(), table, &table.columns, true);
+    let dst_sql = build_select_sql(target.kind(), table, &table.columns, true);
 
     let (src_res, dst_res) = tokio::join!(
-        compute_table_digest(source, &src_sql, table.columns),
-        compute_table_digest(target, &dst_sql, table.columns),
+        compute_table_digest(source, &src_sql, &table.columns),
+        compute_table_digest(target, &dst_sql, &table.columns),
     );
     let (src_count, src_digest) = src_res?;
     let (dst_count, dst_digest) = dst_res?;
@@ -714,7 +947,7 @@ async fn verify_table_parity(
 async fn compute_table_digest(
     pool: &DbPool,
     sql: &str,
-    columns: &[ColumnDef],
+    columns: &[TransferColumn],
 ) -> Result<(u64, String)> {
     let mut hasher = Sha256::new();
     let mut count = 0u64;
@@ -835,13 +1068,6 @@ pub(crate) fn write_canonical_json(val: &serde_json::Value, out: &mut String) ->
     Ok(())
 }
 
-fn deferred_cols_for(table_name: &str) -> &'static [&'static str] {
-    DEFERRED_COLUMNS
-        .iter()
-        .find(|&&(t, _)| t == table_name)
-        .map_or(&[], |&(_, cols)| cols)
-}
-
 fn insert_batch_size(col_count: usize) -> usize {
     MAX_INSERT_ROWS_PER_BATCH.min((MAX_BIND_PARAMS_PER_BATCH / col_count.max(1)).max(1))
 }
@@ -872,24 +1098,24 @@ fn text_order_expr(kind: DatabaseKind, col_expr: &str) -> String {
 
 fn build_select_sql(
     kind: DatabaseKind,
-    table: &TableDef,
-    columns: &[ColumnDef],
+    table: &TransferTable,
+    columns: &[TransferColumn],
     order_by_pk: bool,
 ) -> String {
     let col_list = columns
         .iter()
-        .map(|c| quote_ident(kind, c.name))
+        .map(|c| quote_ident(kind, &c.name))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut sql = format!("SELECT {col_list} FROM {}", quote_ident(kind, table.name));
+    let mut sql = format!("SELECT {col_list} FROM {}", quote_ident(kind, &table.name));
     if order_by_pk && !table.pk_columns.is_empty() {
         let mut order_terms = Vec::with_capacity(table.pk_columns.len());
-        for &pk_name in table.pk_columns {
+        for pk_name in &table.pk_columns {
             let quoted = quote_ident(kind, pk_name);
             let is_text = table
                 .columns
                 .iter()
-                .find(|c| c.name == pk_name)
+                .find(|c| c.name == *pk_name)
                 .is_some_and(|c| {
                     matches!(
                         c.col_type,
@@ -921,7 +1147,7 @@ async fn count_table_rows(pool: &DbPool, table_name: &str) -> Result<u64> {
 async fn fetch_rows_by_str_ids(
     pool: &DbPool,
     table_name: &str,
-    columns: &[ColumnDef],
+    columns: &[TransferColumn],
     ids: &[String],
 ) -> Result<Vec<Vec<SqlValue>>> {
     if ids.is_empty() {
@@ -930,7 +1156,7 @@ async fn fetch_rows_by_str_ids(
     let kind = pool.kind();
     let col_list = columns
         .iter()
-        .map(|c| quote_ident(kind, c.name))
+        .map(|c| quote_ident(kind, &c.name))
         .collect::<Vec<_>>()
         .join(", ");
     let placeholders = (1..=ids.len())
@@ -981,7 +1207,7 @@ async fn fetch_rows_by_str_ids(
 async fn stream_query<'a>(
     pool: &'a DbPool,
     sql: &str,
-    columns: &'a [ColumnDef],
+    columns: &'a [TransferColumn],
 ) -> Result<futures_util::stream::BoxStream<'a, Result<Vec<SqlValue>>>> {
     let sql_owned = sql.to_string();
     let stream: futures_util::stream::BoxStream<'a, Result<Vec<SqlValue>>> = match pool {
@@ -1013,7 +1239,7 @@ async fn stream_query<'a>(
     Ok(stream)
 }
 
-fn decode_sqlite_row(row: &SqliteRow, columns: &[ColumnDef]) -> Result<Vec<SqlValue>> {
+fn decode_sqlite_row(row: &SqliteRow, columns: &[TransferColumn]) -> Result<Vec<SqlValue>> {
     let mut out = Vec::with_capacity(columns.len());
     for (idx, col) in columns.iter().enumerate() {
         let val = match col.col_type {
@@ -1028,11 +1254,11 @@ fn decode_sqlite_row(row: &SqliteRow, columns: &[ColumnDef]) -> Result<Vec<SqlVa
             | ColumnType::BigSerial => row
                 .try_get::<Option<i64>, _>(idx)?
                 .map_or(SqlValue::Null, SqlValue::I64),
-            ColumnType::Double => decode_opt_f64(col.name, row.try_get::<Option<f64>, _>(idx)?)?,
+            ColumnType::Double => decode_opt_f64(&col.name, row.try_get::<Option<f64>, _>(idx)?)?,
             ColumnType::Boolean => row
                 .try_get::<Option<bool>, _>(idx)?
                 .map_or(SqlValue::Null, SqlValue::Bool),
-            ColumnType::Uuid => decode_opt_uuid_str(col.name, row.try_get::<Option<String>, _>(idx)?)?,
+            ColumnType::Uuid => decode_opt_uuid_str(&col.name, row.try_get::<Option<String>, _>(idx)?)?,
             ColumnType::Blob | ColumnType::FixedBinary32 => row
                 .try_get::<Option<Vec<u8>>, _>(idx)?
                 .map_or(SqlValue::Null, SqlValue::Bytes),
@@ -1045,7 +1271,7 @@ fn decode_sqlite_row(row: &SqliteRow, columns: &[ColumnDef]) -> Result<Vec<SqlVa
     Ok(out)
 }
 
-fn decode_mysql_row(row: &MySqlRow, columns: &[ColumnDef]) -> Result<Vec<SqlValue>> {
+fn decode_mysql_row(row: &MySqlRow, columns: &[TransferColumn]) -> Result<Vec<SqlValue>> {
     let mut out = Vec::with_capacity(columns.len());
     for (idx, col) in columns.iter().enumerate() {
         let val = match col.col_type {
@@ -1061,11 +1287,11 @@ fn decode_mysql_row(row: &MySqlRow, columns: &[ColumnDef]) -> Result<Vec<SqlValu
             ColumnType::BigInt | ColumnType::SqliteIntElseBigInt | ColumnType::BigSerial => row
                 .try_get::<Option<i64>, _>(idx)?
                 .map_or(SqlValue::Null, SqlValue::I64),
-            ColumnType::Double => decode_opt_f64(col.name, row.try_get::<Option<f64>, _>(idx)?)?,
+            ColumnType::Double => decode_opt_f64(&col.name, row.try_get::<Option<f64>, _>(idx)?)?,
             ColumnType::Boolean => row
                 .try_get::<Option<bool>, _>(idx)?
                 .map_or(SqlValue::Null, SqlValue::Bool),
-            ColumnType::Uuid => decode_opt_uuid_str(col.name, row.try_get::<Option<String>, _>(idx)?)?,
+            ColumnType::Uuid => decode_opt_uuid_str(&col.name, row.try_get::<Option<String>, _>(idx)?)?,
             ColumnType::Blob | ColumnType::FixedBinary32 => row
                 .try_get::<Option<Vec<u8>>, _>(idx)?
                 .map_or(SqlValue::Null, SqlValue::Bytes),
@@ -1078,7 +1304,7 @@ fn decode_mysql_row(row: &MySqlRow, columns: &[ColumnDef]) -> Result<Vec<SqlValu
     Ok(out)
 }
 
-fn decode_postgres_row(row: &PgRow, columns: &[ColumnDef]) -> Result<Vec<SqlValue>> {
+fn decode_postgres_row(row: &PgRow, columns: &[TransferColumn]) -> Result<Vec<SqlValue>> {
     let mut out = Vec::with_capacity(columns.len());
     for (idx, col) in columns.iter().enumerate() {
         let val = match col.col_type {
@@ -1094,7 +1320,7 @@ fn decode_postgres_row(row: &PgRow, columns: &[ColumnDef]) -> Result<Vec<SqlValu
             ColumnType::BigInt | ColumnType::SqliteIntElseBigInt | ColumnType::BigSerial => row
                 .try_get::<Option<i64>, _>(idx)?
                 .map_or(SqlValue::Null, SqlValue::I64),
-            ColumnType::Double => decode_opt_f64(col.name, row.try_get::<Option<f64>, _>(idx)?)?,
+            ColumnType::Double => decode_opt_f64(&col.name, row.try_get::<Option<f64>, _>(idx)?)?,
             ColumnType::Boolean => row
                 .try_get::<Option<bool>, _>(idx)?
                 .map_or(SqlValue::Null, SqlValue::Bool),
@@ -1138,7 +1364,7 @@ fn decode_opt_uuid_str(col_name: &str, opt: Option<String>) -> Result<SqlValue> 
 async fn insert_batch(
     tx: &mut TargetTx<'_>,
     table_name: &str,
-    columns: &[ColumnDef],
+    columns: &[TransferColumn],
     rows: &[Vec<SqlValue>],
 ) -> Result<()> {
     if rows.is_empty() {
@@ -1152,7 +1378,7 @@ async fn insert_batch(
 
     let col_list = columns
         .iter()
-        .map(|c| quote_ident(kind, c.name))
+        .map(|c| quote_ident(kind, &c.name))
         .collect::<Vec<_>>()
         .join(", ");
     let mut param_idx = 0usize;
@@ -1208,8 +1434,8 @@ async fn insert_batch(
 async fn apply_deferred_update_batch(
     tx: &mut TargetTx<'_>,
     table_name: &str,
-    pk_col: ColumnDef,
-    val_col: ColumnDef,
+    pk_col: &TransferColumn,
+    val_col: &TransferColumn,
     pairs: &[(SqlValue, SqlValue)],
 ) -> Result<()> {
     if pairs.is_empty() {
@@ -1222,8 +1448,8 @@ async fn apply_deferred_update_batch(
     };
 
     let tq = quote_ident(kind, table_name);
-    let pkq = quote_ident(kind, pk_col.name);
-    let vq = quote_ident(kind, val_col.name);
+    let pkq = quote_ident(kind, &pk_col.name);
+    let vq = quote_ident(kind, &val_col.name);
 
     let mut idx = 0usize;
     let mut when_clauses = Vec::with_capacity(pairs.len());
@@ -1250,33 +1476,33 @@ async fn apply_deferred_update_batch(
         TargetTx::Sqlite(inner) => {
             let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             for (pk, val) in pairs {
-                q = bind_sqlite(q, &pk_col, pk)?;
-                q = bind_sqlite(q, &val_col, val)?;
+                q = bind_sqlite(q, pk_col, pk)?;
+                q = bind_sqlite(q, val_col, val)?;
             }
             for (pk, _) in pairs {
-                q = bind_sqlite(q, &pk_col, pk)?;
+                q = bind_sqlite(q, pk_col, pk)?;
             }
             q.execute(&mut **inner).await?;
         }
         TargetTx::Mysql(inner) => {
             let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             for (pk, val) in pairs {
-                q = bind_mysql(q, &pk_col, pk)?;
-                q = bind_mysql(q, &val_col, val)?;
+                q = bind_mysql(q, pk_col, pk)?;
+                q = bind_mysql(q, val_col, val)?;
             }
             for (pk, _) in pairs {
-                q = bind_mysql(q, &pk_col, pk)?;
+                q = bind_mysql(q, pk_col, pk)?;
             }
             q.execute(&mut **inner).await?;
         }
         TargetTx::Postgres(inner) => {
             let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             for (pk, val) in pairs {
-                q = bind_postgres(q, &pk_col, pk)?;
-                q = bind_postgres(q, &val_col, val)?;
+                q = bind_postgres(q, pk_col, pk)?;
+                q = bind_postgres(q, val_col, val)?;
             }
             for (pk, _) in pairs {
-                q = bind_postgres(q, &pk_col, pk)?;
+                q = bind_postgres(q, pk_col, pk)?;
             }
             q.execute(&mut **inner).await?;
         }
@@ -1287,7 +1513,7 @@ async fn apply_deferred_update_batch(
 
 fn bind_sqlite<'q>(
     q: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments>,
-    col: &ColumnDef,
+    col: &TransferColumn,
     val: &'q SqlValue,
 ) -> Result<sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments>> {
     let q = match (col.col_type, val) {
@@ -1338,7 +1564,7 @@ fn bind_sqlite<'q>(
 
 fn bind_mysql<'q>(
     q: sqlx::query::Query<'q, MySql, sqlx::mysql::MySqlArguments>,
-    col: &ColumnDef,
+    col: &TransferColumn,
     val: &'q SqlValue,
 ) -> Result<sqlx::query::Query<'q, MySql, sqlx::mysql::MySqlArguments>> {
     let q = match (col.col_type, val) {
@@ -1395,7 +1621,7 @@ fn bind_mysql<'q>(
 
 fn bind_postgres<'q>(
     q: sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
-    col: &ColumnDef,
+    col: &TransferColumn,
     val: &'q SqlValue,
 ) -> Result<sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>> {
     let q = match (col.col_type, val) {

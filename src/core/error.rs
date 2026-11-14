@@ -15,6 +15,7 @@ pub enum ErrorCode {
     UnfinishedTransaction,
     DatabaseError,
     SchemaDrift,
+    DestructiveMigrationBlocked,
     BackupError,
     ArchiveIntegrityError,
     ExtensionError,
@@ -48,6 +49,9 @@ pub enum CfmsError {
 
     #[error("Database schema validation failed: {0}")]
     SchemaDrift(String),
+
+    #[error("Destructive or blocking database migration requires explicit operator approval: {0}")]
+    DestructiveMigrationBlocked(String),
 
     #[error("Backup operation error: {0}")]
     Backup(String),
@@ -86,6 +90,7 @@ impl CfmsError {
             Self::UnfinishedTransaction(_) => ErrorCode::UnfinishedTransaction,
             Self::Database(_) => ErrorCode::DatabaseError,
             Self::SchemaDrift(_) => ErrorCode::SchemaDrift,
+            Self::DestructiveMigrationBlocked(_) => ErrorCode::DestructiveMigrationBlocked,
             Self::Backup(_) => ErrorCode::BackupError,
             Self::ArchiveIntegrity(_) => ErrorCode::ArchiveIntegrityError,
             Self::Extension(_) => ErrorCode::ExtensionError,

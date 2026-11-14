@@ -3,10 +3,17 @@
 //! Matches SQLAlchemy `Base.metadata` (`create_all`) and `user_oidc_credentials`
 //! column types, constraint names, generated columns, and functional indexes.
 
+use std::collections::BTreeMap;
+
 use sqlx::Acquire;
 use crate::core::error::Result;
 use crate::db::backend::{DatabaseKind, DbPool};
-use crate::db::schema::registry::KNOWN_EXTENSION_TABLES;
+use crate::db::schema::ir::{
+    CanonicalType, CheckIr, ColumnIr, ComputedColumnIr, ConfidenceLevel, ExtractionSource,
+    ForeignKeyIr, IndexIr, PrimaryKeyIr, ReferentialAction, SchemaIr, ServerDefaultIr, TableIr,
+    TableOwnership, UniqueIr,
+};
+use crate::db::schema::registry::{KNOWN_EXTENSION_TABLES, LATEST_SCHEMA_REVISION};
 
 /// Canonical column semantic data type across SQLite, MySQL, and PostgreSQL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,43 +35,35 @@ pub enum ColumnType {
     FixedBinary32,
 }
 
+impl From<ColumnType> for CanonicalType {
+    fn from(ct: ColumnType) -> Self {
+        match ct {
+            ColumnType::Varchar(len) => Self::Varchar {
+                length: Some(u32::from(len)),
+            },
+            ColumnType::Text => Self::Text,
+            ColumnType::LongText => Self::LongText,
+            ColumnType::SmallInt => Self::SmallInt,
+            ColumnType::Integer => Self::Integer,
+            ColumnType::BigInt => Self::BigInt,
+            ColumnType::SqliteIntElseBigInt => Self::SqliteIntElseBigInt,
+            ColumnType::Serial => Self::Serial,
+            ColumnType::BigSerial => Self::BigSerial,
+            ColumnType::Double => Self::Double,
+            ColumnType::Boolean => Self::Boolean,
+            ColumnType::Uuid => Self::Uuid,
+            ColumnType::Json => Self::Json,
+            ColumnType::Blob => Self::Blob,
+            ColumnType::FixedBinary32 => Self::FixedBinary { length: Some(32) },
+        }
+    }
+}
+
 impl ColumnType {
     /// Render the exact dialect DDL column type.
     #[must_use]
     pub fn ddl_type(self, kind: DatabaseKind) -> String {
-        match (self, kind) {
-            (Self::Varchar(len), _) => format!("VARCHAR({len})"),
-            (Self::Text, _) => "TEXT".to_string(),
-            (Self::LongText, DatabaseKind::Mysql) => "LONGTEXT".to_string(),
-            (Self::LongText, DatabaseKind::Sqlite | DatabaseKind::Postgresql) => "TEXT".to_string(),
-            (Self::SmallInt, _) => "SMALLINT".to_string(),
-            (Self::Integer, _) => "INTEGER".to_string(),
-            (Self::BigInt, _) => "BIGINT".to_string(),
-            (Self::SqliteIntElseBigInt, DatabaseKind::Sqlite) => "INTEGER".to_string(),
-            (Self::SqliteIntElseBigInt, DatabaseKind::Mysql | DatabaseKind::Postgresql) => {
-                "BIGINT".to_string()
-            }
-            (Self::Serial, DatabaseKind::Sqlite) => "INTEGER".to_string(),
-            (Self::Serial, DatabaseKind::Mysql) => "INTEGER NOT NULL AUTO_INCREMENT".to_string(),
-            (Self::Serial, DatabaseKind::Postgresql) => "SERIAL".to_string(),
-            (Self::BigSerial, DatabaseKind::Sqlite) => "INTEGER".to_string(),
-            (Self::BigSerial, DatabaseKind::Mysql) => "BIGINT NOT NULL AUTO_INCREMENT".to_string(),
-            (Self::BigSerial, DatabaseKind::Postgresql) => "BIGSERIAL".to_string(),
-            (Self::Double, DatabaseKind::Sqlite | DatabaseKind::Mysql) => "DOUBLE".to_string(),
-            (Self::Double, DatabaseKind::Postgresql) => "DOUBLE PRECISION".to_string(),
-            (Self::Boolean, DatabaseKind::Mysql) => "BOOL".to_string(),
-            (Self::Boolean, DatabaseKind::Sqlite | DatabaseKind::Postgresql) => {
-                "BOOLEAN".to_string()
-            }
-            (Self::Uuid, DatabaseKind::Sqlite | DatabaseKind::Mysql) => "CHAR(32)".to_string(),
-            (Self::Uuid, DatabaseKind::Postgresql) => "UUID".to_string(),
-            (Self::Json, _) => "JSON".to_string(),
-            (Self::Blob, DatabaseKind::Sqlite | DatabaseKind::Mysql) => "BLOB".to_string(),
-            (Self::Blob, DatabaseKind::Postgresql) => "BYTEA".to_string(),
-            (Self::FixedBinary32, DatabaseKind::Sqlite) => "BLOB".to_string(),
-            (Self::FixedBinary32, DatabaseKind::Mysql) => "BINARY(32)".to_string(),
-            (Self::FixedBinary32, DatabaseKind::Postgresql) => "BYTEA".to_string(),
-        }
+        CanonicalType::from(self).ddl_type(kind)
     }
 
     #[must_use]
@@ -163,16 +162,6 @@ pub enum OnDelete {
     SetNull,
 }
 
-impl OnDelete {
-    const fn sql_suffix(self) -> &'static str {
-        match self {
-            Self::Restrict => "",
-            Self::Cascade => " ON DELETE CASCADE",
-            Self::SetNull => " ON DELETE SET NULL",
-        }
-    }
-}
-
 /// Foreign key constraint definition.
 #[derive(Debug, Clone, Copy)]
 pub struct ForeignKeyDef {
@@ -224,25 +213,6 @@ impl ForeignKeyDef {
             on_delete,
             cyclic_alter: true,
         }
-    }
-
-    const fn name_for(self, kind: DatabaseKind) -> &'static str {
-        match kind {
-            DatabaseKind::Sqlite => self.name_sqlite,
-            DatabaseKind::Mysql => self.name_mysql,
-            DatabaseKind::Postgresql => self.name_postgres,
-        }
-    }
-
-    fn constraint_sql(self, kind: DatabaseKind) -> String {
-        format!(
-            "CONSTRAINT {} FOREIGN KEY({}) REFERENCES {} ({}){}",
-            self.name_for(kind),
-            self.column,
-            self.ref_table,
-            self.ref_column,
-            self.on_delete.sql_suffix()
-        )
     }
 }
 
@@ -300,19 +270,6 @@ impl IndexDef {
             cols_mysql,
         }
     }
-
-    fn create_sql(self, kind: DatabaseKind, table_name: &str) -> String {
-        let prefix = if self.unique {
-            "CREATE UNIQUE INDEX"
-        } else {
-            "CREATE INDEX"
-        };
-        let cols = match kind {
-            DatabaseKind::Mysql => self.cols_mysql,
-            DatabaseKind::Sqlite | DatabaseKind::Postgresql => self.cols_sqlite_pg,
-        };
-        format!("{prefix} {} ON {table_name} ({cols})", self.name)
-    }
 }
 
 /// Complete declarative definition of a CFMS application/extension table.
@@ -336,110 +293,165 @@ impl TableDef {
             .filter(|col| col.generated_expr.is_none())
     }
 
+    /// Convert this static `TableDef` into an owned `TableIr`.
+    #[must_use]
+    pub fn to_ir(&self, ownership: TableOwnership) -> TableIr {
+        let columns = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, col)| ColumnIr {
+                name: col.name.to_string(),
+                ordinal,
+                canonical_type: CanonicalType::from(col.col_type),
+                dialect_types: BTreeMap::new(),
+                nullable: col.nullable,
+                autoincrement: col.col_type.is_serial(),
+                server_default: match col.default {
+                    DefaultClause::None => None,
+                    DefaultClause::BooleanFalse => Some(ServerDefaultIr::Boolean { value: false }),
+                },
+                computed: col.generated_expr.map(|expr| ComputedColumnIr {
+                    expression: expr.to_string(),
+                    persisted: true,
+                    dialect_expressions: BTreeMap::new(),
+                }),
+                comment: col.comment.map(ToString::to_string),
+                confidence: ConfidenceLevel::High,
+            })
+            .collect();
+
+        let foreign_keys = self
+            .foreign_keys
+            .iter()
+            .map(|fk| {
+                let mut dialect_names = BTreeMap::new();
+                if fk.name_mysql != fk.name_sqlite {
+                    dialect_names.insert(DatabaseKind::Mysql, fk.name_mysql.to_string());
+                }
+                if fk.name_postgres != fk.name_sqlite {
+                    dialect_names.insert(DatabaseKind::Postgresql, fk.name_postgres.to_string());
+                }
+                ForeignKeyIr {
+                    name: Some(fk.name_sqlite.to_string()),
+                    dialect_names,
+                    columns: vec![fk.column.to_string()],
+                    ref_table: fk.ref_table.to_string(),
+                    ref_columns: vec![fk.ref_column.to_string()],
+                    on_delete: match fk.on_delete {
+                        OnDelete::Restrict => None,
+                        OnDelete::Cascade => Some(ReferentialAction::Cascade),
+                        OnDelete::SetNull => Some(ReferentialAction::SetNull),
+                    },
+                    on_update: None,
+                    defer_on_create: fk.cyclic_alter,
+                }
+            })
+            .collect();
+
+        let uniques = self
+            .uniques
+            .iter()
+            .map(|uq| UniqueIr {
+                name: Some(uq.name.to_string()),
+                dialect_names: BTreeMap::new(),
+                columns: uq.columns.iter().map(|s| (*s).to_string()).collect(),
+            })
+            .collect();
+
+        let checks = self
+            .checks
+            .iter()
+            .map(|ck| CheckIr {
+                name: Some(ck.name.to_string()),
+                dialect_names: BTreeMap::new(),
+                expression: ck.expr.to_string(),
+                dialect_expressions: BTreeMap::new(),
+            })
+            .collect();
+
+        let indexes = self
+            .indexes
+            .iter()
+            .map(|idx| {
+                let mut dialect_clauses = BTreeMap::new();
+                if idx.cols_mysql != idx.cols_sqlite_pg {
+                    dialect_clauses.insert(DatabaseKind::Mysql, idx.cols_mysql.to_string());
+                }
+                IndexIr {
+                    name: idx.name.to_string(),
+                    dialect_names: BTreeMap::new(),
+                    unique: idx.unique,
+                    expressions: split_top_level_commas(idx.cols_sqlite_pg),
+                    dialect_clauses,
+                    where_clause: None,
+                }
+            })
+            .collect();
+
+        TableIr {
+            name: self.name.to_string(),
+            ownership,
+            columns,
+            primary_key: PrimaryKeyIr {
+                name: Some(self.pk_name.to_string()),
+                dialect_names: BTreeMap::new(),
+                columns: self.pk_columns.iter().map(|s| (*s).to_string()).collect(),
+            },
+            foreign_keys,
+            uniques,
+            checks,
+            indexes,
+            comment: None,
+            confidence: ConfidenceLevel::High,
+        }
+    }
+
     /// Compile `CREATE TABLE` SQL for the given dialect (inline cyclic FKs only on SQLite).
     #[must_use]
     pub fn compile_create_table(&self, kind: DatabaseKind) -> String {
-        let mut items = Vec::new();
-        for col in self.columns {
-            let mut clause = format!("\t{} ", col.name);
-            if let Some(expr) = col.generated_expr {
-                clause.push_str(&col.col_type.ddl_type(kind));
-                clause.push_str(" GENERATED ALWAYS AS (");
-                clause.push_str(expr);
-                clause.push_str(") STORED");
-            } else if kind == DatabaseKind::Mysql && col.col_type.is_serial() {
-                clause.push_str(&col.col_type.ddl_type(kind));
-            } else {
-                clause.push_str(&col.col_type.ddl_type(kind));
-                match kind {
-                    DatabaseKind::Mysql => {
-                        if !col.nullable {
-                            clause.push_str(" NOT NULL");
-                        }
-                        if let Some(def) = col.default.render(kind) {
-                            clause.push(' ');
-                            clause.push_str(def);
-                        }
-                    }
-                    DatabaseKind::Sqlite | DatabaseKind::Postgresql => {
-                        if let Some(def) = col.default.render(kind) {
-                            clause.push(' ');
-                            clause.push_str(def);
-                        }
-                        if !col.nullable {
-                            clause.push_str(" NOT NULL");
-                        }
-                    }
-                }
-            }
-            if kind == DatabaseKind::Mysql
-                && let Some(comment) = col.comment
-            {
-                let escaped = comment.replace('\'', "''");
-                clause.push_str(&format!(" COMMENT '{escaped}'"));
-            }
-            items.push(clause);
-        }
-
-        items.push(format!(
-            "\tCONSTRAINT {} PRIMARY KEY ({})",
-            self.pk_name,
-            self.pk_columns.join(", ")
-        ));
-
-        for ck in self.checks {
-            items.push(format!("\tCONSTRAINT {} CHECK ({})", ck.name, ck.expr));
-        }
-        for uq in self.uniques {
-            items.push(format!(
-                "\tCONSTRAINT {} UNIQUE ({})",
-                uq.name,
-                uq.columns.join(", ")
-            ));
-        }
-        for fk in self.foreign_keys {
-            if !fk.cyclic_alter || kind == DatabaseKind::Sqlite {
-                items.push(format!("\t{}", fk.constraint_sql(kind)));
-            }
-        }
-
-        format!("CREATE TABLE {} (\n{}\n)", self.name, items.join(", \n"))
+        self.to_ir(TableOwnership::Core)
+            .compile_create_table(kind, None)
     }
 
     /// Compile index creation SQL statements for the table.
     #[must_use]
     pub fn compile_create_indexes(&self, kind: DatabaseKind) -> Vec<String> {
-        let mut stmts: Vec<String> = self
-            .indexes
-            .iter()
-            .map(|idx| idx.create_sql(kind, self.name))
-            .collect();
-        if kind == DatabaseKind::Postgresql {
-            for col in self.columns {
-                if let Some(comment) = col.comment {
-                    let escaped = comment.replace('\'', "''");
-                    stmts.push(format!(
-                        "COMMENT ON COLUMN {}.{} IS '{escaped}'",
-                        self.name, col.name
-                    ));
-                }
-            }
-        }
-        stmts
+        self.to_ir(TableOwnership::Core)
+            .compile_create_indexes(kind)
     }
 
     /// Compile deferred cyclic `ALTER TABLE ... ADD CONSTRAINT` statements (MySQL / PostgreSQL only).
     #[must_use]
     pub fn compile_deferred_foreign_keys(&self, kind: DatabaseKind) -> Vec<String> {
-        if kind == DatabaseKind::Sqlite {
-            return Vec::new();
-        }
-        self.foreign_keys
-            .iter()
-            .filter(|fk| fk.cyclic_alter)
-            .map(|fk| format!("ALTER TABLE {} ADD {}", self.name, fk.constraint_sql(kind)))
-            .collect()
+        self.to_ir(TableOwnership::Core)
+            .compile_deferred_foreign_keys(kind, None)
     }
+}
+
+fn split_top_level_commas(input: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let piece = input[start..idx].trim();
+                if !piece.is_empty() {
+                    parts.push(piece.to_string());
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+    parts
 }
 
 /// Declarative definitions of all 40 core tables in topological dependency order.
@@ -1662,6 +1674,26 @@ pub fn table_def(name: &str) -> Option<&'static TableDef> {
     CORE_TABLES.iter().find(|t| t.name == name)
 }
 
+/// Export the built-in 0.14.x schema contract as a unified [`SchemaIr`].
+#[must_use]
+pub fn builtin_schema_ir(include_oidc_extension: bool) -> SchemaIr {
+    let mut ir = SchemaIr::new(
+        ExtractionSource::BuiltinFallback,
+        Some(LATEST_SCHEMA_REVISION.to_string()),
+    );
+    for table in CORE_TABLES {
+        ir.tables
+            .insert(table.name.to_string(), table.to_ir(TableOwnership::Core));
+    }
+    if include_oidc_extension {
+        ir.tables.insert(
+            USER_OIDC_CREDENTIALS_TABLE.name.to_string(),
+            USER_OIDC_CREDENTIALS_TABLE.to_ir(TableOwnership::Extension("oidc_sso".to_string())),
+        );
+    }
+    ir
+}
+
 /// Ordered list of active tables (40 core + requested known extensions).
 #[must_use]
 pub fn ordered_tables_for(extension_tables: &[String]) -> Vec<&'static TableDef> {
@@ -1942,5 +1974,32 @@ mod tests {
                 .compile_create_table(DatabaseKind::Postgresql)
                 .contains("comment_id BIGSERIAL NOT NULL")
         );
+    }
+
+    #[test]
+    fn builtin_schema_ir_round_trips_and_matches_table_def_ddl() {
+        let ir = builtin_schema_ir(true);
+        assert_eq!(ir.core_table_names().len(), 40);
+        assert_eq!(ir.extension_table_names().len(), 1);
+        assert_eq!(
+            ir.schema_revision.as_deref(),
+            Some(LATEST_SCHEMA_REVISION)
+        );
+
+        let json = ir.to_pretty_json().expect("serialize ir");
+        let parsed = SchemaIr::from_json_str(&json).expect("deserialize ir");
+        assert_eq!(parsed, ir);
+
+        for kind in [
+            DatabaseKind::Sqlite,
+            DatabaseKind::Mysql,
+            DatabaseKind::Postgresql,
+        ] {
+            for table in CORE_TABLES {
+                let expected = table.compile_create_table(kind);
+                let actual = ir.tables[table.name].compile_create_table(kind, None);
+                assert_eq!(actual, expected, "table {} ({kind})", table.name);
+            }
+        }
     }
 }

@@ -1,0 +1,38 @@
+"""{{ summary_title }}
+
+Revision ID: {{ revision }}
+Revises: {{ down_revision_repr }}
+Max Risk Level: {{ max_risk_level }}{% if has_blocking_risks %} (REVIEW REQUIRED){% endif %}
+"""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import mysql, postgresql
+
+revision: str = {{ revision_repr }}
+down_revision: str | Sequence[str] | None = {{ down_revision_repr }}
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+{% if findings %}
+# ---------------------------------------------------------------------------
+# Automated Risk Audit Summary:
+{% for f in findings %}#   * [{{ f.level }} {{ f.code }}] {{ f.summary }}
+{% endfor %}# ---------------------------------------------------------------------------
+{% endif %}{% if warnings %}
+# Diagnostics / Warnings:
+{% for w in warnings %}#   ! {{ w }}
+{% endfor %}{% endif %}
+
+def upgrade() -> None:
+    """Upgrade schema."""
+{% if upgrade_lines %}{% for line in upgrade_lines %}    {{ line }}
+{% endfor %}{% else %}    pass
+{% endif %}
+
+def downgrade() -> None:
+    """Downgrade schema."""
+{% if downgrade_lines %}{% for line in downgrade_lines %}    {{ line }}
+{% endfor %}{% else %}    pass
+{% endif %}
