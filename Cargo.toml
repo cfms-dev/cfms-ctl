@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Standalone, high-performance, multi-database maintenance CLI for CFMS servers."
 license = "Apache-2.0"
+repository = "https://github.com/cfms-dev/cfms-ctl"
+homepage = "https://github.com/cfms-dev/cfms-ctl"
 
 [lib]
 name = "cfms_ctl"
@@ -51,6 +53,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.29", features = ["v4", "serde"] }
 regex = "1.13.1"
 jsonschema = { version = "0.61.2", default-features = false, features = ["arbitrary-precision"] }
+self_update = { version = "1.3.3", default-features = false, features = ["async", "reqwest", "rustls", "github", "archive-tar", "compression-tar-xz", "compression-tar-gz", "archive-zip", "compression-zip-deflate", "checksums", "progress-bar"] }
 
 [dev-dependencies]
 tempfile = "3.27"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+

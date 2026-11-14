@@ -21,6 +21,7 @@ pub enum ErrorCode {
     InvalidArgument,
     OperationAborted,
     NotImplementedYet,
+    SelfUpdateError,
     IoError,
 }
 
@@ -66,6 +67,9 @@ pub enum CfmsError {
     #[error("Operation `{0}` is part of the scaffold and will be implemented in the next stage")]
     NotImplementedYet(&'static str),
 
+    #[error("Self-update failed: {0}")]
+    SelfUpdate(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -88,6 +92,7 @@ impl CfmsError {
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::OperationAborted => ErrorCode::OperationAborted,
             Self::NotImplementedYet(_) => ErrorCode::NotImplementedYet,
+            Self::SelfUpdate(_) => ErrorCode::SelfUpdateError,
             Self::Io(_) => ErrorCode::IoError,
         }
     }

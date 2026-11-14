@@ -8,6 +8,7 @@ pub mod deployment;
 pub mod doctor;
 pub mod extension;
 pub mod permission;
+pub mod self_update;
 pub mod user;
 
 use crate::cli::{Cli, Commands, GlobalOpts};
@@ -69,5 +70,6 @@ pub async fn execute(cli: Cli, ui: &UiConsole) -> Result<()> {
         Commands::User(cmd) => user::handle(&ctx, cmd).await,
         Commands::Permission(cmd) => permission::handle(&ctx, cmd).await,
         Commands::Audit(cmd) => audit::handle(&ctx, cmd).await,
+        Commands::SelfUpdate(args) => self_update::handle(&ctx, args).await,
     }
 }

@@ -8,6 +8,7 @@ pub mod deployment;
 pub mod doctor;
 pub mod extension;
 pub mod permission;
+pub mod self_update;
 pub mod user;
 
 use std::path::PathBuf;
@@ -98,4 +99,49 @@ pub enum Commands {
     /// Inspect, export, and archive-then-purge expired audit log entries.
     #[command(subcommand)]
     Audit(audit::AuditCommand),
+
+    /// Check for and install updates to `cfms-ctl` from GitHub Releases.
+    SelfUpdate(self_update::SelfUpdateArgs),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_self_update_default_args() {
+        let cli = Cli::try_parse_from(["cfms-ctl", "self-update"]).expect("valid self-update args");
+        match cli.command {
+            Commands::SelfUpdate(args) => {
+                assert!(!args.check);
+                assert_eq!(args.version, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_self_update_check_and_version_args() {
+        let cli = Cli::try_parse_from([
+            "cfms-ctl",
+            "--output",
+            "json",
+            "--yes",
+            "self-update",
+            "--check",
+            "--version",
+            "v0.2.0",
+        ])
+        .expect("valid self-update check/version args");
+        assert_eq!(cli.global.output, OutputFormat::Json);
+        assert!(cli.global.yes);
+        match cli.command {
+            Commands::SelfUpdate(args) => {
+                assert!(args.check);
+                assert_eq!(args.version.as_deref(), Some("v0.2.0"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+}
+
