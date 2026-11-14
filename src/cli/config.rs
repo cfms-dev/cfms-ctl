@@ -22,6 +22,10 @@ pub struct ConfigSyncTemplateArgs {
     #[arg(long = "template", value_name = "FILE")]
     pub template: Option<PathBuf>,
 
+    /// Optional JSON Schema file to validate the merged configuration against (defaults to workspace `config.schema.json` if present).
+    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
+    pub schema: Option<PathBuf>,
+
     /// Report whether synchronization is needed without modifying `config.toml` (exits 1 if dirty).
     #[arg(long = "check")]
     pub check: bool,
@@ -58,6 +62,10 @@ pub struct OptionsListArgs {
     /// Filter options by namespace (e.g. `security.password`).
     #[arg(long = "namespace")]
     pub namespace: Option<String>,
+
+    /// Optional JSON Schema file for option definitions (defaults to workspace `options.schema.json` if present).
+    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
+    pub schema: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -66,6 +74,9 @@ pub struct OptionsGetArgs {
     pub namespace: String,
     /// Option key (e.g. `name`).
     pub option_key: String,
+    /// Optional JSON Schema file for option definitions (defaults to workspace `options.schema.json` if present).
+    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
+    pub schema: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -80,6 +91,9 @@ pub struct OptionsSetArgs {
     /// Expected current revision (0 creates a new entry).
     #[arg(long = "expected-revision")]
     pub expected_revision: u64,
+    /// Optional JSON Schema file for option definitions (defaults to workspace `options.schema.json` if present).
+    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
+    pub schema: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -89,6 +103,9 @@ pub struct OptionsSetManyArgs {
     /// Path to JSON file mapping `option_key -> { value, expected_revision }`.
     #[arg(value_name = "PAYLOAD_FILE")]
     pub payload_file: PathBuf,
+    /// Optional JSON Schema file for option definitions (defaults to workspace `options.schema.json` if present).
+    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
+    pub schema: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -100,4 +117,7 @@ pub struct OptionsResetArgs {
     /// Expected current revision.
     #[arg(long = "expected-revision")]
     pub expected_revision: u64,
+    /// Optional JSON Schema file for option definitions (defaults to workspace `options.schema.json` if present).
+    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
+    pub schema: Option<PathBuf>,
 }

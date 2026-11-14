@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, Key, TableLike, Value};
 use crate::core::atomic::write_with_timestamped_backup;
 use crate::core::error::{CfmsError, Result};
+use crate::core::schema::{
+    evaluate_schema_invariants, load_json_schema_file, validate_instance_against_schema,
+};
 use crate::db::DatabaseKind;
 
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
@@ -205,16 +208,30 @@ impl ConfigDocument {
     }
 
     /// Synchronize this configuration document in-place with `template` using `toml_edit` CST merging.
-    ///
-    /// - Existing operator values, inline comments, section headers, and key ordering are preserved.
-    /// - Missing keys and sections from `template` are inserted with their template comments (`Decor`).
-    /// - Template-external paths in `self` are preserved in `preserved_paths` unless removed via
-    ///   `remove_paths` or `prune`.
     pub fn sync_with_template(
         &mut self,
         template: &Self,
         remove_paths: &[String],
         prune: bool,
+    ) -> Result<TemplateSyncPlan> {
+        self.sync_with_template_and_schema(template, remove_paths, prune, None)
+    }
+
+    /// Synchronize this configuration document in-place with `template` using `toml_edit` CST merging,
+    /// and optionally validate the resulting configuration against an external JSON Schema file.
+    ///
+    /// - Existing operator values, inline comments, section headers, and key ordering are preserved.
+    /// - Missing keys and sections from `template` are inserted with their template comments (`Decor`).
+    /// - Template-external paths in `self` are preserved in `preserved_paths` unless removed via
+    ///   `remove_paths` or `prune`.
+    /// - When `schema_path` is provided, the merged document is validated against the JSON Schema
+    ///   and its declarative `x-invariants` rules.
+    pub fn sync_with_template_and_schema(
+        &mut self,
+        template: &Self,
+        remove_paths: &[String],
+        prune: bool,
+        schema_path: Option<&Path>,
     ) -> Result<TemplateSyncPlan> {
         if paths_refer_to_same_file(&self.path, &template.path) {
             return Err(CfmsError::Config(
@@ -280,7 +297,7 @@ impl ConfigDocument {
             raw_source: self.raw_source.clone(),
             doc: candidate,
         };
-        let warnings = candidate_wrapper.validate_deployment_invariants()?;
+        let warnings = candidate_wrapper.validate_with_schema(schema_path)?;
 
         added_paths.sort();
         let mut removed_paths = selected_removals;
@@ -303,8 +320,9 @@ impl ConfigDocument {
         })
     }
 
-    /// Validate core deployment invariants and return non-blocking diagnostic warnings.
-    pub fn validate_deployment_invariants(&self) -> Result<Vec<String>> {
+    /// Validate structural invariants and optionally evaluate an external `config.schema.json`
+    /// (including standard JSON Schema keywords and declarative `x-invariants`).
+    pub fn validate_with_schema(&self, schema_path: Option<&Path>) -> Result<Vec<String>> {
         if let Some(sec_item) = self.doc.get("security")
             && !sec_item.is_table_like()
         {
@@ -313,137 +331,23 @@ impl ConfigDocument {
             ));
         }
 
-        let summary = self.summary()?;
-        if summary.database.kind == DatabaseKind::Mysql && summary.database.charset != "utf8mb4" {
-            return Err(CfmsError::Config(format!(
-                "MySQL database.charset must be 'utf8mb4', got '{}'",
-                summary.database.charset
-            )));
-        }
+        // Verify that the minimal [database] connection table required by cfms-ctl is well-formed.
+        let _ = self.database_config()?;
 
-        if let Some(server) = self.doc.get("server").and_then(|v| v.as_table_like()) {
-            if let Some(chunk_item) = server.get("file_chunk_size") {
-                let valid = chunk_item.as_integer().is_some_and(|v| v > 0);
-                if !valid {
-                    return Err(CfmsError::Config(
-                        "server.file_chunk_size must be a positive integer".to_string(),
-                    ));
-                }
-            }
+        let Some(path) = schema_path else {
+            return Ok(Vec::new());
+        };
 
-            if let Some(adm) = server
-                .get("admission_control")
-                .and_then(|v| v.as_table_like())
-            {
-                for field in [
-                    "max_connections",
-                    "max_connections_per_ip",
-                    "max_inflight_requests",
-                    "max_inflight_requests_per_connection",
-                    "max_pending_streams_per_connection",
-                    "busy_retry_after_seconds",
-                ] {
-                    if let Some(item) = adm.get(field)
-                        && !item.as_integer().is_some_and(|v| v > 0)
-                    {
-                        return Err(CfmsError::Config(format!(
-                            "server.admission_control.{field} must be a positive integer"
-                        )));
-                    }
-                }
-                let max_conn = adm
-                    .get("max_connections")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(64);
-                let max_conn_ip = adm
-                    .get("max_connections_per_ip")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(16);
-                if max_conn_ip > max_conn {
-                    return Err(CfmsError::Config(
-                        "server.admission_control.max_connections_per_ip must not exceed max_connections"
-                            .to_string(),
-                    ));
-                }
-                let max_req = adm
-                    .get("max_inflight_requests")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(12);
-                let max_req_conn = adm
-                    .get("max_inflight_requests_per_connection")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(8);
-                if max_req_conn > max_req {
-                    return Err(CfmsError::Config(
-                        "server.admission_control.max_inflight_requests_per_connection must not exceed max_inflight_requests"
-                            .to_string(),
-                    ));
-                }
-            }
-        }
+        let schema_json = load_json_schema_file(path)?;
+        let config_json: serde_json::Value = toml::from_str(&self.doc.to_string()).map_err(|e| {
+            CfmsError::Config(format!(
+                "Unable to convert '{}' for schema validation: {e}",
+                self.path.display()
+            ))
+        })?;
 
-        if let Some(sched) = self.doc.get("scheduling").and_then(|v| v.as_table_like()) {
-            let lease = sched
-                .get("execution_lease_seconds")
-                .and_then(|v| v.as_integer())
-                .unwrap_or(60);
-            let refresh = sched
-                .get("lease_refresh_seconds")
-                .and_then(|v| v.as_integer())
-                .unwrap_or(20);
-            if lease <= 0 || refresh <= 0 || refresh >= lease {
-                return Err(CfmsError::Config(
-                    "scheduling.lease_refresh_seconds must be positive and less than execution_lease_seconds"
-                        .to_string(),
-                ));
-            }
-        }
-
-        let mut warnings = Vec::new();
-        if !summary.has_pepper {
-            warnings.push(
-                "Setting `security.pepper` to empty can lead to password storage security risks; run `cfms-ctl config fill-pepper`."
-                    .to_string(),
-            );
-        }
-        if !summary.has_secret_key {
-            warnings.push(
-                "`server.secret_key` is empty; configure a secret key before starting the server in production."
-                    .to_string(),
-            );
-        }
-
-        let max_inflight = self
-            .doc
-            .get("server")
-            .and_then(|v| v.as_table_like())
-            .and_then(|s| s.get("admission_control"))
-            .and_then(|v| v.as_table_like())
-            .and_then(|a| a.get("max_inflight_requests"))
-            .and_then(|v| v.as_integer())
-            .unwrap_or(12);
-        let (pool_size, pool_overflow) = self
-            .doc
-            .get("database")
-            .and_then(|v| v.as_table_like())
-            .and_then(|d| d.get("pool"))
-            .and_then(|v| v.as_table_like())
-            .map_or((5, 10), |p| {
-                (
-                    p.get("size").and_then(|v| v.as_integer()).unwrap_or(5),
-                    p.get("max_overflow")
-                        .and_then(|v| v.as_integer())
-                        .unwrap_or(10),
-                )
-            });
-        if max_inflight > pool_size + pool_overflow {
-            warnings.push(
-                "`server.admission_control.max_inflight_requests` exceeds `database.pool.size + database.pool.max_overflow`."
-                    .to_string(),
-            );
-        }
-
-        Ok(warnings)
+        validate_instance_against_schema(&schema_json, &config_json, "config.toml")?;
+        evaluate_schema_invariants(&schema_json, &config_json)
     }
 }
 
@@ -912,6 +816,120 @@ sqlite_path = "./data.db"
         assert!(
             err.to_string()
                 .contains("Configuration shape differs from the template at 'server'")
+        );
+    }
+
+    #[test]
+    fn test_sync_template_with_external_json_schema_and_invariants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let template_path = dir.path().join("config.toml.sample");
+        let schema_path = dir.path().join("config.schema.json");
+
+        let template_content = r#"[server]
+host = "0.0.0.0"
+port = 5104
+secret_key = ""
+
+[server.admission_control]
+max_connections = 64
+max_connections_per_ip = 16
+max_inflight_requests = 12
+
+[security]
+pepper = ""
+
+[database]
+type = "sqlite"
+file = "app.db"
+
+[database.pool]
+size = 5
+max_overflow = 10
+"#;
+        let schema_content = r#"{
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": {
+                        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                    }
+                }
+            },
+            "x-invariants": [
+                {
+                    "rule": "order",
+                    "lower": "server.admission_control.max_connections_per_ip",
+                    "upper": "server.admission_control.max_connections",
+                    "allow_equal": true,
+                    "message": "server.admission_control.max_connections_per_ip must not exceed max_connections"
+                },
+                {
+                    "rule": "order",
+                    "lower": "server.admission_control.max_inflight_requests",
+                    "upper": ["database.pool.size", "database.pool.max_overflow"],
+                    "allow_equal": true,
+                    "severity": "warning",
+                    "message": "`server.admission_control.max_inflight_requests` exceeds `database.pool.size + database.pool.max_overflow`."
+                },
+                {
+                    "rule": "non_empty",
+                    "path": "security.pepper",
+                    "severity": "warning",
+                    "message": "Setting `security.pepper` to empty can lead to password storage security risks; run `cfms-ctl config fill-pepper`."
+                }
+            ]
+        }"#;
+        std::fs::write(&template_path, template_content).expect("write template");
+        std::fs::write(&schema_path, schema_content).expect("write schema");
+
+        // 1. Valid config with inflight > pool sum and empty pepper produces non-blocking warnings from schema
+        let valid_config = r#"[server]
+host = "127.0.0.1"
+port = 5104
+secret_key = "secret"
+
+[server.admission_control]
+max_inflight_requests = 20
+
+[security]
+pepper = ""
+
+[database]
+type = "sqlite"
+file = "app.db"
+"#;
+        std::fs::write(&config_path, valid_config).expect("write config");
+        let mut doc = ConfigDocument::load(&config_path).expect("load config");
+        let template_doc = ConfigDocument::load(&template_path).expect("load template");
+        let plan = doc
+            .sync_with_template_and_schema(&template_doc, &[], false, Some(&schema_path))
+            .expect("sync with schema");
+        assert_eq!(plan.warnings.len(), 2);
+
+        // 2. Config violating blocking order invariant fails
+        let bad_config = r#"[server]
+host = "127.0.0.1"
+port = 5104
+
+[server.admission_control]
+max_connections = 32
+max_connections_per_ip = 64
+
+[database]
+type = "sqlite"
+file = "app.db"
+"#;
+        std::fs::write(&config_path, bad_config).expect("write bad config");
+        let mut bad_doc = ConfigDocument::load(&config_path).expect("load bad config");
+        let err = bad_doc
+            .sync_with_template_and_schema(&template_doc, &[], false, Some(&schema_path))
+            .expect_err("blocking invariant violation");
+        assert!(
+            err.to_string()
+                .contains("max_connections_per_ip must not exceed max_connections")
         );
     }
 }

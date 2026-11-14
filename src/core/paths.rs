@@ -142,6 +142,77 @@ impl WorkspacePaths {
             self.server_root.join(path)
         }
     }
+
+    /// Resolve an explicit file path override, checking `server_root` for relative paths if needed.
+    #[must_use]
+    pub fn resolve_file_override(&self, explicit: &Path) -> PathBuf {
+        if explicit.is_absolute() || explicit.is_file() {
+            explicit.to_path_buf()
+        } else {
+            let candidate_in_server = self.server_root.join(explicit);
+            if candidate_in_server.is_file() {
+                candidate_in_server
+            } else {
+                explicit.to_path_buf()
+            }
+        }
+    }
+
+    /// Discover the external `config.schema.json` file in the workspace or validate an explicit override.
+    pub fn discover_config_schema_path(
+        &self,
+        override_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        if let Some(explicit) = override_path {
+            let resolved = self.resolve_file_override(explicit);
+            if !resolved.is_file() {
+                return Err(CfmsError::Config(format!(
+                    "Configuration schema file not found: '{}'",
+                    resolved.display()
+                )));
+            }
+            return Ok(Some(resolved));
+        }
+
+        let candidates = [
+            self.server_root.join("config.schema.json"),
+            self.server_root
+                .join("include")
+                .join("schemas")
+                .join("config.schema.json"),
+            self.project_root.join("schemas").join("config.schema.json"),
+        ];
+        Ok(candidates.into_iter().find(|p| p.is_file()))
+    }
+
+    /// Discover the external `options.schema.json` file in the workspace or validate an explicit override.
+    pub fn discover_options_schema_path(
+        &self,
+        override_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        if let Some(explicit) = override_path {
+            let resolved = self.resolve_file_override(explicit);
+            if !resolved.is_file() {
+                return Err(CfmsError::Config(format!(
+                    "Options schema file not found: '{}'",
+                    resolved.display()
+                )));
+            }
+            return Ok(Some(resolved));
+        }
+
+        let candidates = [
+            self.server_root.join("options.schema.json"),
+            self.server_root
+                .join("include")
+                .join("schemas")
+                .join("options.schema.json"),
+            self.project_root
+                .join("schemas")
+                .join("options.schema.json"),
+        ];
+        Ok(candidates.into_iter().find(|p| p.is_file()))
+    }
 }
 
 #[cfg(test)]

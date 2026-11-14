@@ -11,8 +11,8 @@ use toml_edit::{Item, Table, Value as TomlValue, value};
 use crate::cli::config::{ConfigCommand, ConfigSyncTemplateArgs, OptionsCommand};
 use crate::core::{CfmsError, ConfigDocument, Result};
 use crate::db::{
-    OptionUpdateInput, ResolvedOptionRecord, get_option, list_options, reset_option,
-    validate_option_key, write_options_batch,
+    OptionUpdateInput, OptionsSchemaRegistry, ResolvedOptionRecord, get_option, list_options,
+    reset_option, validate_option_key, write_options_batch,
 };
 use crate::ops::AppContext;
 use crate::ui::{
@@ -312,18 +312,7 @@ fn handle_sync_template(ctx: &AppContext, args: ConfigSyncTemplateArgs) -> Resul
 
     let paths = ctx.resolve_paths()?;
     let template_path = match &args.template {
-        Some(explicit) => {
-            if explicit.is_absolute() || explicit.is_file() {
-                explicit.clone()
-            } else {
-                let candidate_in_server = paths.server_root.join(explicit);
-                if candidate_in_server.is_file() {
-                    candidate_in_server
-                } else {
-                    explicit.clone()
-                }
-            }
-        }
+        Some(explicit) => paths.resolve_file_override(explicit),
         None => paths.config_template_path.clone(),
     };
 
@@ -334,9 +323,16 @@ fn handle_sync_template(ctx: &AppContext, args: ConfigSyncTemplateArgs) -> Resul
         )));
     }
 
+    let schema_path = paths.discover_config_schema_path(args.schema.as_deref())?;
+
     let mut current_doc = ctx.load_config(&paths)?;
     let template_doc = ConfigDocument::load(&template_path)?;
-    let plan = current_doc.sync_with_template(&template_doc, &args.remove, args.prune)?;
+    let plan = current_doc.sync_with_template_and_schema(
+        &template_doc,
+        &args.remove,
+        args.prune,
+        schema_path.as_deref(),
+    )?;
 
     let mut report = ConfigSyncReport {
         config_path: plan.config_path.display().to_string(),
@@ -392,8 +388,9 @@ async fn handle_options(ctx: &AppContext, cmd: OptionsCommand) -> Result<()> {
     let paths = ctx.resolve_paths()?;
     match cmd {
         OptionsCommand::List(args) => {
+            let registry = OptionsSchemaRegistry::from_workspace(&paths, args.schema.as_deref())?;
             let pool = ctx.connect_db(&paths).await?;
-            let options = list_options(&pool, args.namespace.as_deref()).await?;
+            let options = list_options(&pool, &registry, args.namespace.as_deref()).await?;
             let report = OptionsListReport {
                 namespace_filter: args.namespace,
                 options,
@@ -402,12 +399,14 @@ async fn handle_options(ctx: &AppContext, cmd: OptionsCommand) -> Result<()> {
             Ok(())
         }
         OptionsCommand::Get(args) => {
+            let registry = OptionsSchemaRegistry::from_workspace(&paths, args.schema.as_deref())?;
             let pool = ctx.connect_db(&paths).await?;
-            let option = get_option(&pool, &args.namespace, &args.option_key).await?;
+            let option = get_option(&pool, &registry, &args.namespace, &args.option_key).await?;
             ctx.ui.render(&OptionItemReport { option });
             Ok(())
         }
         OptionsCommand::Set(args) => {
+            let registry = OptionsSchemaRegistry::from_workspace(&paths, args.schema.as_deref())?;
             let value = read_single_option_json(&args.payload_file)?;
             let pool = ctx.connect_db(&paths).await?;
             let mut updates = BTreeMap::new();
@@ -419,8 +418,7 @@ async fn handle_options(ctx: &AppContext, cmd: OptionsCommand) -> Result<()> {
                 },
             );
             let mut updated =
-                write_options_batch(&pool, &paths.extensions_root, &args.namespace, updates)
-                    .await?;
+                write_options_batch(&pool, &registry, &args.namespace, updates).await?;
             let option = updated.remove(&args.option_key).ok_or_else(|| {
                 CfmsError::Database(format!(
                     "Failed to retrieve updated option {}/{}",
@@ -431,11 +429,11 @@ async fn handle_options(ctx: &AppContext, cmd: OptionsCommand) -> Result<()> {
             Ok(())
         }
         OptionsCommand::SetMany(args) => {
+            let registry = OptionsSchemaRegistry::from_workspace(&paths, args.schema.as_deref())?;
             let updates = read_many_options_json(&args.payload_file)?;
             let pool = ctx.connect_db(&paths).await?;
             let updated =
-                write_options_batch(&pool, &paths.extensions_root, &args.namespace, updates)
-                    .await?;
+                write_options_batch(&pool, &registry, &args.namespace, updates).await?;
             let report = OptionsBatchReport {
                 namespace: args.namespace,
                 updated,
@@ -444,10 +442,11 @@ async fn handle_options(ctx: &AppContext, cmd: OptionsCommand) -> Result<()> {
             Ok(())
         }
         OptionsCommand::Reset(args) => {
+            let registry = OptionsSchemaRegistry::from_workspace(&paths, args.schema.as_deref())?;
             let pool = ctx.connect_db(&paths).await?;
             let option = reset_option(
                 &pool,
-                &paths.extensions_root,
+                &registry,
                 &args.namespace,
                 &args.option_key,
                 args.expected_revision,
