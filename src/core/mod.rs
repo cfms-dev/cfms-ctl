@@ -7,7 +7,7 @@ pub mod error;
 pub mod lock;
 pub mod paths;
 
-pub use config::{ConfigDocument, DatabaseSectionConfig, ServerConfigSummary};
+pub use config::{ConfigDocument, DatabaseSectionConfig, ServerConfigSummary, TemplateSyncPlan};
 pub use error::{CfmsError, ErrorCode, Result};
 pub use lock::{RuntimeLock, ServerLockGuard};
 pub use paths::WorkspacePaths;

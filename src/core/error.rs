@@ -10,6 +10,7 @@ use thiserror::Error;
 pub enum ErrorCode {
     WorkspaceNotFound,
     ConfigError,
+    OptionConflict,
     RuntimeLocked,
     UnfinishedTransaction,
     DatabaseError,
@@ -31,6 +32,9 @@ pub enum CfmsError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[error("Option revision conflict: {0}")]
+    OptionConflict(String),
 
     #[error("CFMS server or another maintenance process holds the runtime lock at '{0}'")]
     RuntimeLocked(PathBuf),
@@ -73,6 +77,7 @@ impl CfmsError {
         match self {
             Self::WorkspaceNotFound(_) => ErrorCode::WorkspaceNotFound,
             Self::Config(_) => ErrorCode::ConfigError,
+            Self::OptionConflict(_) => ErrorCode::OptionConflict,
             Self::RuntimeLocked(_) => ErrorCode::RuntimeLocked,
             Self::UnfinishedTransaction(_) => ErrorCode::UnfinishedTransaction,
             Self::Database(_) => ErrorCode::DatabaseError,
