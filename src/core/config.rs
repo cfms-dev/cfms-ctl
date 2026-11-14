@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use toml_edit::{DocumentMut, Item, Key, TableLike, Value};
+use toml_edit::{Array, DocumentMut, Item, Key, Table, TableLike, Value};
 use crate::core::atomic::write_with_timestamped_backup;
 use crate::core::error::{CfmsError, Result};
 use crate::core::paths::WorkspacePaths;
@@ -372,6 +372,103 @@ impl ConfigDocument {
         candidate_wrapper.validate_with_schema(schema_path)?;
         self.doc = candidate_wrapper.doc;
         Ok(())
+    }
+
+    /// Read `[extensions].enabled` strictly without coercing invalid types to empty.
+    ///
+    /// Returns `Ok(None)` when `[extensions]` or `extensions.enabled` is absent.
+    pub fn extensions_enabled_raw(&self) -> Result<Option<Vec<String>>> {
+        let Some(ext_item) = self.doc.get("extensions") else {
+            return Ok(None);
+        };
+        let Some(ext_table) = ext_item.as_table_like() else {
+            return Err(CfmsError::Config(format!(
+                "Configuration section 'extensions' in '{}' must be a table",
+                self.path.display()
+            )));
+        };
+        let Some(enabled_item) = ext_table.get("enabled") else {
+            return Ok(None);
+        };
+        let Some(array) = enabled_item.as_array() else {
+            return Err(CfmsError::Config(format!(
+                "Configuration value 'extensions.enabled' in '{}' must be an array of strings",
+                self.path.display()
+            )));
+        };
+
+        let mut values = Vec::with_capacity(array.len());
+        for item in array.iter() {
+            let Some(text) = item.as_str() else {
+                return Err(CfmsError::Config(format!(
+                    "All entries in 'extensions.enabled' in '{}' must be strings",
+                    self.path.display()
+                )));
+            };
+            values.push(text.to_string());
+        }
+        Ok(Some(values))
+    }
+
+    /// Losslessly update `[extensions].enabled` in memory, preserving comments and formatting.
+    ///
+    /// Creates the `[extensions]` table if absent, validates against `schema_path` when supplied,
+    /// and commits the candidate `DocumentMut` only if validation succeeds.
+    pub fn set_extensions_enabled(
+        &mut self,
+        enabled: &[String],
+        schema_path: Option<&Path>,
+    ) -> Result<Vec<String>> {
+        let mut candidate = self.doc.clone();
+        if !candidate.contains_key("extensions") {
+            candidate["extensions"] = Item::Table(Table::new());
+        }
+        let Some(ext_item) = candidate.get_mut("extensions") else {
+            unreachable!("inserted extensions table if missing");
+        };
+        let Some(ext_table) = ext_item.as_table_like_mut() else {
+            return Err(CfmsError::Config(format!(
+                "Configuration section 'extensions' in '{}' must be a table",
+                self.path.display()
+            )));
+        };
+
+        let mut new_array = Array::new();
+        for identifier in enabled {
+            new_array.push(identifier.as_str());
+        }
+
+        if let Some(existing_item) = ext_table.get_mut("enabled") {
+            match existing_item {
+                Item::Value(existing_val) if existing_val.is_array() => {
+                    let decor = existing_val.decor().clone();
+                    let mut replacement = Value::Array(new_array);
+                    *replacement.decor_mut() = decor;
+                    *existing_val = replacement;
+                }
+                _ => {
+                    return Err(CfmsError::Config(format!(
+                        "Configuration value 'extensions.enabled' in '{}' must be an array of strings",
+                        self.path.display()
+                    )));
+                }
+            }
+        } else {
+            ext_table.insert("enabled", Item::Value(Value::Array(new_array)));
+        }
+
+        let candidate_wrapper = Self {
+            path: self.path.clone(),
+            raw_source: self.raw_source.clone(),
+            doc: candidate,
+        };
+        let warnings = if schema_path.is_some() {
+            candidate_wrapper.validate_with_schema(schema_path)?
+        } else {
+            Vec::new()
+        };
+        self.doc = candidate_wrapper.doc;
+        Ok(warnings)
     }
 
     /// Synchronize this configuration document in-place with `template` using `toml_edit` CST merging.
@@ -1172,5 +1269,49 @@ file = "app.db"
         assert!(saved.contains("# keep operator comment"));
         assert!(saved.contains("name = \"cfms_prod\""));
         assert!(saved.contains("[database.pool]"));
+    }
+
+    #[test]
+    fn test_set_extensions_enabled_preserves_comments_and_creates_missing_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // 1. Existing [extensions] table preserves key & inline comments and other sections
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "# Global comment\n\n[extensions]\n# Keep extension comment\nenabled = [] # inline note\n\n[extensions.http_api]\nport = 5105\n",
+        )
+        .expect("write config");
+        let mut doc = ConfigDocument::load(&cfg_path).expect("load");
+        assert_eq!(doc.extensions_enabled_raw().expect("read"), Some(vec![]));
+        doc.set_extensions_enabled(&["http_api".to_string(), "oidc_sso".to_string()], None)
+            .expect("update enabled");
+        let rendered = doc.document().to_string();
+        assert!(rendered.contains("# Keep extension comment"));
+        assert!(rendered.contains("] # inline note"));
+        assert!(rendered.contains("[extensions.http_api]"));
+        assert_eq!(
+            doc.extensions_enabled_raw().expect("re-read"),
+            Some(vec!["http_api".to_string(), "oidc_sso".to_string()])
+        );
+
+        // 2. Missing [extensions] table is created cleanly
+        let minimal_path = dir.path().join("minimal.toml");
+        std::fs::write(&minimal_path, "debug = true\n").expect("write minimal");
+        let mut minimal = ConfigDocument::load(&minimal_path).expect("load minimal");
+        assert_eq!(minimal.extensions_enabled_raw().expect("absent"), None);
+        minimal
+            .set_extensions_enabled(&["oidc_sso".to_string()], None)
+            .expect("create extensions section");
+        assert_eq!(
+            minimal.extensions_enabled_raw().expect("created"),
+            Some(vec!["oidc_sso".to_string()])
+        );
+
+        // 3. Invalid non-array extensions.enabled fails strictly
+        let bad_path = dir.path().join("bad.toml");
+        std::fs::write(&bad_path, "[extensions]\nenabled = \"http_api\"\n").expect("write bad");
+        let bad = ConfigDocument::load(&bad_path).expect("load bad");
+        assert!(bad.extensions_enabled_raw().is_err());
     }
 }
