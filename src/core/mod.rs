@@ -5,6 +5,7 @@ pub mod atomic;
 pub mod config;
 pub mod error;
 pub mod lock;
+pub mod migration;
 pub mod paths;
 pub mod schema;
 
@@ -16,9 +17,15 @@ pub use atomic::{
 pub use config::{ConfigDocument, DatabaseSectionConfig, ServerConfigSummary, TemplateSyncPlan};
 pub use error::{CfmsError, ErrorCode, Result};
 pub use lock::{RuntimeLock, ServerLockGuard};
+pub use migration::{
+    ConfigMigrationsManifest, MigrationOp, ObsoletePathRule, OptionMigrationGroup,
+    TomlMigrationOutcome, TomlMigrationRule, apply_toml_migrations,
+    find_present_obsolete_paths, find_present_option_migration_paths, load_config_migrations,
+};
 pub use paths::WorkspacePaths;
 pub use schema::{
     InvariantRule, InvariantSeverity, cmp_numeric_values, evaluate_invariants,
     evaluate_schema_invariants, format_canonical_float, is_canonical_int_str,
-    load_json_schema_file, normalize_and_precheck_value, validate_instance_against_schema,
+    load_json_schema_file, normalize_and_precheck_value, validate_config_against_schema,
+    validate_instance_against_schema,
 };

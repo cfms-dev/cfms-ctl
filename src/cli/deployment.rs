@@ -150,7 +150,7 @@ pub struct DeploymentCheckArgs {
     pub online: OnlineReleaseArgs,
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 pub struct DeploymentUpgradeArgs {
     /// Path to the local CFMS release archive (`.zip`, `.tar.gz`, or `.tgz`).
     #[arg(value_name = "PACKAGE")]
@@ -168,6 +168,10 @@ pub struct DeploymentUpgradeArgs {
     /// Allow destructive/narrowing schema migrations when advancing the database.
     #[arg(long = "allow-destructive")]
     pub allow_destructive: bool,
+
+    /// Discard legacy TOML values when migrating options that already have an authoritative DB revision > 0.
+    #[arg(long = "discard-legacy")]
+    pub discard_legacy: bool,
 
     /// Stage, verify, and preview file/config/database changes without mutating the workspace or DB.
     #[arg(long = "dry-run")]
@@ -192,6 +196,10 @@ pub struct DeploymentUpdateArgs {
     /// Allow destructive/narrowing schema migrations when advancing the database.
     #[arg(long = "allow-destructive")]
     pub allow_destructive: bool,
+
+    /// Discard legacy TOML values when migrating options that already have an authoritative DB revision > 0.
+    #[arg(long = "discard-legacy")]
+    pub discard_legacy: bool,
 
     /// Query, download, verify, and preview upgrade plan without mutating the workspace or DB.
     #[arg(long = "dry-run")]
@@ -249,6 +257,10 @@ pub struct DeploymentResumeArgs {
     /// Permit destructive schema operations if resuming a database upgrade step.
     #[arg(long = "allow-destructive")]
     pub allow_destructive: bool,
+
+    /// Discard legacy TOML values when finishing options migration after an interrupted upgrade.
+    #[arg(long = "discard-legacy")]
+    pub discard_legacy: bool,
 
     /// Inspect `transaction.json`, live database revision, and schema drift without modifying state.
     #[arg(long = "dry-run")]

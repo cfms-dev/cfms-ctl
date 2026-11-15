@@ -834,14 +834,31 @@ pub async fn reset_option(
     })
 }
 
-/// Atomically validate and write one or more options in `namespace` with optimistic concurrency
-/// (`options.revision` CAS + `system_states` namespace guard + `audit_entries` record).
-pub async fn write_options_batch(
+/// Fetch only persisted rows from the `options` table keyed by `(namespace, option_key)`.
+pub async fn fetch_stored_options(
     pool: &DbPool,
-    registry: &OptionsSchemaRegistry,
+    namespace: Option<&str>,
+) -> Result<BTreeMap<(String, String), ResolvedOptionRecord>> {
+    if let Some(ns) = namespace {
+        validate_option_namespace(ns)?;
+    }
+    let raw_rows = fetch_option_rows(pool, namespace).await?;
+    let mut map = BTreeMap::new();
+    for row in raw_rows {
+        let resolved = row.into_resolved()?;
+        map.insert(
+            (resolved.namespace.clone(), resolved.option_key.clone()),
+            resolved,
+        );
+    }
+    Ok(map)
+}
+
+fn validate_batch_target<'a>(
+    registry: &'a OptionsSchemaRegistry,
     namespace: &str,
-    updates: BTreeMap<String, OptionUpdateInput>,
-) -> Result<BTreeMap<String, ResolvedOptionRecord>> {
+    updates: &BTreeMap<String, OptionUpdateInput>,
+) -> Result<Option<&'a NamespaceSchemaSpec>> {
     validate_option_namespace(namespace)?;
     if updates.is_empty() {
         return Err(CfmsError::InvalidArgument(
@@ -878,24 +895,130 @@ pub async fn write_options_batch(
         }
     }
 
+    Ok(ns_spec)
+}
+
+/// Atomically validate and write one or more options in `namespace` with optimistic concurrency
+/// (`options.revision` CAS + `system_states` namespace guard + `audit_entries` record).
+pub async fn write_options_batch(
+    pool: &DbPool,
+    registry: &OptionsSchemaRegistry,
+    namespace: &str,
+    updates: BTreeMap<String, OptionUpdateInput>,
+) -> Result<BTreeMap<String, ResolvedOptionRecord>> {
+    let ns_spec = validate_batch_target(registry, namespace, &updates)?;
+
     match pool {
         DbPool::Sqlite(sqlite_pool) => {
             let mut tx = sqlite_pool.begin().await?;
-            let result = execute_write_tx_sqlite(&mut tx, namespace, ns_spec, &updates).await?;
+            let result = execute_write_tx_sqlite(
+                &mut tx,
+                namespace,
+                ns_spec,
+                &updates,
+                "maintenance_cli",
+            )
+            .await?;
             tx.commit().await?;
             Ok(result)
         }
         DbPool::Mysql(mysql_pool) => {
             let mut tx = mysql_pool.begin().await?;
-            let result = execute_write_tx_mysql(&mut tx, namespace, ns_spec, &updates).await?;
+            let result = execute_write_tx_mysql(
+                &mut tx,
+                namespace,
+                ns_spec,
+                &updates,
+                "maintenance_cli",
+            )
+            .await?;
             tx.commit().await?;
             Ok(result)
         }
         DbPool::Postgres(pg_pool) => {
             let mut tx = pg_pool.begin().await?;
-            let result = execute_write_tx_postgres(&mut tx, namespace, ns_spec, &updates).await?;
+            let result = execute_write_tx_postgres(
+                &mut tx,
+                namespace,
+                ns_spec,
+                &updates,
+                "maintenance_cli",
+            )
+            .await?;
             tx.commit().await?;
             Ok(result)
+        }
+    }
+}
+
+/// Atomically validate and commit option batches across multiple namespaces in one SQL transaction.
+pub async fn write_options_batches(
+    pool: &DbPool,
+    registry: &OptionsSchemaRegistry,
+    batches: &[(String, BTreeMap<String, OptionUpdateInput>)],
+    audit_source: &str,
+) -> Result<Vec<(String, BTreeMap<String, ResolvedOptionRecord>)>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut prepared = Vec::with_capacity(batches.len());
+    for (namespace, updates) in batches {
+        let ns_spec = validate_batch_target(registry, namespace, updates)?;
+        prepared.push((namespace.as_str(), ns_spec, updates));
+    }
+
+    match pool {
+        DbPool::Sqlite(sqlite_pool) => {
+            let mut tx = sqlite_pool.begin().await?;
+            let mut results = Vec::with_capacity(prepared.len());
+            for (namespace, ns_spec, updates) in prepared {
+                let res = execute_write_tx_sqlite(
+                    &mut tx,
+                    namespace,
+                    ns_spec,
+                    updates,
+                    audit_source,
+                )
+                .await?;
+                results.push((namespace.to_string(), res));
+            }
+            tx.commit().await?;
+            Ok(results)
+        }
+        DbPool::Mysql(mysql_pool) => {
+            let mut tx = mysql_pool.begin().await?;
+            let mut results = Vec::with_capacity(prepared.len());
+            for (namespace, ns_spec, updates) in prepared {
+                let res = execute_write_tx_mysql(
+                    &mut tx,
+                    namespace,
+                    ns_spec,
+                    updates,
+                    audit_source,
+                )
+                .await?;
+                results.push((namespace.to_string(), res));
+            }
+            tx.commit().await?;
+            Ok(results)
+        }
+        DbPool::Postgres(pg_pool) => {
+            let mut tx = pg_pool.begin().await?;
+            let mut results = Vec::with_capacity(prepared.len());
+            for (namespace, ns_spec, updates) in prepared {
+                let res = execute_write_tx_postgres(
+                    &mut tx,
+                    namespace,
+                    ns_spec,
+                    updates,
+                    audit_source,
+                )
+                .await?;
+                results.push((namespace.to_string(), res));
+            }
+            tx.commit().await?;
+            Ok(results)
         }
     }
 }
@@ -1139,6 +1262,7 @@ async fn execute_write_tx_sqlite(
     namespace: &str,
     ns_spec: Option<&NamespaceSchemaSpec>,
     updates: &BTreeMap<String, OptionUpdateInput>,
+    audit_source: &str,
 ) -> Result<BTreeMap<String, ResolvedOptionRecord>> {
     let state_key = format!("{OPTIONS_REVISION_PREFIX}{namespace}");
     let guard_row = sqlx::query(
@@ -1269,7 +1393,7 @@ async fn execute_write_tx_sqlite(
     }
 
     let audit_data = serde_json::to_string(&json!({
-        "source": "maintenance_cli",
+        "source": audit_source,
         "namespace": namespace,
         "previous_revisions": plan.previous_revisions,
         "revisions": plan.new_revisions,
@@ -1295,6 +1419,7 @@ async fn execute_write_tx_mysql(
     namespace: &str,
     ns_spec: Option<&NamespaceSchemaSpec>,
     updates: &BTreeMap<String, OptionUpdateInput>,
+    audit_source: &str,
 ) -> Result<BTreeMap<String, ResolvedOptionRecord>> {
     let state_key = format!("{OPTIONS_REVISION_PREFIX}{namespace}");
     let guard_row = sqlx::query(
@@ -1425,7 +1550,7 @@ async fn execute_write_tx_mysql(
     }
 
     let audit_data = serde_json::to_string(&json!({
-        "source": "maintenance_cli",
+        "source": audit_source,
         "namespace": namespace,
         "previous_revisions": plan.previous_revisions,
         "revisions": plan.new_revisions,
@@ -1451,6 +1576,7 @@ async fn execute_write_tx_postgres(
     namespace: &str,
     ns_spec: Option<&NamespaceSchemaSpec>,
     updates: &BTreeMap<String, OptionUpdateInput>,
+    audit_source: &str,
 ) -> Result<BTreeMap<String, ResolvedOptionRecord>> {
     let state_key = format!("{OPTIONS_REVISION_PREFIX}{namespace}");
     let guard_row = sqlx::query(
@@ -1581,7 +1707,7 @@ async fn execute_write_tx_postgres(
     }
 
     let audit_data = serde_json::to_string(&json!({
-        "source": "maintenance_cli",
+        "source": audit_source,
         "namespace": namespace,
         "previous_revisions": plan.previous_revisions,
         "revisions": plan.new_revisions,

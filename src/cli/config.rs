@@ -8,12 +8,38 @@ pub enum ConfigCommand {
     /// Losslessly merge new template settings from `config.toml.sample` into `config.toml`.
     SyncTemplate(ConfigSyncTemplateArgs),
 
+    /// Migrate legacy business options from `config.toml` into the database `options` table.
+    MigrateOptions(ConfigMigrateOptionsArgs),
+
     /// Generate and store a 32-byte hex `security.pepper` in `config.toml` when missing.
     FillPepper,
 
     /// Read and update namespaced database-backed business settings (`options` table).
     #[command(subcommand)]
     Options(OptionsCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ConfigMigrateOptionsArgs {
+    /// Preview pending DB option imports, conflicts, and TOML cleanups without writing.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Discard legacy TOML values when an option namespace key already has an authoritative DB revision > 0.
+    #[arg(long = "discard-legacy")]
+    pub discard_legacy: bool,
+
+    /// Optional options JSON Schema directory or core `options.schema.json` path.
+    #[arg(long = "schema", value_name = "OPTIONS_SCHEMA")]
+    pub schema: Option<PathBuf>,
+
+    /// Optional `config.migrations.json` manifest path.
+    #[arg(long = "migrations", value_name = "MIGRATIONS_FILE")]
+    pub migrations: Option<PathBuf>,
+
+    /// Optional `config.schema.json` file to validate the cleaned `config.toml` against.
+    #[arg(long = "config-schema", value_name = "CONFIG_SCHEMA_FILE")]
+    pub config_schema: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -25,6 +51,10 @@ pub struct ConfigSyncTemplateArgs {
     /// Optional JSON Schema file to validate the merged configuration against (defaults to workspace `config.schema.json` if present).
     #[arg(long = "schema", value_name = "SCHEMA_FILE")]
     pub schema: Option<PathBuf>,
+
+    /// Optional `config.migrations.json` manifest path for rule-driven TOML migrations.
+    #[arg(long = "migrations", value_name = "MIGRATIONS_FILE")]
+    pub migrations: Option<PathBuf>,
 
     /// Report whether synchronization is needed without modifying `config.toml` (exits 1 if dirty).
     #[arg(long = "check")]

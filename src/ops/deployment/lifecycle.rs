@@ -18,7 +18,11 @@ use crate::core::{
     ensure_safe_directory_chain, retry_fs_op, write_with_timestamped_backup,
 };
 use crate::db::schema::analyze_alembic_directory;
+use crate::db::OptionsSchemaRegistry;
 use crate::ops::AppContext;
+use crate::ops::config::{
+    OptionsMigrationRequest, execute_options_migration, load_options_registry_with_override,
+};
 use crate::ops::extension::catalog::discover_catalog;
 use crate::ops::extension::version::{CfmsServerVersion, check_server_compatibility, discover_server_version};
 use crate::ui::{OutputFormat, confirm_or_abort};
@@ -70,31 +74,73 @@ fn ensure_confirmed(ctx: &AppContext, prompt: &str, dry_run: bool) -> Result<()>
 ///
 /// Before `apply_swap_with_journal`, pass `Some((target_dir, source_manifest))` so preflight
 /// previews match post-swap discovery: files present in `target_dir` take precedence slot-by-slot,
-/// tracked files in `source_manifest` that are absent from `target_dir` are ignored (the swap will
-/// remove them), and untracked workspace overrides remain visible.
-fn resolve_target_config_schema_path(
+/// Resolve a schema/migration file (`config.schema.json`, `config.migrations.json`, or `options.schema.json`)
+/// from the staged target tree when available. Tracked files in `source_manifest` that are absent from
+/// `target_dir` are ignored (the swap will remove them), and untracked workspace overrides remain visible.
+fn resolve_target_named_schema_path(
     paths: &WorkspacePaths,
+    filename: &str,
     target_root: Option<(&Path, &ValidatedManifest)>,
-) -> Result<Option<PathBuf>> {
+) -> Option<PathBuf> {
     let Some((target_dir, source_manifest)) = target_root else {
-        return paths.discover_config_schema_path(None);
+        return paths
+            .named_schema_candidates(filename)
+            .into_iter()
+            .find(|p| p.is_file());
     };
     let target_paths = WorkspacePaths::for_target_project_root(target_dir, None);
     for (target_candidate, live_candidate) in target_paths
-        .named_schema_candidates("config.schema.json")
+        .named_schema_candidates(filename)
         .into_iter()
-        .zip(paths.named_schema_candidates("config.schema.json"))
+        .zip(paths.named_schema_candidates(filename))
     {
         if target_candidate.is_file() {
-            return Ok(Some(target_candidate));
+            return Some(target_candidate);
         }
         if live_candidate.is_file()
             && !is_tracked_file_removed_by_swap(&paths.project_root, &live_candidate, source_manifest)
         {
-            return Ok(Some(live_candidate));
+            return Some(live_candidate);
         }
     }
-    Ok(None)
+    None
+}
+
+fn resolve_target_config_schema_path(
+    paths: &WorkspacePaths,
+    target_root: Option<(&Path, &ValidatedManifest)>,
+) -> Result<Option<PathBuf>> {
+    Ok(resolve_target_named_schema_path(
+        paths,
+        "config.schema.json",
+        target_root,
+    ))
+}
+
+fn resolve_target_config_migrations_path(
+    paths: &WorkspacePaths,
+    target_root: Option<(&Path, &ValidatedManifest)>,
+) -> Option<PathBuf> {
+    resolve_target_named_schema_path(paths, "config.migrations.json", target_root)
+}
+
+fn resolve_target_options_schema_registry(
+    paths: &WorkspacePaths,
+    target_root: Option<(&Path, &ValidatedManifest)>,
+) -> Result<OptionsSchemaRegistry> {
+    let core_schema = resolve_target_named_schema_path(paths, "options.schema.json", target_root);
+    let ext_root = match target_root {
+        Some((target_dir, _)) => {
+            let candidate = WorkspacePaths::for_target_project_root(target_dir, None).extensions_root;
+            if candidate.is_dir() {
+                candidate
+            } else {
+                paths.extensions_root.clone()
+            }
+        }
+        None => paths.extensions_root.clone(),
+    };
+    OptionsSchemaRegistry::load(core_schema.as_deref(), Some(ext_root.as_path()))
 }
 
 fn is_tracked_file_removed_by_swap(
@@ -113,6 +159,7 @@ fn preview_or_apply_config_sync(
     paths: &WorkspacePaths,
     template_path: &Path,
     target_root: Option<(&Path, &ValidatedManifest)>,
+    allow_unmigrated_options: bool,
     write: bool,
 ) -> Result<(bool, Option<String>, Vec<String>)> {
     if !paths.config_path.is_file() || !template_path.is_file() {
@@ -121,11 +168,14 @@ fn preview_or_apply_config_sync(
     let mut current = ConfigDocument::load(&paths.config_path)?;
     let template = ConfigDocument::load(template_path)?;
     let schema_path = resolve_target_config_schema_path(paths, target_root)?;
-    let plan = current.sync_with_template_and_schema(
+    let migrations_path = resolve_target_config_migrations_path(paths, target_root);
+    let plan = current.sync_with_template_and_migrations(
         &template,
         &[],
         false,
         schema_path.as_deref(),
+        migrations_path.as_deref(),
+        allow_unmigrated_options,
     )?;
 
     if plan.changed && write {
@@ -133,6 +183,116 @@ fn preview_or_apply_config_sync(
         return Ok((true, Some(bak.display().to_string()), plan.warnings));
     }
     Ok((plan.changed, None, plan.warnings))
+}
+
+async fn preflight_deployment_options_migration(
+    ctx: &AppContext,
+    paths: &WorkspacePaths,
+    staged_dir: &Path,
+    source_manifest: &ValidatedManifest,
+    staged_template: &Path,
+    discard_legacy: bool,
+) -> Result<(bool, Vec<String>)> {
+    let Some(migrations_path) =
+        resolve_target_config_migrations_path(paths, Some((staged_dir, source_manifest)))
+    else {
+        return Ok((false, Vec::new()));
+    };
+    if !paths.config_path.is_file() {
+        return Ok((false, Vec::new()));
+    }
+
+    let pool = ctx.connect_db(paths).await?;
+    let tables = pool.list_tables().await?;
+    let has_options_table = tables.iter().any(|t| t == "options");
+    let registry =
+        resolve_target_options_schema_registry(paths, Some((staged_dir, source_manifest)))?;
+    let config_schema_path =
+        resolve_target_config_schema_path(paths, Some((staged_dir, source_manifest)))?;
+    let template_opt = staged_template.is_file().then_some(staged_template);
+    let override_doc = if let Some(tpl_path) = template_opt {
+        let mut merged = ConfigDocument::load(&paths.config_path)?;
+        let tpl = ConfigDocument::load(tpl_path)?;
+        let _ = merged.sync_with_template_and_migrations(
+            &tpl,
+            &[],
+            false,
+            config_schema_path.as_deref(),
+            Some(migrations_path.as_path()),
+            true,
+        )?;
+        Some(merged)
+    } else {
+        None
+    };
+    let strict_config_schema = override_doc.is_some();
+
+    let report = execute_options_migration(OptionsMigrationRequest {
+        paths,
+        pool: has_options_table.then_some(&pool),
+        registry: &registry,
+        migrations_path: Some(migrations_path.as_path()),
+        config_schema_path: config_schema_path.as_deref(),
+        template_path: template_opt,
+        override_doc,
+        strict_config_schema,
+        dry_run: true,
+        discard_legacy,
+    })
+    .await?;
+
+    Ok((report.changed, report.warnings))
+}
+
+async fn complete_deployment_options_migration(
+    ctx: &AppContext,
+    paths: &WorkspacePaths,
+    discard_legacy: bool,
+    config_changed: bool,
+    config_backup_path: Option<String>,
+    warnings: &mut Vec<String>,
+) -> Result<(bool, Option<String>)> {
+    let Some(migrations_path) = paths.discover_config_migrations_path(None)? else {
+        return Ok((config_changed, config_backup_path));
+    };
+    if !paths.config_path.is_file() {
+        return Ok((config_changed, config_backup_path));
+    }
+
+    let pool = ctx.connect_db(paths).await?;
+    let tables = pool.list_tables().await?;
+    let has_options_table = tables.iter().any(|t| t == "options");
+    let registry = load_options_registry_with_override(paths, None, None)?;
+    let config_schema_path = paths.discover_config_schema_path(None)?;
+    let template_path = paths
+        .config_template_path
+        .is_file()
+        .then_some(paths.config_template_path.as_path());
+
+    let report = execute_options_migration(OptionsMigrationRequest {
+        paths,
+        pool: has_options_table.then_some(&pool),
+        registry: &registry,
+        migrations_path: Some(migrations_path.as_path()),
+        config_schema_path: config_schema_path.as_deref(),
+        template_path,
+        override_doc: None,
+        strict_config_schema: true,
+        dry_run: false,
+        discard_legacy,
+    })
+    .await?;
+
+    for w in report.warnings {
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
+
+    Ok((
+        config_changed || report.changed,
+        config_backup_path.or(report.backup_path),
+    ))
 }
 
 fn check_extension_compat_warnings(
@@ -390,7 +550,20 @@ pub async fn run_check_with_config(
 /// Stage, verify, migrate, and atomically activate a local archive upgrade.
 pub async fn handle_upgrade(ctx: &AppContext, args: DeploymentUpgradeArgs) -> Result<()> {
     let paths = ctx.resolve_paths()?;
-    run_upgrade_flow(ctx, &paths, "upgrade", &args.package, &args.checksum, &args.env, &args.backup, args.allow_destructive, args.dry_run, Vec::new()).await
+    run_upgrade_flow(
+        ctx,
+        &paths,
+        "upgrade",
+        &args.package,
+        &args.checksum,
+        &args.env,
+        &args.backup,
+        args.allow_destructive,
+        args.discard_legacy,
+        args.dry_run,
+        Vec::new(),
+    )
+    .await
 }
 
 /// Download and activate an official GitHub release when newer or pinned.
@@ -471,6 +644,7 @@ pub async fn run_update_with_config(
         &args.env,
         &args.backup,
         args.allow_destructive,
+        args.discard_legacy,
         args.dry_run,
         extra_warnings,
     )
@@ -487,6 +661,7 @@ async fn run_upgrade_flow(
     env_args: &crate::cli::deployment::DeploymentEnvArgs,
     backup_args: &crate::cli::deployment::SafetyBackupArgs,
     allow_destructive: bool,
+    discard_legacy: bool,
     dry_run: bool,
     mut warnings: Vec<String>,
 ) -> Result<()> {
@@ -562,9 +737,26 @@ async fn run_upgrade_flow(
         paths,
         &staged_template,
         Some((&staged.extracted_dir, &source_manifest)),
+        true,
         false,
     )?;
     warnings.extend(cfg_warnings);
+
+    let (opt_config_changed, opt_warnings) = preflight_deployment_options_migration(
+        ctx,
+        paths,
+        &staged.extracted_dir,
+        &source_manifest,
+        &staged_template,
+        discard_legacy,
+    )
+    .await?;
+    for w in opt_warnings {
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
+    let config_changed = config_changed || opt_config_changed;
 
     if dry_run {
         let report = DeploymentMutationReport {
@@ -674,7 +866,7 @@ async fn run_upgrade_flow(
     }
 
     let (applied_cfg_changed, cfg_bak_path, apply_cfg_warnings) =
-        match preview_or_apply_config_sync(paths, &paths.config_template_path, None, true) {
+        match preview_or_apply_config_sync(paths, &paths.config_template_path, None, true, true) {
             Ok(v) => v,
             Err(err) => {
                 let _ = rollback_swap_journal(paths, &journal_dir);
@@ -705,6 +897,24 @@ async fn run_upgrade_flow(
                 "Database migration failed during upgrade; recovery state recorded in '{}'. Inspect and run `cfms-ctl deployment resume`: {err}",
                 paths.transaction_path().display()
             )));
+        }
+    };
+
+    let (applied_cfg_changed, cfg_bak_path) = match complete_deployment_options_migration(
+        ctx,
+        paths,
+        discard_legacy,
+        applied_cfg_changed,
+        cfg_bak_path,
+        &mut warnings,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tx.last_error = Some(err.to_string());
+            let _ = save_transaction(paths, &tx);
+            return Err(err);
         }
     };
 
@@ -803,6 +1013,7 @@ pub async fn handle_downgrade(ctx: &AppContext, args: DeploymentDowngradeArgs) -
             &paths,
             &target.release_dir.join("src").join("config.toml.sample"),
             Some((&target.release_dir, &source_manifest)),
+            true,
             false,
         )?
     };
@@ -938,9 +1149,17 @@ pub async fn handle_downgrade(ctx: &AppContext, args: DeploymentDowngradeArgs) -
         }
     } else {
         let (changed, bak, cfg_warn) =
-            preview_or_apply_config_sync(&paths, &paths.config_template_path, None, true)?;
+            preview_or_apply_config_sync(&paths, &paths.config_template_path, None, true, true)?;
         warnings.extend(cfg_warn);
-        (changed, bak)
+        complete_deployment_options_migration(
+            ctx,
+            &paths,
+            false,
+            changed,
+            bak,
+            &mut warnings,
+        )
+        .await?
     };
 
     let quarantined =
@@ -1124,7 +1343,14 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                     args.skip_env,
                 )?;
                 sync_python_environment(&paths, &env_plan).await?;
-                preview_or_apply_config_sync(&paths, &paths.config_template_path, None, true)?;
+                let (cfg_changed, cfg_bak, cfg_warn) = preview_or_apply_config_sync(
+                    &paths,
+                    &paths.config_template_path,
+                    None,
+                    true,
+                    true,
+                )?;
+                warnings.extend(cfg_warn);
                 let target_head = tx.target_head.clone().ok_or_else(|| {
                     CfmsError::Deployment("Missing target_head in transaction.json".to_string())
                 })?;
@@ -1135,21 +1361,66 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                     args.allow_destructive,
                 )
                 .await?;
+                let (cfg_changed, cfg_bak) = complete_deployment_options_migration(
+                    ctx,
+                    &paths,
+                    args.discard_legacy,
+                    cfg_changed,
+                    cfg_bak,
+                    &mut warnings,
+                )
+                .await?;
                 clear_transaction_artifacts(&paths, Some(&tx))?;
-                emit_resume_done(ctx, &tx, "continued-upgrade", diagnosis.drift.current_revision, Some(db_after), warnings);
+                emit_resume_done(
+                    ctx,
+                    &tx,
+                    "continued-upgrade",
+                    diagnosis.drift.current_revision,
+                    Some(db_after),
+                    cfg_changed,
+                    cfg_bak,
+                    warnings,
+                );
                 return Ok(());
             }
             // Safe default for interrupted activation: restore source via journal or snapshot.
             restore_source_release_state(ctx, &paths, &tx, args.skip_env).await?;
             clear_transaction_artifacts(&paths, Some(&tx))?;
-            emit_resume_done(ctx, &tx, "rolled-back-activation", diagnosis.drift.current_revision.clone(), diagnosis.drift.current_revision, warnings);
+            emit_resume_done(
+                ctx,
+                &tx,
+                "rolled-back-activation",
+                diagnosis.drift.current_revision.clone(),
+                diagnosis.drift.current_revision,
+                false,
+                None,
+                warnings,
+            );
             Ok(())
         }
         (TransactionOperation::Upgrade, TransactionPhase::DatabaseMigration | TransactionPhase::DatabaseRecoveryRequired) => {
             match &diagnosis.classification {
                 ResumeDbClassification::AtTarget => {
+                    let (cfg_changed, cfg_bak) = complete_deployment_options_migration(
+                        ctx,
+                        &paths,
+                        args.discard_legacy,
+                        false,
+                        None,
+                        &mut warnings,
+                    )
+                    .await?;
                     clear_transaction_artifacts(&paths, Some(&tx))?;
-                    emit_resume_done(ctx, &tx, "finalized-already-migrated", tx.target_head.clone(), tx.target_head.clone(), warnings);
+                    emit_resume_done(
+                        ctx,
+                        &tx,
+                        "finalized-already-migrated",
+                        tx.target_head.clone(),
+                        tx.target_head.clone(),
+                        cfg_changed,
+                        cfg_bak,
+                        warnings,
+                    );
                     Ok(())
                 }
                 ResumeDbClassification::AtSource | ResumeDbClassification::Intermediate(_) => {
@@ -1162,7 +1433,16 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                         }
                         restore_source_release_state(ctx, &paths, &tx, args.skip_env).await?;
                         clear_transaction_artifacts(&paths, Some(&tx))?;
-                        emit_resume_done(ctx, &tx, "rolled-back-to-source", diagnosis.drift.current_revision, Some(source_head.to_string()), warnings);
+                        emit_resume_done(
+                            ctx,
+                            &tx,
+                            "rolled-back-to-source",
+                            diagnosis.drift.current_revision,
+                            Some(source_head.to_string()),
+                            false,
+                            None,
+                            warnings,
+                        );
                         return Ok(());
                     }
                     let target_head = tx.target_head.as_deref().ok_or_else(|| {
@@ -1183,8 +1463,26 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                         args.allow_destructive,
                     )
                     .await?;
+                    let (cfg_changed, cfg_bak) = complete_deployment_options_migration(
+                        ctx,
+                        &paths,
+                        args.discard_legacy,
+                        false,
+                        None,
+                        &mut warnings,
+                    )
+                    .await?;
                     clear_transaction_artifacts(&paths, Some(&tx))?;
-                    emit_resume_done(ctx, &tx, "resumed-database-upgrade", diagnosis.drift.current_revision, Some(db_after), warnings);
+                    emit_resume_done(
+                        ctx,
+                        &tx,
+                        "resumed-database-upgrade",
+                        diagnosis.drift.current_revision,
+                        Some(db_after),
+                        cfg_changed,
+                        cfg_bak,
+                        warnings,
+                    );
                     Ok(())
                 }
                 ResumeDbClassification::Unknown(rev) => Err(CfmsError::SchemaDrift(format!(
@@ -1220,7 +1518,7 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                     let env_plan = plan_environment_options(&paths, &settings, &[], false, None, false, args.skip_env)?;
                     sync_python_environment(&paths, &env_plan).await?;
                     clear_transaction_artifacts(&paths, Some(&tx))?;
-                    emit_resume_done(ctx, &tx, "completed-downgrade-activation", tx.target_head.clone(), tx.target_head.clone(), warnings);
+                    emit_resume_done(ctx, &tx, "completed-downgrade-activation", tx.target_head.clone(), tx.target_head.clone(), false, None, warnings);
                     Ok(())
                 }
                 ResumeDbClassification::AtSource | ResumeDbClassification::Intermediate(_) => {
@@ -1240,7 +1538,7 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                         let j_dir = tx_root_dir(&paths).join(&tx.transaction_id);
                         apply_swap_with_journal(&paths, current_manifest.as_ref(), &target.release_dir, &target.manifest, &j_dir)?;
                         clear_transaction_artifacts(&paths, Some(&tx))?;
-                        emit_resume_done(ctx, &tx, "continued-downgrade", diagnosis.drift.current_revision, Some(target_head.to_string()), warnings);
+                        emit_resume_done(ctx, &tx, "continued-downgrade", diagnosis.drift.current_revision, Some(target_head.to_string()), false, None, warnings);
                         return Ok(());
                     }
                     if matches!(diagnosis.classification, ResumeDbClassification::Intermediate(_)) {
@@ -1248,7 +1546,7 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                         execute_deployment_db_upgrade(ctx, &paths, source_head, args.allow_destructive).await?;
                     }
                     clear_transaction_artifacts(&paths, Some(&tx))?;
-                    emit_resume_done(ctx, &tx, "aborted-downgrade-at-source", diagnosis.drift.current_revision, tx.source_head.clone(), warnings);
+                    emit_resume_done(ctx, &tx, "aborted-downgrade-at-source", diagnosis.drift.current_revision, tx.source_head.clone(), false, None, warnings);
                     Ok(())
                 }
                 ResumeDbClassification::Unknown(rev) => Err(CfmsError::SchemaDrift(format!(
@@ -1272,12 +1570,12 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
             let env_plan = plan_environment_options(&paths, &settings, &[], false, None, false, args.skip_env)?;
             sync_python_environment(&paths, &env_plan).await?;
             clear_transaction_artifacts(&paths, Some(&tx))?;
-            emit_resume_done(ctx, &tx, "finished-downgrade-activation", diagnosis.drift.current_revision, tx.target_head.clone(), warnings);
+            emit_resume_done(ctx, &tx, "finished-downgrade-activation", diagnosis.drift.current_revision, tx.target_head.clone(), false, None, warnings);
             Ok(())
         }
         (TransactionOperation::Install, _) => {
             clear_transaction_artifacts(&paths, Some(&tx))?;
-            emit_resume_done(ctx, &tx, "cleared-install-marker", diagnosis.drift.current_revision, None, warnings);
+            emit_resume_done(ctx, &tx, "cleared-install-marker", diagnosis.drift.current_revision, None, false, None, warnings);
             Ok(())
         }
     }
@@ -1341,12 +1639,15 @@ async fn restore_source_release_state(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_resume_done(
     ctx: &AppContext,
     tx: &DeploymentTransaction,
     outcome: &str,
     db_before: Option<String>,
     db_after: Option<String>,
+    config_changed: bool,
+    config_backup_path: Option<String>,
     warnings: Vec<String>,
 ) {
     let report = DeploymentMutationReport {
@@ -1362,8 +1663,8 @@ fn emit_resume_done(
         files_updated: 0,
         files_removed: 0,
         extras: Vec::new(),
-        config_changed: false,
-        config_backup_path: None,
+        config_changed,
+        config_backup_path,
         db_revision_before: db_before,
         db_revision_after: db_after,
         backup_archive_path: None,
@@ -2241,6 +2542,7 @@ mod tests {
                 },
                 backup: SafetyBackupArgs::default(),
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: true,
             },
         )
@@ -2269,6 +2571,7 @@ mod tests {
                 },
                 backup: SafetyBackupArgs::default(),
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: false,
             },
         )
@@ -2328,6 +2631,7 @@ mod tests {
                     backup_key_out: Some(bak_key.clone()),
                 },
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: false,
             },
         )
@@ -2454,6 +2758,7 @@ mod tests {
                 },
                 backup: SafetyBackupArgs::default(),
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: false,
             },
         )
@@ -2508,6 +2813,7 @@ mod tests {
                 },
                 backup: SafetyBackupArgs::default(),
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: false,
             },
         )
@@ -2737,6 +3043,7 @@ mod tests {
                     },
                     backup: SafetyBackupArgs::default(),
                     allow_destructive: false,
+                    discard_legacy: false,
                     dry_run: false,
                 },
             )
@@ -2985,6 +3292,7 @@ mod tests {
                 backup: SafetyBackupArgs::default(),
                 require_github_digest: false,
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: false,
             },
             &online_cfg,
@@ -3017,6 +3325,7 @@ mod tests {
                 backup: SafetyBackupArgs::default(),
                 require_github_digest: false,
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: false,
             },
             &online_cfg,
@@ -3123,6 +3432,7 @@ mod tests {
                 },
                 backup: SafetyBackupArgs::default(),
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: true,
             },
         )
@@ -3188,6 +3498,7 @@ mod tests {
                 },
                 backup: SafetyBackupArgs::default(),
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: true,
             },
         )
@@ -3205,6 +3516,7 @@ mod tests {
                 },
                 backup: SafetyBackupArgs::default(),
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: false,
             },
         )
@@ -3270,6 +3582,7 @@ mod tests {
                 },
                 backup: SafetyBackupArgs::default(),
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: true,
             },
         )
@@ -3292,6 +3605,7 @@ mod tests {
                 },
                 backup: SafetyBackupArgs::default(),
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: true,
             },
         )
@@ -3363,6 +3677,7 @@ mod tests {
                 },
                 backup: SafetyBackupArgs::default(),
                 allow_destructive: false,
+                discard_legacy: false,
                 dry_run: false,
             },
         )
@@ -3399,6 +3714,406 @@ mod tests {
                 .manifest
                 .version,
             "0.15.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_migrates_legacy_toml_creates_options_table_and_handles_resume_conflict_recovery()
+    {
+        use sqlx::Row;
+        use crate::db::{OptionUpdateInput, fetch_stored_options, write_options_batch};
+
+        let tmp = TempDir::new().unwrap();
+        let v1_pkg = tmp.path().join("cfms-0.13.9.tar.gz");
+        let (v1_files, v1_manifest_bytes) = build_release_bundle_map(
+            "0.13.9",
+            &[("03197fed3401", None)],
+            &base_config_template(""),
+            &[],
+        );
+        write_release_targz(&v1_pkg, "cfms-0.13.9", &v1_files, &v1_manifest_bytes);
+
+        let deploy = tmp.path().join("deploy-upgrade-mig");
+        install_fixture_release(&deploy, &v1_pkg, true).await;
+        let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
+        let ctx = test_ctx(&deploy);
+
+        // Configure legacy v0.13 config.toml and drop `options` table so DB starts at pre-options revision `03197fed3401`.
+        let legacy_cfg = r#"# Operator deployment header
+[database]
+type = "sqlite"
+# Keep custom sqlite path
+db_name = "legacy_deploy.db"
+
+[security]
+pepper = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+passwd_min_len = 9
+passwd_must_contain = ["AB", "!@"]
+
+[security.auth_throttle]
+max_attempts = 5
+
+[sso.oidc]
+enabled = true
+issuer = "  https://sso.example.org  "
+
+[document]
+allow_name_duplicate = false
+
+[document.upload]
+creation_rate_window_seconds = 90
+creation_rate_per_user = 15
+
+[extensions]
+enabled = []
+
+[server]
+secret_key = "deploy-secret-key"
+
+[custom]
+note = "preserve-me"
+"#;
+        fs::write(&paths.config_path, legacy_cfg).unwrap();
+        {
+            let db = ctx.connect_db(&paths).await.unwrap();
+            create_head_schema(&db, false).await.unwrap();
+            let DbPool::Sqlite(ref sq) = db else { unreachable!() };
+            sqlx::query("DROP TABLE options").execute(sq).await.unwrap();
+            set_alembic_version(&db, "03197fed3401").await.unwrap();
+            db.close().await;
+        }
+
+        let v2_template = b"[database]\ntype = \"sqlite\"\nname = \"cfms.db\"\n\n[security]\npepper = \"\"\n\n[server]\nsecret_key = \"\"\n\n[logging]\nlevel = \"INFO\"\n\n[extensions]\nenabled = []\n";
+        let config_schema = serde_json::to_vec_pretty(&serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "database": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "type": { "type": "string", "enum": ["sqlite", "mysql", "postgresql"] },
+                        "name": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["type", "name"]
+                },
+                "security": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "pepper": { "type": "string" }
+                    },
+                    "required": ["pepper"]
+                },
+                "server": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "secret_key": { "type": "string" }
+                    },
+                    "required": ["secret_key"]
+                },
+                "logging": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "level": { "type": "string" }
+                    },
+                    "required": ["level"]
+                }
+            },
+            "required": ["database", "security", "server", "logging"]
+        }))
+        .unwrap();
+        let options_schema = serde_json::to_vec_pretty(&serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "security.password": {
+                    "type": "object",
+                    "x-cfms-owner": "core",
+                    "x-cfms-schema-version": 1,
+                    "additionalProperties": false,
+                    "properties": {
+                        "passwd_min_len": { "type": "integer", "minimum": 1, "default": 8 },
+                        "passwd_rules": {
+                            "type": "array",
+                            "items": { "type": "string", "x-format": "regex" },
+                            "default": []
+                        },
+                        "passwd_min_passed_count": { "type": "integer", "minimum": 0, "default": 0 }
+                    }
+                },
+                "security.auth_throttle": {
+                    "type": "object",
+                    "x-cfms-owner": "core",
+                    "x-cfms-schema-version": 1,
+                    "additionalProperties": false,
+                    "properties": {
+                        "max_attempts": { "type": "integer", "minimum": 1, "default": 5 }
+                    }
+                },
+                "document.upload.creation_risk_control": {
+                    "type": "object",
+                    "x-cfms-owner": "core",
+                    "x-cfms-schema-version": 1,
+                    "additionalProperties": false,
+                    "properties": {
+                        "refill_period_seconds": { "type": "integer", "minimum": 1, "default": 60 },
+                        "account_refill_tokens": { "type": "integer", "minimum": 1, "default": 10 },
+                        "account_capacity": { "type": "integer", "minimum": 1, "default": 10 }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let oidc_schema = serde_json::to_vec_pretty(&serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "ext.oidc_sso": {
+                    "type": "object",
+                    "x-cfms-owner": "oidc_sso",
+                    "x-cfms-schema-version": 1,
+                    "additionalProperties": false,
+                    "properties": {
+                        "issuer": { "type": "string", "minLength": 1, "x-normalize": "trim" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let migrations_json = serde_json::to_vec_pretty(&serde_json::json!({
+            "format_version": 1,
+            "toml_migrations": [
+                {
+                    "id": "database_db_name_to_name",
+                    "description": "Rename db_name",
+                    "ops": [
+                        { "op": "rename_or_move", "from": "database.db_name", "to": "database.name" },
+                        { "op": "remove", "path": "database.db_name" }
+                    ]
+                },
+                {
+                    "id": "sso_oidc_to_extensions",
+                    "description": "Move sso.oidc",
+                    "ops": [
+                        { "op": "move_table_entries", "from_table": "sso.oidc", "to_table": "extensions.oidc_sso", "exclude": ["enabled"] },
+                        { "op": "append_if_true", "from_flag": "sso.oidc.enabled", "to_array": "extensions.enabled", "value": "oidc_sso" },
+                        { "op": "remove", "path": "sso.oidc" },
+                        { "op": "remove", "path": "sso" }
+                    ]
+                },
+                {
+                    "id": "creation_rate",
+                    "description": "Convert rate",
+                    "ops": [
+                        { "op": "copy_positive_int", "from": "document.upload.creation_rate_window_seconds", "to": "document.upload.creation_risk_control.refill_period_seconds" },
+                        { "op": "copy_positive_int", "from": "document.upload.creation_rate_per_user", "to": "document.upload.creation_risk_control.account_refill_tokens" },
+                        { "op": "copy_scaled_int", "from": "document.upload.creation_rate_per_user", "to": "document.upload.creation_risk_control.account_capacity", "div_ceil": 3, "min_from_path": "document.upload.creation_risk_control.account_capacity", "default_min": 10 },
+                        { "op": "remove", "path": "document.upload.creation_rate_window_seconds" },
+                        { "op": "remove", "path": "document.upload.creation_rate_per_user" }
+                    ]
+                },
+                {
+                    "id": "passwd",
+                    "description": "Convert passwd",
+                    "ops": [
+                        { "op": "char_groups_to_regex_list", "from": "security.passwd_must_contain", "to_rules": "security.passwd_rules", "to_count": "security.passwd_min_passed_count" },
+                        { "op": "remove", "path": "security.passwd_must_contain" }
+                    ]
+                }
+            ],
+            "options_migrations": [
+                { "toml_path": "security", "namespace": "security.password", "owner": "core", "keys": ["passwd_min_len", "passwd_rules", "passwd_min_passed_count"] },
+                { "toml_path": "security.auth_throttle", "namespace": "security.auth_throttle", "owner": "core" },
+                { "toml_path": "document.upload.creation_risk_control", "namespace": "document.upload.creation_risk_control", "owner": "core" },
+                { "toml_path": "extensions.oidc_sso", "namespace": "ext.oidc_sso", "owner": "oidc_sso" }
+            ],
+            "obsolete_paths": [
+                { "path": "document.allow_name_duplicate", "action": "warn_and_ignore", "warning": "obsolete allow_name_duplicate" }
+            ]
+        }))
+        .unwrap();
+
+        let v2_pkg = tmp.path().join("cfms-0.14.0.zip");
+        let (v2_files, mut v2_manifest_bytes) = build_release_bundle_map(
+            "0.14.0",
+            &[
+                ("03197fed3401", None),
+                ("16c86712512a", Some("03197fed3401")),
+                ("e952c02c1454", Some("16c86712512a")),
+            ],
+            v2_template,
+            &[
+                ("src/include/schemas/config.schema.json", &config_schema),
+                ("src/include/schemas/options.schema.json", &options_schema),
+                ("src/include/schemas/config.migrations.json", &migrations_json),
+                ("src/include/extensions/oidc_sso/options.schema.json", &oidc_schema),
+            ],
+        );
+        let mut parsed_manifest: ReleaseManifest = serde_json::from_slice(&v2_manifest_bytes).unwrap();
+        parsed_manifest.managed_extensions.push("oidc_sso".to_string());
+        v2_manifest_bytes = serde_json::to_vec_pretty(&parsed_manifest).unwrap();
+        write_release_zip(&v2_pkg, "cfms-0.14.0", &v2_files, &v2_manifest_bytes);
+
+        // 1. Dry-run succeeds even before `options` table exists and leaves workspace/DB untouched.
+        handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v2_pkg.clone(),
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                discard_legacy: false,
+                dry_run: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read_to_string(&paths.config_path).unwrap(), legacy_cfg);
+
+        // 2. Real upgrade creates `options` table during DB upgrade, migrates legacy options, cleans config.toml.
+        handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v2_pkg,
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                discard_legacy: false,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let upgraded_cfg = fs::read_to_string(&paths.config_path).unwrap();
+        assert!(upgraded_cfg.contains("# Operator deployment header"));
+        assert!(upgraded_cfg.contains("note = \"preserve-me\""));
+        assert!(upgraded_cfg.contains("name = \"legacy_deploy.db\""));
+        assert!(upgraded_cfg.contains("level = \"INFO\""));
+        assert!(!upgraded_cfg.contains("db_name"));
+        assert!(!upgraded_cfg.contains("[sso"));
+        assert!(!upgraded_cfg.contains("passwd_must_contain"));
+        assert!(!upgraded_cfg.contains("allow_name_duplicate"));
+        assert!(!upgraded_cfg.contains("auth_throttle"));
+        assert!(!upgraded_cfg.contains("creation_rate_"));
+
+        let db = ctx.connect_db(&paths).await.unwrap();
+        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("e952c02c1454"));
+        let stored = fetch_stored_options(&db, None).await.unwrap();
+        assert_eq!(
+            stored[&("security.password".to_string(), "passwd_min_len".to_string())].value,
+            serde_json::json!(9)
+        );
+        assert_eq!(
+            stored[&("security.password".to_string(), "passwd_rules".to_string())].value,
+            serde_json::json!(["(?:A|B)", "(?:!|@)"])
+        );
+        assert_eq!(
+            stored[&("security.auth_throttle".to_string(), "max_attempts".to_string())].value,
+            serde_json::json!(5)
+        );
+        assert_eq!(
+            stored[&("ext.oidc_sso".to_string(), "issuer".to_string())].value,
+            serde_json::json!("https://sso.example.org")
+        );
+        let DbPool::Sqlite(ref sq) = db else { unreachable!() };
+        let audit_count: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM audit_entries WHERE action = 'update_options' AND data LIKE '%cfms_ctl_migration%'",
+        )
+        .fetch_one(sq)
+        .await
+        .unwrap()
+        .get(0);
+        assert!(audit_count >= 1);
+
+        // 3. Interrupted upgrade transaction at DatabaseMigration (AtTarget) with conflicting DB option
+        //    must error cleanly without `--discard-legacy` and recover cleanly WITH `--discard-legacy`.
+        let registry = load_options_registry_with_override(&paths, None, None).unwrap();
+        let mut override_val = BTreeMap::new();
+        override_val.insert(
+            "max_attempts".to_string(),
+            OptionUpdateInput {
+                value: serde_json::json!(12),
+                expected_revision: 1,
+            },
+        );
+        write_options_batch(&db, &registry, "security.auth_throttle", override_val)
+            .await
+            .unwrap();
+        db.close().await;
+
+        let re_added_legacy = format!("{upgraded_cfg}\n[security.auth_throttle]\nmax_attempts = 4\n");
+        fs::write(&paths.config_path, &re_added_legacy).unwrap();
+
+        let tx = DeploymentTransaction {
+            format_version: TRANSACTION_FORMAT_VERSION,
+            transaction_id: "tx-opt-resume".to_string(),
+            operation: TransactionOperation::Upgrade,
+            phase: TransactionPhase::DatabaseMigration,
+            started_at: None,
+            source_release_id: "src-013".to_string(),
+            target_release_id: "tgt-014".to_string(),
+            source_version: "0.13.9".to_string(),
+            target_version: "0.14.0".to_string(),
+            source_head: Some("03197fed3401".to_string()),
+            target_head: Some("e952c02c1454".to_string()),
+            staging_dir: None,
+            journal_dir: None,
+            last_error: None,
+            observed_db_revision: Some("03197fed3401".to_string()),
+            step_history: Vec::new(),
+        };
+        save_transaction(&paths, &tx).unwrap();
+
+        let resume_err = handle_resume(
+            &ctx,
+            DeploymentResumeArgs {
+                skip_env: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(resume_err, CfmsError::OptionConflict(_)));
+        assert!(paths.transaction_path().is_file());
+
+        handle_resume(
+            &ctx,
+            DeploymentResumeArgs {
+                skip_env: true,
+                discard_legacy: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!paths.transaction_path().exists());
+
+        let resumed_cfg = fs::read_to_string(&paths.config_path).unwrap();
+        assert!(!resumed_cfg.contains("auth_throttle"));
+        let db2 = ctx.connect_db(&paths).await.unwrap();
+        let stored2 = fetch_stored_options(&db2, Some("security.auth_throttle"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored2[&("security.auth_throttle".to_string(), "max_attempts".to_string())].value,
+            serde_json::json!(12)
+        );
+        assert_eq!(
+            stored2[&("security.auth_throttle".to_string(), "max_attempts".to_string())].revision,
+            2
         );
     }
 }

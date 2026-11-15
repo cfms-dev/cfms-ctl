@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Key, Table, TableLike, Value};
 use crate::core::atomic::write_with_timestamped_backup;
 use crate::core::error::{CfmsError, Result};
-use crate::core::paths::WorkspacePaths;
-use crate::core::schema::{
-    evaluate_schema_invariants, load_json_schema_file, validate_instance_against_schema,
+use crate::core::migration::{
+    apply_toml_migrations, find_present_obsolete_paths, find_present_option_migration_paths,
+    has_dotted_path as migration_has_dotted_path, load_config_migrations,
 };
+use crate::core::paths::WorkspacePaths;
+use crate::core::schema::{load_json_schema_file, validate_config_against_schema};
 use crate::db::DatabaseKind;
 
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
@@ -202,6 +204,7 @@ pub struct TemplateSyncPlan {
     pub config_path: PathBuf,
     pub template_path: PathBuf,
     pub changed: bool,
+    pub migrations_applied: Vec<String>,
     pub added_paths: Vec<String>,
     pub removed_paths: Vec<String>,
     pub preserved_paths: Vec<String>,
@@ -483,19 +486,37 @@ impl ConfigDocument {
 
     /// Synchronize this configuration document in-place with `template` using `toml_edit` CST merging,
     /// and optionally validate the resulting configuration against an external JSON Schema file.
-    ///
-    /// - Existing operator values, inline comments, section headers, and key ordering are preserved.
-    /// - Missing keys and sections from `template` are inserted with their template comments (`Decor`).
-    /// - Template-external paths in `self` are preserved in `preserved_paths` unless removed via
-    ///   `remove_paths` or `prune`.
-    /// - When `schema_path` is provided, the merged document is validated against the JSON Schema
-    ///   and its declarative `x-invariants` rules.
     pub fn sync_with_template_and_schema(
         &mut self,
         template: &Self,
         remove_paths: &[String],
         prune: bool,
         schema_path: Option<&Path>,
+    ) -> Result<TemplateSyncPlan> {
+        self.sync_with_template_and_migrations(
+            template,
+            remove_paths,
+            prune,
+            schema_path,
+            None,
+            false,
+        )
+    }
+
+    /// Synchronize this configuration document in-place with `template`, applying declarative
+    /// `config.migrations.json` rules before template structural checks and schema validation.
+    ///
+    /// When `allow_unmigrated_options` is `false` and `migrations_path` is provided, any remaining
+    /// `options_migrations` or `obsolete_paths` entries cause an explicit error directing the user
+    /// to run `cfms-ctl config migrate-options` first.
+    pub fn sync_with_template_and_migrations(
+        &mut self,
+        template: &Self,
+        remove_paths: &[String],
+        prune: bool,
+        schema_path: Option<&Path>,
+        migrations_path: Option<&Path>,
+        allow_unmigrated_options: bool,
     ) -> Result<TemplateSyncPlan> {
         if paths_refer_to_same_file(&self.path, &template.path) {
             return Err(CfmsError::Config(
@@ -504,6 +525,29 @@ impl ConfigDocument {
         }
 
         let mut candidate = self.doc.clone();
+        let mut migrations_applied = Vec::new();
+        let mut warnings = Vec::new();
+        let mut mig_changed = false;
+
+        if let Some(mig_path) = migrations_path {
+            let manifest = load_config_migrations(mig_path)?;
+            let outcome = apply_toml_migrations(&mut candidate, &manifest, Some(&template.doc))?;
+            mig_changed = outcome.changed;
+            migrations_applied = outcome.applied_rule_ids;
+            warnings.extend(outcome.warnings);
+
+            if !allow_unmigrated_options {
+                let mut pending = find_present_option_migration_paths(candidate.as_table(), &manifest);
+                pending.extend(find_present_obsolete_paths(candidate.as_table(), &manifest));
+                if !pending.is_empty() {
+                    return Err(CfmsError::Config(format!(
+                        "Run `cfms-ctl config migrate-options` before synchronizing the template; legacy database-backed or obsolete settings remain in config.toml: {}",
+                        pending.join(", ")
+                    )));
+                }
+            }
+        }
+
         let mut unknown_roots = Vec::new();
         find_unknown_roots(
             candidate.as_table(),
@@ -515,7 +559,7 @@ impl ConfigDocument {
         let requested_removals: BTreeSet<String> = remove_paths.iter().cloned().collect();
         let mut invalid_removals = Vec::new();
         for req in &requested_removals {
-            let exists_in_current = has_dotted_path(candidate.as_table(), req);
+            let exists_in_current = migration_has_dotted_path(candidate.as_table(), req);
             let is_template_external = unknown_roots
                 .iter()
                 .any(|u| req == u || req.starts_with(&format!("{u}.")));
@@ -561,14 +605,14 @@ impl ConfigDocument {
             raw_source: self.raw_source.clone(),
             doc: candidate,
         };
-        let warnings = candidate_wrapper.validate_with_schema(schema_path)?;
+        warnings.extend(candidate_wrapper.validate_with_schema(schema_path)?);
 
         added_paths.sort();
         let mut removed_paths = selected_removals;
         removed_paths.sort();
         preserved_paths.sort();
 
-        let changed = !added_paths.is_empty() || !removed_paths.is_empty();
+        let changed = mig_changed || !added_paths.is_empty() || !removed_paths.is_empty();
         if changed {
             self.doc = candidate_wrapper.doc;
         }
@@ -577,6 +621,7 @@ impl ConfigDocument {
             config_path: self.path.clone(),
             template_path: template.path.clone(),
             changed,
+            migrations_applied,
             added_paths,
             removed_paths,
             preserved_paths,
@@ -585,7 +630,7 @@ impl ConfigDocument {
     }
 
     /// Validate structural invariants and optionally evaluate an external `config.schema.json`
-    /// (including standard JSON Schema keywords and declarative `x-invariants`).
+    /// (including standard JSON Schema keywords, regex/integer normalization, and `x-invariants`).
     pub fn validate_with_schema(&self, schema_path: Option<&Path>) -> Result<Vec<String>> {
         if let Some(sec_item) = self.doc.get("security")
             && !sec_item.is_table_like()
@@ -610,8 +655,7 @@ impl ConfigDocument {
             ))
         })?;
 
-        validate_instance_against_schema(&schema_json, &config_json, "config.toml")?;
-        evaluate_schema_invariants(&schema_json, &config_json)
+        validate_config_against_schema(&schema_json, &config_json)
     }
 
     /// Extract normalized `[extensions.oidc_sso].issuer` if configured (trailing `/` stripped).
@@ -678,30 +722,6 @@ fn find_unknown_roots(
         }
     }
     Ok(())
-}
-
-fn has_dotted_path(root: &dyn TableLike, dotted_path: &str) -> bool {
-    let parts: Vec<&str> = dotted_path.split('.').collect();
-    if parts.is_empty() {
-        return false;
-    }
-    let mut current = root;
-    for (idx, part) in parts.iter().enumerate() {
-        let Some(item) = current.get(part) else {
-            return false;
-        };
-        if item.is_none() {
-            return false;
-        }
-        if idx + 1 == parts.len() {
-            return true;
-        }
-        let Some(next_table) = item.as_table_like() else {
-            return false;
-        };
-        current = next_table;
-    }
-    false
 }
 
 fn remove_dotted_path(

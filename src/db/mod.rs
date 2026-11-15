@@ -10,8 +10,9 @@ pub use backend::{DatabaseKind, DbPool};
 pub use options::{
     NamespaceSchemaSpec, OptionPropertySpec, OptionUpdateInput, OptionValueType,
     OptionsSchemaRegistry, ResolvedOptionRecord, decode_option_value, encode_option_value,
-    get_option, list_options, reset_option, validate_option_key, validate_option_namespace,
-    validate_option_owner, write_options_batch,
+    fetch_stored_options, get_option, list_options, reset_option, validate_namespace_values_with_schema,
+    validate_option_key, validate_option_namespace, validate_option_owner, write_options_batch,
+    write_options_batches,
 };
 pub use schema::{
     APPLICATION_TABLE_NAMES, DEFERRED_COLUMNS, KNOWN_EXTENSION_TABLES, LATEST_SCHEMA_REVISION,

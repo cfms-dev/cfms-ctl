@@ -577,6 +577,17 @@ pub fn resolve_dotted_value<'a>(root: &'a Value, dotted_path: &str) -> Option<&'
     Some(current)
 }
 
+/// Normalize declarative fields, enforce strict integer/regex formats, validate against
+/// Draft 2020-12 JSON Schema, and evaluate `x-invariants` on `config.toml`.
+pub fn validate_config_against_schema(
+    schema_json: &Value,
+    raw_instance: &Value,
+) -> Result<Vec<String>> {
+    let normalized = normalize_and_precheck_value("config", schema_json, raw_instance)?;
+    validate_instance_against_schema(schema_json, &normalized, "config.toml")?;
+    evaluate_schema_invariants(schema_json, &normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
