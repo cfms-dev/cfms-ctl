@@ -27,9 +27,12 @@ use package::{
     commit_install_directory,
 };
 use planner::{
-    ExtensionTogglePlan, plan_disable, plan_enable, plan_install, plan_uninstall, plan_upgrade,
+    ExtensionPurgeDataPlan, ExtensionTogglePlan, plan_disable, plan_enable, plan_install,
+    plan_purge_data, plan_uninstall, plan_upgrade,
 };
-use purge::{ExtensionPurgeSummary, execute_extension_purge, preview_extension_purge};
+use purge::{
+    ExtensionPurgeSummary, PurgeTargetSpec, execute_extension_purge, preview_extension_purge,
+};
 use version::{CfmsServerVersion, check_server_compatibility, discover_server_version};
 
 pub use catalog::{
@@ -145,6 +148,36 @@ pub struct ExtensionUninstallReport {
     pub dry_run: bool,
     pub applied: bool,
     pub restart_required: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Report for `cfms-ctl extension purge-data`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtensionPurgeDataReport {
+    pub identifier: String,
+    pub display_name: Option<String>,
+    pub version: Option<String>,
+    pub directory: Option<String>,
+    pub installed: bool,
+    pub broken_target: bool,
+    pub retired_identifier: bool,
+    pub currently_enabled: bool,
+    pub can_apply: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
+    pub options_only: bool,
+    pub option_entries: u64,
+    pub state_entries: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub option_namespaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extension_tables: BTreeMap<String, u64>,
+    pub python_hook_detected: bool,
+    pub python_hook_executed: bool,
+    pub audit_logged: bool,
+    pub server_running: bool,
+    pub dry_run: bool,
+    pub applied: bool,
     pub warnings: Vec<String>,
 }
 
@@ -486,6 +519,7 @@ impl CommandReport for ExtensionUninstallReport {
         if let Some(purge) = &self.purge_summary {
             kv.row("Option Rows", purge.option_entries_deleted.to_string())
                 .row("State Rows", purge.state_entries_deleted.to_string())
+                .row("Custom Data Tables", format_table_row_counts(&purge.extension_table_rows))
                 .row(
                     "Python Hook Executed",
                     if purge.python_hook_executed { "yes" } else { "no" },
@@ -515,6 +549,124 @@ impl CommandReport for ExtensionUninstallReport {
     }
 }
 
+impl CommandReport for ExtensionPurgeDataReport {
+    fn render_human(&self, ui: &UiConsole) {
+        ui.print_section(&format!("Purge Extension Data ({})", self.identifier));
+        let mut kv = KeyValueTable::new("Extension Data Purge");
+        let status = if self.installed {
+            "installed"
+        } else if self.broken_target {
+            "broken directory (--options-only recovery)"
+        } else if self.retired_identifier {
+            "retired (not installed)"
+        } else {
+            "not installed (orphaned database rows)"
+        };
+
+        kv.row("Identifier", &self.identifier).row("Target Status", status);
+        if let Some(name) = &self.display_name {
+            kv.row("Display Name", name);
+        }
+        if let Some(ver) = &self.version {
+            kv.row("Installed Version", ver);
+        }
+        if let Some(dir) = &self.directory {
+            kv.row("Directory", dir);
+        }
+        kv.row(
+            "Currently Enabled",
+            if self.currently_enabled {
+                "yes (blocker: disable first)"
+            } else {
+                "no"
+            },
+        )
+        .row(
+            "Purge Scope",
+            if self.options_only {
+                "options + system_states only (--options-only)"
+            } else {
+                "full (ext_purge_data hook, declared [data] tables, options, system_states)"
+            },
+        )
+        .row("Option Rows", self.option_entries.to_string())
+        .row("State Rows", self.state_entries.to_string())
+        .row(
+            "Option Namespaces",
+            if self.option_namespaces.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.option_namespaces.join(", ")
+            },
+        )
+        .row(
+            "Custom Data Tables",
+            format_table_row_counts(&self.extension_tables),
+        )
+        .row(
+            "Python Hook",
+            if self.options_only {
+                "skipped (--options-only)"
+            } else if self.python_hook_executed {
+                "executed"
+            } else if self.python_hook_detected {
+                if self.applied {
+                    "detected (not executed)"
+                } else {
+                    "detected (runs on apply)"
+                }
+            } else {
+                "none"
+            },
+        )
+        .row(
+            "Server Lock Held",
+            if self.server_running { "yes" } else { "no" },
+        )
+        .row("Dry Run", if self.dry_run { "yes" } else { "no" })
+        .row("Applied", if self.applied { "yes" } else { "no" });
+        kv.print();
+
+        for warning in &self.warnings {
+            ui.print_warning(warning);
+        }
+
+        if self.applied {
+            let table_note = if self.extension_tables.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} across {} custom data table(s)",
+                    format_table_row_counts(&self.extension_tables),
+                    self.extension_tables.len()
+                )
+            };
+            let code_note = if self.installed {
+                "; extension code was preserved"
+            } else {
+                ""
+            };
+            ui.print_success(&format!(
+                "Purged {} option row(s) and {} system state row(s){} owned by '{}' (audit_logged={}){}.",
+                self.option_entries,
+                self.state_entries,
+                table_note,
+                self.identifier,
+                self.audit_logged,
+                code_note
+            ));
+        } else if self.dry_run {
+            if !self.can_apply {
+                ui.print_warning(
+                    "Dry-run preview completed with blockers; resolve the blockers above before applying purge-data.",
+                );
+            } else {
+                ui.print_warning("Dry-run mode active: no database data was modified.");
+            }
+        }
+    }
+}
+
 pub async fn handle(ctx: &AppContext, cmd: ExtensionCommand) -> Result<()> {
     match cmd {
         ExtensionCommand::List => handle_list(ctx),
@@ -524,9 +676,7 @@ pub async fn handle(ctx: &AppContext, cmd: ExtensionCommand) -> Result<()> {
         ExtensionCommand::Install(args) => handle_install(ctx, args),
         ExtensionCommand::Upgrade(args) => handle_upgrade(ctx, args),
         ExtensionCommand::Uninstall(args) => handle_uninstall(ctx, args).await,
-        ExtensionCommand::PurgeData(_args) => {
-            Err(CfmsError::NotImplementedYet("extension purge-data"))
-        }
+        ExtensionCommand::PurgeData(args) => handle_purge_data(ctx, args).await,
     }
 }
 
@@ -846,17 +996,22 @@ async fn handle_uninstall(ctx: &AppContext, args: ExtensionUninstallArgs) -> Res
     )?;
 
     let mut warnings = plan.warnings.clone();
-    let preview_summary = if args.purge_data && args.dry_run {
+    let uninstall_purge_target = PurgeTargetSpec {
+        identifier: &plan.identifier,
+        options_only: false,
+        target_directory: Some(&plan.target_directory),
+        entrypoint: Some(&plan.entrypoint_path),
+        data_module: plan.data_module.as_deref(),
+        manifest_namespaces: &plan.option_namespaces,
+        load_closure: &plan.load_closure,
+        dependency_error: plan.dependency_error.as_deref(),
+    };
+    let need_uninstall_preview =
+        args.purge_data && (args.dry_run || (!ctx.global.yes && ctx.ui.format() == OutputFormat::Human));
+    let preview_summary = if need_uninstall_preview {
         let db_cfg = config_doc.database_config()?;
         let pool = crate::db::backend::DbPool::connect(&db_cfg, &paths).await?;
-        let res = preview_extension_purge(
-            &pool,
-            &plan.identifier,
-            &plan.entrypoint_path,
-            plan.data_module.as_deref(),
-            &mut warnings,
-        )
-        .await;
+        let res = preview_extension_purge(&paths, &pool, &uninstall_purge_target, &mut warnings).await;
         pool.close().await;
         Some(res?)
     } else {
@@ -905,15 +1060,18 @@ async fn handle_uninstall(ctx: &AppContext, args: ExtensionUninstallArgs) -> Res
             report.backup_path = Some(backup_path.display().to_string());
         }
 
-        let purge_res = execute_extension_purge(
-            &paths,
-            &db_cfg,
-            &plan.identifier,
-            &plan.entrypoint_path,
-            plan.data_module.as_deref(),
-            &mut report.warnings,
-        )
-        .await;
+        let purge_target = PurgeTargetSpec {
+            identifier: &plan.identifier,
+            options_only: false,
+            target_directory: Some(&plan.target_directory),
+            entrypoint: Some(&plan.entrypoint_path),
+            data_module: plan.data_module.as_deref(),
+            manifest_namespaces: &plan.option_namespaces,
+            load_closure: &plan.load_closure,
+            dependency_error: plan.dependency_error.as_deref(),
+        };
+        let purge_res =
+            execute_extension_purge(&paths, &db_cfg, &purge_target, &mut report.warnings).await;
 
         let summary = match purge_res {
             Ok(s) => s,
@@ -959,6 +1117,174 @@ async fn handle_uninstall(ctx: &AppContext, args: ExtensionUninstallArgs) -> Res
 
     ctx.ui.render(&report);
     Ok(())
+}
+
+async fn handle_purge_data(ctx: &AppContext, args: ExtensionPurgeDataArgs) -> Result<()> {
+    if !args.dry_run && ctx.ui.format() == OutputFormat::Json && !ctx.global.yes {
+        return Err(CfmsError::InvalidArgument(
+            "Refusing interactive confirmation in JSON output mode; pass --yes to apply or --dry-run to preview"
+                .to_string(),
+        ));
+    }
+
+    let paths = ctx.resolve_paths()?;
+    let config_doc = ctx.load_config(&paths)?;
+    let catalog = discover_catalog(&paths.extensions_root)?;
+    let mut plan = plan_purge_data(
+        &args.identifier,
+        args.options_only,
+        args.dry_run,
+        &catalog,
+        &config_doc,
+        &paths,
+    )?;
+
+    let server_running = RuntimeLock::is_locked(&paths);
+    if !args.dry_run && server_running {
+        return Err(CfmsError::Extension(
+            "Cannot purge extension data while CFMS server runtime lock (`server.lock`) is held; stop the server first or pass --dry-run to preview".to_string(),
+        ));
+    }
+    if server_running {
+        let lock_msg = "CFMS server appears to be running (server.lock is held); stop the server before applying purge-data".to_string();
+        plan.blockers.push(lock_msg.clone());
+        plan.warnings.push(lock_msg);
+    }
+
+    let db_cfg = config_doc.database_config()?;
+    let need_preview =
+        args.dry_run || (!ctx.global.yes && ctx.ui.format() == OutputFormat::Human);
+    let mut report = if need_preview {
+        let pool = crate::db::backend::DbPool::connect(&db_cfg, &paths).await?;
+        let mut purge_warnings = Vec::new();
+        let preview_res = {
+            let target_spec = purge_target_from_plan(&plan);
+            preview_extension_purge(&paths, &pool, &target_spec, &mut purge_warnings).await
+        };
+        pool.close().await;
+        plan.warnings.extend(purge_warnings);
+        let summary = preview_res?;
+
+        if summary.python_hook_detected
+            && !plan.options_only
+            && let Some(dep_err) = &plan.dependency_error
+        {
+            if args.dry_run {
+                plan.blockers.push(dep_err.clone());
+            } else {
+                return Err(CfmsError::Extension(format!(
+                    "Cannot execute `ext_purge_data` hook for '{}' because its dependency closure failed to resolve ({dep_err}); repair dependencies or pass --options-only",
+                    plan.identifier
+                )));
+            }
+        }
+        build_purge_data_report(&plan, &summary, server_running, args.dry_run, false)
+    } else {
+        ExtensionPurgeDataReport {
+            identifier: plan.identifier.clone(),
+            display_name: plan.display_name.clone(),
+            version: plan.version.clone(),
+            directory: plan
+                .target_directory
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            installed: plan.installed,
+            broken_target: plan.broken_target,
+            retired_identifier: plan.retired_identifier,
+            currently_enabled: plan.currently_enabled,
+            can_apply: plan.blockers.is_empty(),
+            blockers: plan.blockers.clone(),
+            options_only: plan.options_only,
+            option_entries: 0,
+            state_entries: 0,
+            option_namespaces: plan.option_namespaces.clone(),
+            extension_tables: BTreeMap::new(),
+            python_hook_detected: false,
+            python_hook_executed: false,
+            audit_logged: false,
+            server_running,
+            dry_run: args.dry_run,
+            applied: false,
+            warnings: plan.warnings.clone(),
+        }
+    };
+
+    let prompt = if plan.options_only {
+        format!(
+            "Permanently delete `options` and `system_states` rows owned by '{}'?",
+            plan.identifier
+        )
+    } else {
+        format!(
+            "Permanently purge persistent database data owned by '{}'?",
+            plan.identifier
+        )
+    };
+    if !confirm_or_dry_run(ctx, &report, args.dry_run, &prompt)? {
+        return Ok(());
+    }
+
+    let _server_lock = ctx.acquire_server_lock(&paths, false)?;
+    let mut purge_warnings = Vec::new();
+    let exec_res = {
+        let target_spec = purge_target_from_plan(&plan);
+        execute_extension_purge(&paths, &db_cfg, &target_spec, &mut purge_warnings).await
+    };
+    plan.warnings.extend(purge_warnings);
+    let summary = exec_res?;
+
+    report = build_purge_data_report(&plan, &summary, false, false, true);
+    ctx.ui.render(&report);
+    Ok(())
+}
+
+fn purge_target_from_plan(plan: &ExtensionPurgeDataPlan) -> PurgeTargetSpec<'_> {
+    PurgeTargetSpec {
+        identifier: &plan.identifier,
+        options_only: plan.options_only,
+        target_directory: plan.target_directory.as_deref(),
+        entrypoint: plan.entrypoint_path.as_deref(),
+        data_module: plan.data_module.as_deref(),
+        manifest_namespaces: &plan.option_namespaces,
+        load_closure: &plan.load_closure,
+        dependency_error: plan.dependency_error.as_deref(),
+    }
+}
+
+fn build_purge_data_report(
+    plan: &ExtensionPurgeDataPlan,
+    summary: &ExtensionPurgeSummary,
+    server_running: bool,
+    dry_run: bool,
+    applied: bool,
+) -> ExtensionPurgeDataReport {
+    ExtensionPurgeDataReport {
+        identifier: plan.identifier.clone(),
+        display_name: plan.display_name.clone(),
+        version: plan.version.clone(),
+        directory: plan
+            .target_directory
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        installed: plan.installed,
+        broken_target: plan.broken_target,
+        retired_identifier: plan.retired_identifier,
+        currently_enabled: plan.currently_enabled,
+        can_apply: plan.blockers.is_empty(),
+        blockers: plan.blockers.clone(),
+        options_only: summary.options_only,
+        option_entries: summary.option_entries_deleted,
+        state_entries: summary.state_entries_deleted,
+        option_namespaces: summary.option_namespaces.clone(),
+        extension_tables: summary.extension_table_rows.clone(),
+        python_hook_detected: summary.python_hook_detected,
+        python_hook_executed: summary.python_hook_executed,
+        audit_logged: summary.audit_logged,
+        server_running,
+        dry_run,
+        applied,
+        warnings: plan.warnings.clone(),
+    }
 }
 
 fn summarize_extension(
@@ -1040,8 +1366,17 @@ fn format_enabled_list(items: &[String]) -> String {
     }
 }
 
-#[allow(dead_code)]
-type _UnusedArgs = ExtensionPurgeDataArgs;
+fn format_table_row_counts(tables: &BTreeMap<String, u64>) -> String {
+    if tables.is_empty() {
+        "(none)".to_string()
+    } else {
+        tables
+            .iter()
+            .map(|(tbl, rows)| format!("{tbl} ({rows} row(s))"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1664,6 +1999,195 @@ mod tests {
             .expect("audit");
         assert_eq!(audit.get::<String, _>("action"), "purge_extension_data");
         assert_eq!(audit.get::<String, _>("target"), "sample_ext");
+        verify_pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn purge_data_handler_enforces_yes_lock_enabled_dry_run_and_options_only() {
+        use crate::cli::extension::ExtensionPurgeDataArgs;
+        use crate::db::schema::ddl::create_head_schema;
+
+        let dir = setup_workspace(
+            "[database]\ntype = \"sqlite\"\nfile = \"cfms.db\"\n\n[extensions]\nenabled = [\"oidc_sso\"]\n",
+        );
+        let ext_root = dir.path().join("src").join("include").join("extensions");
+        write_ext(
+            &ext_root,
+            "oidc_sso",
+            "manifest_version = 3\noption_namespaces = [\"ext.oidc\"]\n[extension]\nidentifier = \"oidc_sso\"\nname = \"OIDC\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n[data]\nmodule = \"models.py\"\n",
+        );
+        std::fs::write(
+            ext_root.join("oidc_sso").join("models.py"),
+            "class Cred:\n    __tablename__ = \"user_oidc_credentials\"\n",
+        )
+        .expect("write models");
+
+        let paths = WorkspacePaths::discover(Some(dir.path()), None).expect("paths");
+        let db_cfg = ConfigDocument::load(&paths.config_path)
+            .expect("cfg")
+            .database_config()
+            .expect("db");
+        let pool = crate::db::backend::DbPool::connect(&db_cfg, &paths)
+            .await
+            .expect("connect");
+        create_head_schema(&pool, true).await.expect("head oidc schema");
+        let crate::db::backend::DbPool::Sqlite(ref sp) = pool else {
+            panic!("sqlite");
+        };
+        let uid = uuid::Uuid::new_v4().simple().to_string();
+        sqlx::query(
+            "INSERT INTO users (id, username, nickname, created_time, status, secret_key) VALUES (?, 'bob', 'Bob', 1.0, 0, 'sec')",
+        )
+        .bind(&uid)
+        .execute(sp)
+        .await
+        .expect("insert user");
+        sqlx::query(
+            "INSERT INTO user_oidc_credentials (id, user_id, issuer, subject, identity_digest) VALUES ('c1', ?, 'https://idp', 'sub', ?)",
+        )
+        .bind(&uid)
+        .bind(vec![3u8; 32])
+        .execute(sp)
+        .await
+        .expect("insert oidc");
+        sqlx::query(
+            "INSERT INTO options (namespace, owner, option_key, schema_version, revision, value_type, option_value, updated_at) VALUES ('ext.oidc', 'oidc_sso', 'k', 1, 1, 'str', '\"v\"', 1.0), ('ext.sched', 'scheduling', 'k', 1, 1, 'str', '\"v\"', 1.0)",
+        )
+        .execute(sp)
+        .await
+        .expect("insert options");
+        pool.close().await;
+
+        let json_no_yes = test_ctx(dir.path(), OutputFormat::Json, false);
+        let json_yes = test_ctx(dir.path(), OutputFormat::Json, true);
+
+        // 1. Enabled target permits --dry-run (even without --yes, and even with server.lock!).
+        let lock = RuntimeLock::acquire(&paths, false).expect("hold server lock");
+        handle(
+            &json_no_yes,
+            ExtensionCommand::PurgeData(ExtensionPurgeDataArgs {
+                identifier: "oidc_sso".to_string(),
+                options_only: false,
+                dry_run: true,
+            }),
+        )
+        .await
+        .expect("dry-run preview succeeds while enabled and locked");
+
+        // Mutating purge rejected while enabled.
+        let enabled_err = handle(
+            &json_yes,
+            ExtensionCommand::PurgeData(ExtensionPurgeDataArgs {
+                identifier: "oidc_sso".to_string(),
+                options_only: false,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect_err("enabled rejects apply");
+        assert!(enabled_err.to_string().contains("currently enabled"));
+
+        // Disable oidc_sso; mutating purge still rejected while server.lock is held!
+        handle(
+            &json_yes,
+            ExtensionCommand::Disable(ExtensionDisableArgs {
+                identifiers: vec!["oidc_sso".to_string()],
+                dry_run: false,
+                schema: None,
+            }),
+        )
+        .await
+        .expect("disable oidc_sso");
+        let lock_err = handle(
+            &json_yes,
+            ExtensionCommand::PurgeData(ExtensionPurgeDataArgs {
+                identifier: "oidc_sso".to_string(),
+                options_only: false,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect_err("server.lock rejects apply");
+        assert!(lock_err.to_string().contains("lock"));
+        drop(lock);
+
+        // 2. JSON without --yes rejects mutating execution cleanly without touching data.
+        let no_yes_err = handle(
+            &json_no_yes,
+            ExtensionCommand::PurgeData(ExtensionPurgeDataArgs {
+                identifier: "oidc_sso".to_string(),
+                options_only: false,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect_err("json without --yes rejected");
+        assert!(no_yes_err.to_string().contains("--yes"));
+
+        // 3. Real purge succeeds for disabled `oidc_sso` and retired `scheduling --options-only`.
+        handle(
+            &json_yes,
+            ExtensionCommand::PurgeData(ExtensionPurgeDataArgs {
+                identifier: "oidc_sso".to_string(),
+                options_only: false,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect("purge oidc_sso");
+
+        let sched_err = handle(
+            &json_yes,
+            ExtensionCommand::PurgeData(ExtensionPurgeDataArgs {
+                identifier: "scheduling".to_string(),
+                options_only: false,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect_err("retired without --options-only fails");
+        assert!(sched_err.to_string().contains("--options-only"));
+
+        handle(
+            &json_yes,
+            ExtensionCommand::PurgeData(ExtensionPurgeDataArgs {
+                identifier: "scheduling".to_string(),
+                options_only: true,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect("retired with --options-only succeeds");
+
+        let verify_pool = crate::db::backend::DbPool::connect(&db_cfg, &paths)
+            .await
+            .expect("reconnect");
+        let crate::db::backend::DbPool::Sqlite(ref sp2) = verify_pool else {
+            panic!("sqlite");
+        };
+        let oidc_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_oidc_credentials")
+            .fetch_one(sp2)
+            .await
+            .expect("count oidc");
+        assert_eq!(oidc_rows, 0);
+        let opt_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM options")
+            .fetch_one(sp2)
+            .await
+            .expect("count options");
+        assert_eq!(opt_rows, 0);
+        let audit_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_entries WHERE action = 'purge_extension_data'")
+                .fetch_one(sp2)
+                .await
+                .expect("count audit");
+        assert_eq!(audit_count, 2);
+        let oidc_audit: String = sqlx::query_scalar(
+            "SELECT data FROM audit_entries WHERE target = 'oidc_sso' AND action = 'purge_extension_data'",
+        )
+        .fetch_one(sp2)
+        .await
+        .expect("oidc audit data");
+        assert!(oidc_audit.contains("\"user_oidc_credentials\":1"));
         verify_pool.close().await;
     }
 }

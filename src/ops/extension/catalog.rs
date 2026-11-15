@@ -285,6 +285,23 @@ pub(crate) fn declared_data_module(raw: &RawExtensionManifest) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Extract optional top-level `option_namespaces` list declared inside an extension manifest.
+#[must_use]
+pub(crate) fn declared_option_namespaces(raw: &RawExtensionManifest) -> Vec<String> {
+    raw.extra_sections
+        .get("option_namespaces")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Validated view of `[extensions].enabled` in `config.toml`.
 #[derive(Debug, Clone)]
 pub struct EnabledConfigState {

@@ -26,7 +26,7 @@ pub enum ExtensionCommand {
     /// Uninstall a third-party extension's code (and optionally purge its database data).
     Uninstall(ExtensionUninstallArgs),
 
-    /// Purge a disabled extension's persistent database options and system states.
+    /// Purge a disabled extension's persistent database options, system states, and declared data tables.
     PurgeData(ExtensionPurgeDataArgs),
 }
 
@@ -103,13 +103,17 @@ pub struct ExtensionUninstallArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct ExtensionPurgeDataArgs {
-    /// Disabled extension identifier.
+    /// Disabled extension identifier (or orphaned identifier when `--options-only` is set).
     #[arg(value_name = "IDENTIFIER")]
     pub identifier: String,
 
-    /// Delete only `options` and `system_states` rows owned by this extension.
+    /// Delete only `options` and `system_states` rows owned by this extension without importing extension code or purging `[data]` tables.
     #[arg(long = "options-only")]
     pub options_only: bool,
+
+    /// Preview affected options, system states, declared `[data]` tables, and purge hooks without modifying the database.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 }
 
 #[cfg(test)]
@@ -214,6 +218,38 @@ mod tests {
             Commands::Extension(ExtensionCommand::Uninstall(args)) => {
                 assert_eq!(args.identifier, "sample_ext");
                 assert!(args.purge_data);
+                assert!(args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_extension_purge_data_flags() {
+        let bare = Cli::try_parse_from(["cfms-ctl", "extension", "purge-data", "oidc_sso"])
+            .expect("parse bare purge-data");
+        match bare.command {
+            Commands::Extension(ExtensionCommand::PurgeData(args)) => {
+                assert_eq!(args.identifier, "oidc_sso");
+                assert!(!args.options_only);
+                assert!(!args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let flagged = Cli::try_parse_from([
+            "cfms-ctl",
+            "extension",
+            "purge-data",
+            "sample_ext",
+            "--options-only",
+            "--dry-run",
+        ])
+        .expect("parse flagged purge-data");
+        match flagged.command {
+            Commands::Extension(ExtensionCommand::PurgeData(args)) => {
+                assert_eq!(args.identifier, "sample_ext");
+                assert!(args.options_only);
                 assert!(args.dry_run);
             }
             other => panic!("unexpected command: {other:?}"),

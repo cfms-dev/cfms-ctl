@@ -7,11 +7,13 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use serde::Serialize;
 use crate::core::{CfmsError, ConfigDocument, Result, WorkspacePaths};
 use crate::ops::extension::catalog::{
     BUILTIN_EXTENSION_ID, CatalogDiagnostic, ExtensionCatalog, InstalledExtension,
-    MAX_EXTENSION_SCAN_ENTRIES, RESERVED_EXTENSION_IDS, StagingMarker, UninstallTarget,
-    declared_data_module, ensure_not_retired, read_enabled_config, validate_extension_identifier,
+    MAX_EXTENSION_SCAN_ENTRIES, RETIRED_EXTENSION_IDS, RESERVED_EXTENSION_IDS, StagingMarker,
+    UninstallTarget, declared_data_module, declared_option_namespaces, ensure_not_retired,
+    read_enabled_config, validate_extension_identifier,
 };
 use crate::ops::extension::package::VerifiedExtensionPackage;
 use crate::ops::extension::version::{
@@ -319,6 +321,15 @@ pub struct ExtensionUpgradePlan {
     pub warnings: Vec<String>,
 }
 
+/// Resolved extension module specification for isolated Python hook execution.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtensionLoadEntry {
+    pub identifier: String,
+    pub directory: PathBuf,
+    pub entrypoint: PathBuf,
+    pub option_namespaces: Vec<String>,
+}
+
 /// Planned extension uninstallation (healthy or broken directory) computed before mutation.
 #[derive(Debug, Clone)]
 pub struct ExtensionUninstallPlan {
@@ -329,11 +340,35 @@ pub struct ExtensionUninstallPlan {
     pub entrypoint_path: PathBuf,
     pub broken_target: bool,
     pub data_module: Option<String>,
+    pub option_namespaces: Vec<String>,
+    pub load_closure: Vec<ExtensionLoadEntry>,
+    pub dependency_error: Option<String>,
     pub purge_data: bool,
     pub disabled_extensions: Vec<String>,
     pub cascade_dependents: Vec<String>,
     pub config_changed: bool,
     pub candidate_doc: ConfigDocument,
+    pub warnings: Vec<String>,
+}
+
+/// Planned target metadata, fault-isolated dependency closure, and blockers for `extension purge-data`.
+#[derive(Debug, Clone)]
+pub struct ExtensionPurgeDataPlan {
+    pub identifier: String,
+    pub installed: bool,
+    pub broken_target: bool,
+    pub retired_identifier: bool,
+    pub currently_enabled: bool,
+    pub blockers: Vec<String>,
+    pub options_only: bool,
+    pub display_name: Option<String>,
+    pub version: Option<String>,
+    pub target_directory: Option<PathBuf>,
+    pub entrypoint_path: Option<PathBuf>,
+    pub data_module: Option<String>,
+    pub option_namespaces: Vec<String>,
+    pub load_closure: Vec<ExtensionLoadEntry>,
+    pub dependency_error: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -688,25 +723,46 @@ pub fn plan_uninstall(
     }
 
     let resolved = catalog.resolve_uninstall_target(identifier)?;
-    let (target_directory, entrypoint_path, display_name, version, broken_target, data_module) =
-        match resolved {
-            UninstallTarget::Installed(ext) => (
+    let (
+        target_directory,
+        entrypoint_path,
+        display_name,
+        version,
+        broken_target,
+        data_module,
+        option_namespaces,
+        load_closure,
+        dependency_error,
+    ) = match resolved {
+        UninstallTarget::Installed(ext) => {
+            let (closure, dep_err) = match resolve_target_load_closure(catalog, identifier) {
+                Ok(entries) => (entries, None),
+                Err(err) => (Vec::new(), Some(err)),
+            };
+            (
                 ext.directory.clone(),
                 ext.entrypoint.clone(),
                 Some(ext.display_name.clone()),
                 Some(ext.raw.extension.version.clone()),
                 false,
                 declared_data_module(&ext.raw).map(ToString::to_string),
-            ),
-            UninstallTarget::Broken(diag) => (
-                diag.directory.clone(),
-                diag.directory.join(crate::ops::extension::catalog::ENTRYPOINT_FILENAME),
-                None,
-                None,
-                true,
-                None,
-            ),
-        };
+                declared_option_namespaces(&ext.raw),
+                closure,
+                dep_err,
+            )
+        }
+        UninstallTarget::Broken(diag) => (
+            diag.directory.clone(),
+            diag.directory.join(crate::ops::extension::catalog::ENTRYPOINT_FILENAME),
+            None,
+            None,
+            true,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+        ),
+    };
 
     let enabled_state = read_enabled_config(config_doc, true)?;
     let previous_enabled = enabled_state.entries;
@@ -747,6 +803,9 @@ pub fn plan_uninstall(
         entrypoint_path,
         broken_target,
         data_module,
+        option_namespaces,
+        load_closure,
+        dependency_error,
         purge_data,
         disabled_extensions,
         cascade_dependents,
@@ -754,6 +813,240 @@ pub fn plan_uninstall(
         candidate_doc,
         warnings,
     })
+}
+
+/// Plan `cfms-ctl extension purge-data <IDENTIFIER>` without acquiring locks or importing Python code.
+pub fn plan_purge_data(
+    identifier: &str,
+    options_only: bool,
+    dry_run: bool,
+    catalog: &ExtensionCatalog,
+    config_doc: &ConfigDocument,
+    paths: &WorkspacePaths,
+) -> Result<ExtensionPurgeDataPlan> {
+    if identifier == BUILTIN_EXTENSION_ID || RESERVED_EXTENSION_IDS.contains(&identifier) {
+        return Err(CfmsError::Extension(format!(
+            "Built-in/core data owned by '{identifier}' cannot be purged as extension data"
+        )));
+    }
+    validate_extension_identifier(identifier)?;
+
+    let retired_identifier = RETIRED_EXTENSION_IDS.contains(&identifier);
+    let enabled_state = read_enabled_config(config_doc, true)?;
+    let currently_enabled = enabled_state.entries.iter().any(|entry| entry == identifier);
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+
+    if currently_enabled {
+        let msg = format!(
+            "Extension '{identifier}' is currently enabled in config.toml; run `cfms-ctl extension disable {identifier}` before applying purge-data"
+        );
+        if !dry_run {
+            return Err(CfmsError::Extension(msg));
+        }
+        blockers.push(msg.clone());
+        warnings.push(msg);
+    }
+
+    let mut installed = false;
+    let mut broken_target = false;
+    let mut display_name = None;
+    let mut version = None;
+    let mut target_directory = None;
+    let mut entrypoint_path = None;
+    let mut data_module = None;
+    let mut option_namespaces = Vec::new();
+    let mut load_closure = Vec::new();
+    let mut dependency_error = None;
+
+    if let Some(conflict_dirs) = catalog.conflicted_identifiers.get(identifier) {
+        let joined = conflict_dirs
+            .iter()
+            .map(|p| format!("'{}'", p.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !options_only {
+            return Err(CfmsError::Extension(format!(
+                "Extension '{identifier}' has duplicate definitions in {joined}; resolve the conflict or pass --options-only to clean options and system states"
+            )));
+        }
+        broken_target = true;
+        warnings.push(format!(
+            "Extension '{identifier}' has duplicate definitions in {joined}; skipping code and custom data tables under --options-only"
+        ));
+    } else if let Some(ext) = catalog.extensions.get(identifier) {
+        installed = true;
+        display_name = Some(ext.display_name.clone());
+        version = Some(ext.raw.extension.version.clone());
+        target_directory = Some(ext.directory.clone());
+        entrypoint_path = Some(ext.entrypoint.clone());
+        data_module = declared_data_module(&ext.raw).map(ToString::to_string);
+        option_namespaces = declared_option_namespaces(&ext.raw);
+
+        let server_version = discover_server_version(paths, None).ok().flatten();
+        collect_manifest_advisories(ext, catalog, server_version.as_ref(), &mut warnings);
+
+        if !options_only {
+            match resolve_target_load_closure(catalog, identifier) {
+                Ok(entries) => load_closure = entries,
+                Err(err) => {
+                    warnings.push(format!(
+                        "Dependency closure for '{identifier}' could not be resolved ({err}); Python `ext_purge_data` hooks cannot run without fixing dependencies or passing --options-only"
+                    ));
+                    dependency_error = Some(err);
+                }
+            }
+        }
+    } else if let Some(diag) = catalog.diagnostic_for(identifier) {
+        if !options_only {
+            return Err(CfmsError::Extension(format!(
+                "Extension '{identifier}' at '{}' is broken ({}); repair it or pass --options-only to purge owned options and system states without executing extension code",
+                diag.directory.display(),
+                diag.message
+            )));
+        }
+        broken_target = true;
+        warnings.push(format!(
+            "Extension directory '{}' failed manifest/entrypoint checks ({}); skipping code and custom data tables under --options-only",
+            diag.directory.display(),
+            diag.message
+        ));
+    } else {
+        if !options_only {
+            return Err(CfmsError::Extension(format!(
+                "Extension '{identifier}' is not installed under '{}'; pass --options-only to remove orphaned options and system states",
+                paths.extensions_root.display()
+            )));
+        }
+        if retired_identifier {
+            warnings.push(format!(
+                "Target '{identifier}' is a retired extension identifier; cleaning orphaned options and system states only"
+            ));
+        } else {
+            warnings.push(format!(
+                "Extension '{identifier}' is not installed on disk; cleaning orphaned options and system states only"
+            ));
+        }
+    }
+
+    let target_set = BTreeSet::from([identifier.to_string()]);
+    if dry_run && !options_only {
+        if let Err(err) = check_scoped_staging_markers(
+            &catalog.staging_markers,
+            &target_set,
+            &target_set,
+            &mut warnings,
+            true,
+        ) {
+            let msg = err.to_string();
+            blockers.push(msg.clone());
+            warnings.push(msg);
+        }
+    } else {
+        check_scoped_staging_markers(
+            &catalog.staging_markers,
+            &target_set,
+            &target_set,
+            &mut warnings,
+            !options_only,
+        )?;
+    }
+
+    Ok(ExtensionPurgeDataPlan {
+        identifier: identifier.to_string(),
+        installed,
+        broken_target,
+        retired_identifier,
+        currently_enabled,
+        blockers,
+        options_only,
+        display_name,
+        version,
+        target_directory,
+        entrypoint_path,
+        data_module,
+        option_namespaces,
+        load_closure,
+        dependency_error,
+        warnings,
+    })
+}
+
+/// Resolve the topological (`dependencies -> target`) load closure for `target_id` without
+/// aborting on unrelated broken sibling extensions or server version constraints.
+fn resolve_target_load_closure(
+    catalog: &ExtensionCatalog,
+    target_id: &str,
+) -> std::result::Result<Vec<ExtensionLoadEntry>, String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Visiting,
+        Visited,
+    }
+
+    fn visit(
+        id: &str,
+        catalog: &ExtensionCatalog,
+        states: &mut HashMap<String, State>,
+        stack: &mut Vec<String>,
+        out: &mut Vec<ExtensionLoadEntry>,
+    ) -> std::result::Result<(), String> {
+        if let Some(state) = states.get(id) {
+            return match state {
+                State::Visited => Ok(()),
+                State::Visiting => {
+                    let pos = stack.iter().position(|item| item == id).unwrap_or(0);
+                    let mut cycle = stack[pos..].to_vec();
+                    cycle.push(id.to_string());
+                    Err(format!("dependency cycle detected: {}", cycle.join(" -> ")))
+                }
+            };
+        }
+
+        if let Some(dirs) = catalog.conflicted_identifiers.get(id) {
+            let joined = dirs
+                .iter()
+                .map(|p| format!("'{}'", p.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "dependency '{id}' has duplicate conflicting definitions in {joined}"
+            ));
+        }
+
+        let Some(ext) = catalog.extensions.get(id) else {
+            if let Some(diag) = catalog.diagnostic_for(id) {
+                return Err(format!(
+                    "dependency '{id}' at '{}' is broken ({})",
+                    diag.directory.display(),
+                    diag.message
+                ));
+            }
+            return Err(format!("required dependency '{id}' is not installed"));
+        };
+
+        states.insert(id.to_string(), State::Visiting);
+        stack.push(id.to_string());
+        for dep_id in ext.dependencies.keys() {
+            visit(dep_id, catalog, states, stack, out)?;
+        }
+        stack.pop();
+        states.insert(id.to_string(), State::Visited);
+
+        out.push(ExtensionLoadEntry {
+            identifier: ext.identifier.clone(),
+            directory: ext.directory.clone(),
+            entrypoint: ext.entrypoint.clone(),
+            option_namespaces: declared_option_namespaces(&ext.raw),
+        });
+        Ok(())
+    }
+
+    let mut states = HashMap::new();
+    let mut stack = Vec::new();
+    let mut out = Vec::new();
+    visit(target_id, catalog, &mut states, &mut stack, &mut out)?;
+    Ok(out)
 }
 
 fn collect_manifest_advisories(
@@ -1071,7 +1364,7 @@ fn topo_sort_preserving_priority(
     ordered
 }
 
-fn check_scoped_staging_markers(
+pub(crate) fn check_scoped_staging_markers(
     markers: &[StagingMarker],
     affected_ids: &BTreeSet<String>,
     direct_targets: &BTreeSet<String>,
@@ -1495,5 +1788,138 @@ mod tests {
         assert_eq!(uninstall_plan.target_directory, broken_dir);
         assert!(uninstall_plan.config_changed);
         assert_eq!(uninstall_plan.disabled_extensions, vec!["broken_ext"]);
+    }
+
+    #[test]
+    fn purge_data_blocks_core_and_handles_enabled_dry_run_vs_managed_disabled() {
+        let (dir, paths) = setup_workspace("0.14.0", "[extensions]\nenabled = [\"oidc_sso\"]\n");
+        let ext_root = &paths.extensions_root;
+
+        std::fs::write(
+            dir.path().join("release-manifest.json"),
+            r#"{"version":"0.14.0","managed_extensions":["oidc_sso"]}"#,
+        )
+        .expect("write release manifest");
+        write_manifest_ext(
+            ext_root,
+            "oidc_sso",
+            "manifest_version = 3\noption_namespaces = [\"oidc_sso\"]\n[extension]\nidentifier = \"oidc_sso\"\nname = \"OIDC SSO\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n[data]\nmodule = \"models.py\"\n",
+        );
+
+        let catalog = discover_catalog(ext_root).expect("catalog");
+        let enabled_doc = ConfigDocument::load(&paths.config_path).expect("enabled config");
+
+        for reserved in ["core", "builtin"] {
+            let err = plan_purge_data(reserved, false, true, &catalog, &enabled_doc, &paths)
+                .expect_err("core/builtin rejected");
+            assert!(err.to_string().contains("core") || err.to_string().contains("built-in"));
+        }
+
+        // Enabled target rejects mutating execution...
+        let enabled_err =
+            plan_purge_data("oidc_sso", false, false, &catalog, &enabled_doc, &paths)
+                .expect_err("enabled target cannot purge");
+        assert!(enabled_err.to_string().contains("enabled"));
+        assert!(enabled_err.to_string().contains("disable"));
+
+        // ...but allows read-only --dry-run preview with blocker + warning populated.
+        let dry_plan = plan_purge_data("oidc_sso", false, true, &catalog, &enabled_doc, &paths)
+            .expect("dry-run allowed while enabled");
+        assert!(dry_plan.currently_enabled);
+        assert!(!dry_plan.blockers.is_empty());
+        assert!(
+            dry_plan
+                .blockers
+                .iter()
+                .any(|b| b.contains("currently enabled"))
+        );
+        assert!(
+            dry_plan
+                .warnings
+                .iter()
+                .any(|w| w.contains("currently enabled"))
+        );
+        assert_eq!(dry_plan.option_namespaces, vec!["oidc_sso"]);
+        assert_eq!(dry_plan.data_module.as_deref(), Some("models.py"));
+
+        // Managed extensions remain purgeable once disabled!
+        std::fs::write(&paths.config_path, "[extensions]\nenabled = []\n").expect("disable oidc");
+        let disabled_doc = ConfigDocument::load(&paths.config_path).expect("disabled config");
+        let purge_plan =
+            plan_purge_data("oidc_sso", false, false, &catalog, &disabled_doc, &paths)
+                .expect("disabled managed extension can be purged");
+        assert!(!purge_plan.currently_enabled);
+        assert!(purge_plan.blockers.is_empty());
+        assert_eq!(purge_plan.load_closure.len(), 1);
+        assert_eq!(purge_plan.load_closure[0].identifier, "oidc_sso");
+    }
+
+    #[test]
+    fn purge_data_isolates_broken_siblings_and_recovers_orphans_with_options_only() {
+        let (dir, paths) = setup_workspace("0.14.0", "[extensions]\nenabled = []\n");
+        let ext_root = &paths.extensions_root;
+
+        write_manifest_ext(
+            ext_root,
+            "dep_ext",
+            "manifest_version = 3\n[extension]\nidentifier = \"dep_ext\"\nname = \"Dep\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+        );
+        write_manifest_ext(
+            ext_root,
+            "app_ext",
+            "manifest_version = 3\n[extension]\nidentifier = \"app_ext\"\nname = \"App\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n[dependencies.extensions]\ndep_ext = \">=1.0.0\"\n[compatibility]\nminimum_server_version = \"99.0.0\"\n",
+        );
+
+        // Unrelated broken sibling + broken target directory (missing `_extension.py`).
+        let broken_sibling = ext_root.join("broken_sibling");
+        std::fs::create_dir_all(&broken_sibling).expect("mkdir sibling");
+        std::fs::write(broken_sibling.join("manifest.toml"), "not valid toml = [")
+            .expect("write corrupt manifest");
+
+        let broken_target = ext_root.join("broken_target");
+        std::fs::create_dir_all(&broken_target).expect("mkdir broken_target");
+        std::fs::write(
+            broken_target.join("manifest.toml"),
+            "manifest_version = 2\n[extension]\nidentifier = \"broken_target\"\nname = \"Broken\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+        )
+        .expect("write broken target manifest");
+
+        // Remove constants.py as well: purge-data must still inspect/clean without server version!
+        std::fs::remove_file(dir.path().join("src/include/config/constants.py"))
+            .expect("rm constants");
+
+        let catalog = discover_catalog(ext_root).expect("catalog");
+        let doc = ConfigDocument::load(&paths.config_path).expect("config");
+
+        let app_plan = plan_purge_data("app_ext", false, false, &catalog, &doc, &paths)
+            .expect("healthy target ignores broken sibling and server version bounds");
+        let closure_ids: Vec<&str> = app_plan
+            .load_closure
+            .iter()
+            .map(|e| e.identifier.as_str())
+            .collect();
+        assert_eq!(closure_ids, vec!["dep_ext", "app_ext"]);
+        assert!(app_plan.dependency_error.is_none());
+
+        // Broken, retired, and uninstalled targets fail without --options-only...
+        assert!(plan_purge_data("broken_target", false, false, &catalog, &doc, &paths).is_err());
+        assert!(plan_purge_data("scheduling", false, false, &catalog, &doc, &paths).is_err());
+        assert!(plan_purge_data("ghost_ext", false, false, &catalog, &doc, &paths).is_err());
+
+        // ...and succeed with --options-only.
+        let broken_plan = plan_purge_data("broken_target", true, false, &catalog, &doc, &paths)
+            .expect("broken target --options-only");
+        assert!(broken_plan.broken_target);
+        assert!(broken_plan.blockers.is_empty());
+
+        let retired_plan = plan_purge_data("scheduling", true, false, &catalog, &doc, &paths)
+            .expect("retired target --options-only");
+        assert!(retired_plan.retired_identifier);
+        assert!(!retired_plan.installed);
+
+        let ghost_plan = plan_purge_data("ghost_ext", true, false, &catalog, &doc, &paths)
+            .expect("uninstalled target --options-only");
+        assert!(!ghost_plan.retired_identifier);
+        assert!(!ghost_plan.installed);
     }
 }
