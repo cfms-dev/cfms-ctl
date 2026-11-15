@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- git-cliff: end of header -->
 
+## [0.3.0] - 2026-11-15
+
+### Added
+
+- Implement transactional extension database purge functionality
+- Implement password policy management with Argon2id hashing
+- Implement database-backed audit log retention policy with validation and defaults
+- *(permission)* Implement retention policy management for permission purging
+- Implement `extension purge-data`
+- Implement `deployment install / upgrade / update`
+- [**breaking**] Refactor server version handling and improve error reporting, remove `--server-version` argument
+
+**Full Changelog**: https://github.com/cfms-dev/cfms-ctl/compare/v0.2.0..v0.3.0
+
 ## [0.2.0] - 2026-11-14
 
 ### Added
