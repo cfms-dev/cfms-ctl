@@ -47,10 +47,6 @@ pub struct ExtensionEnableArgs {
     #[arg(long = "dry-run")]
     pub dry_run: bool,
 
-    /// Override the detected CFMS server version for `[compatibility]` checks.
-    #[arg(long = "server-version", value_name = "VERSION")]
-    pub server_version: Option<String>,
-
     /// Optional JSON Schema file (`config.schema.json`) used to validate `config.toml` before write.
     #[arg(long = "schema", value_name = "FILE")]
     pub schema: Option<PathBuf>,
@@ -130,8 +126,6 @@ mod tests {
             "http_api",
             "oidc_sso",
             "--dry-run",
-            "--server-version",
-            "0.14.0",
             "--schema",
             "config.schema.json",
         ])
@@ -141,7 +135,6 @@ mod tests {
             Commands::Extension(ExtensionCommand::Enable(args)) => {
                 assert_eq!(args.identifiers, vec!["http_api", "oidc_sso"]);
                 assert!(args.dry_run);
-                assert_eq!(args.server_version.as_deref(), Some("0.14.0"));
                 assert_eq!(
                     args.schema.as_deref(),
                     Some(std::path::Path::new("config.schema.json"))
@@ -149,6 +142,17 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        let err = Cli::try_parse_from([
+            "cfms-ctl",
+            "extension",
+            "enable",
+            "http_api",
+            "--server-version",
+            "0.14.0",
+        ])
+        .expect_err("removed --server-version flag must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

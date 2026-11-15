@@ -27,7 +27,7 @@ use crate::db::transfer::{
     stream_query,
 };
 use crate::ops::AppContext;
-use crate::ops::deployment::ReleaseManifestSummary;
+use crate::ops::extension::version::discover_server_version;
 use crate::storage::{StorageBackend, resolve_local_storage, validate_storage_relative_path};
 use crate::ui::{CommandReport, KeyValueTable, OutputFormat, UiConsole};
 use super::backup_progress_bar;
@@ -167,6 +167,7 @@ async fn execute_export_locked(
     paths: &WorkspacePaths,
     options: &ResolvedExportOptions,
 ) -> Result<BackupExportReport> {
+    let server_version = discover_server_version(paths)?.version.to_string();
     let config = ctx.load_config(paths)?;
     let storage = resolve_local_storage(paths, &config)?;
     let configuration = extract_configuration_payload(
@@ -192,7 +193,6 @@ async fn execute_export_locked(
     };
 
     let created_at = Utc::now().to_rfc3339();
-    let server_version = detect_server_version(paths);
     let component_names = options.selection.component_names();
 
     let master_key = generate_backup_key();
@@ -959,30 +959,6 @@ fn extract_configuration_payload(
         pepper: Some(pepper),
         secret_key: Some(secret_key),
     })
-}
-
-fn detect_server_version(paths: &WorkspacePaths) -> String {
-    if paths.release_manifest_path.is_file()
-        && let Ok(raw) = std::fs::read_to_string(&paths.release_manifest_path)
-        && let Ok(summary) = serde_json::from_str::<ReleaseManifestSummary>(&raw)
-        && let Some(ver) = summary.version
-        && !ver.trim().is_empty()
-    {
-        return ver;
-    }
-    let pyproject_path = paths.project_root.join("pyproject.toml");
-    if pyproject_path.is_file()
-        && let Ok(raw) = std::fs::read_to_string(pyproject_path)
-        && let Ok(doc) = raw.parse::<toml_edit::DocumentMut>()
-        && let Some(ver) = doc
-            .get("project")
-            .and_then(|p| p.get("version"))
-            .and_then(|v| v.as_str())
-        && !ver.trim().is_empty()
-    {
-        return ver.to_string();
-    }
-    "0.14.0".to_string()
 }
 
 fn archive_parent_dir(output_path: &Path) -> Result<&Path> {

@@ -132,7 +132,6 @@ impl fmt::Display for CfmsServerVersion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerVersionSource {
-    CliOverride,
     ReleaseManifest,
     ConstantsAst,
     PyprojectToml,
@@ -142,7 +141,6 @@ impl ServerVersionSource {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::CliOverride => "--server-version",
             Self::ReleaseManifest => "release-manifest.json",
             Self::ConstantsAst => "include/config/constants.py",
             Self::PyprojectToml => "pyproject.toml",
@@ -160,35 +158,22 @@ pub struct DetectedServerVersion {
 /// Discover the target CFMS server version without importing or running Python code.
 ///
 /// Precedence:
-/// 1. Explicit `cli_override` (`--server-version`)
-/// 2. `<project_root>/release-manifest.json` (`"version"`)
-/// 3. `<server_root>/include/config/constants.py` (`CORE_VERSION` via `ruff_python_parser`)
-/// 4. `<project_root>/pyproject.toml` (`[project].version`)
-pub fn discover_server_version(
-    paths: &WorkspacePaths,
-    cli_override: Option<&str>,
-) -> Result<Option<DetectedServerVersion>> {
-    if let Some(raw) = cli_override {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err(CfmsError::InvalidArgument(
-                "--server-version cannot be empty".to_string(),
-            ));
-        }
-        let version = CfmsServerVersion::parse(trimmed).map_err(|e| {
-            CfmsError::InvalidArgument(format!("Invalid --server-version '{raw}': {e}"))
-        })?;
-        return Ok(Some(DetectedServerVersion {
-            version,
-            source: ServerVersionSource::CliOverride,
-        }));
-    }
+/// 1. `<project_root>/release-manifest.json` (`"version"`)
+/// 2. `<server_root>/include/config/constants.py` (`CORE_VERSION` via `ruff_python_parser`)
+/// 3. `<project_root>/pyproject.toml` (`[project].version`)
+///
+/// Fails if no authoritative source yields a valid CFMS server version; either the
+/// target server workspace is damaged/incomplete or `cfms-ctl` is outdated.
+pub fn discover_server_version(paths: &WorkspacePaths) -> Result<DetectedServerVersion> {
+    let mut checked_notes = Vec::with_capacity(3);
 
-    if let Some(version) = read_release_manifest_version(&paths.release_manifest_path)? {
-        return Ok(Some(DetectedServerVersion {
+    if let Some(version) =
+        read_release_manifest_version(&paths.release_manifest_path, &mut checked_notes)?
+    {
+        return Ok(DetectedServerVersion {
             version,
             source: ServerVersionSource::ReleaseManifest,
-        }));
+        });
     }
 
     let constants_path = paths
@@ -196,22 +181,25 @@ pub fn discover_server_version(
         .join("include")
         .join("config")
         .join("constants.py");
-    if let Some(version) = read_constants_ast_version(&constants_path)? {
-        return Ok(Some(DetectedServerVersion {
+    if let Some(version) = read_constants_ast_version(&constants_path, &mut checked_notes)? {
+        return Ok(DetectedServerVersion {
             version,
             source: ServerVersionSource::ConstantsAst,
-        }));
+        });
     }
 
     let pyproject_path = paths.project_root.join("pyproject.toml");
-    if let Some(version) = read_pyproject_version(&pyproject_path)? {
-        return Ok(Some(DetectedServerVersion {
+    if let Some(version) = read_pyproject_version(&pyproject_path, &mut checked_notes)? {
+        return Ok(DetectedServerVersion {
             version,
             source: ServerVersionSource::PyprojectToml,
-        }));
+        });
     }
 
-    Ok(None)
+    Err(CfmsError::Config(format!(
+        "Unable to determine target CFMS server version ({}). Either the CFMS server workspace is incomplete/corrupted or this cfms-ctl version is too old to recognize it",
+        checked_notes.join("; ")
+    )))
 }
 
 /// Check whether `server_version` falls within optional `[min, max]` server bounds.
@@ -338,8 +326,12 @@ fn parse_u64(digits: &str, full_input: &str) -> Result<u64> {
     })
 }
 
-fn read_release_manifest_version(path: &Path) -> Result<Option<CfmsServerVersion>> {
+fn read_release_manifest_version(
+    path: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<CfmsServerVersion>> {
     if !path.is_file() {
+        notes.push("release-manifest.json: not found".to_string());
         return Ok(None);
     }
     let raw = std::fs::read_to_string(path).map_err(|e| {
@@ -348,20 +340,35 @@ fn read_release_manifest_version(path: &Path) -> Result<Option<CfmsServerVersion
     let json: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
         CfmsError::Config(format!("Invalid JSON in '{}': {e}", path.display()))
     })?;
-    let Some(version_val) = json.get("version").and_then(|v| v.as_str()) else {
+    let Some(version_field) = json.get("version") else {
+        notes.push("release-manifest.json: missing 'version' field".to_string());
         return Ok(None);
     };
+    if version_field.is_null() {
+        notes.push("release-manifest.json: 'version' is null".to_string());
+        return Ok(None);
+    }
+    let version_val = version_field.as_str().ok_or_else(|| {
+        CfmsError::Config(format!("Field 'version' in '{}' must be a string", path.display()))
+    })?;
     let trimmed = version_val.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        return Err(CfmsError::Config(format!(
+            "Field 'version' in '{}' cannot be empty",
+            path.display()
+        )));
     }
     CfmsServerVersion::parse(trimmed)
         .map(Some)
         .map_err(|e| CfmsError::Config(format!("Invalid version in '{}': {e}", path.display())))
 }
 
-fn read_constants_ast_version(path: &Path) -> Result<Option<CfmsServerVersion>> {
+fn read_constants_ast_version(
+    path: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<CfmsServerVersion>> {
     if !path.is_file() {
+        notes.push("include/config/constants.py: not found".to_string());
         return Ok(None);
     }
     let src = std::fs::read_to_string(path).map_err(|e| {
@@ -386,9 +393,13 @@ fn read_constants_ast_version(path: &Path) -> Result<Option<CfmsServerVersion>> 
             _ => None,
         };
 
-        if let Some(expr) = value_expr
-            && let Some(raw_ver) = extract_core_version_literal(expr)
-        {
+        if let Some(expr) = value_expr {
+            let raw_ver = extract_core_version_literal(expr).ok_or_else(|| {
+                CfmsError::Config(format!(
+                    "Unsupported CORE_VERSION expression in '{}': expected a string literal or Version(\"...\"); either the server file is malformed or this cfms-ctl version is too old",
+                    path.display()
+                ))
+            })?;
             return CfmsServerVersion::parse(&raw_ver).map(Some).map_err(|e| {
                 CfmsError::Config(format!(
                     "Invalid CORE_VERSION in '{}': {e}",
@@ -398,11 +409,16 @@ fn read_constants_ast_version(path: &Path) -> Result<Option<CfmsServerVersion>> 
         }
     }
 
+    notes.push("include/config/constants.py: missing CORE_VERSION assignment".to_string());
     Ok(None)
 }
 
-fn read_pyproject_version(path: &Path) -> Result<Option<CfmsServerVersion>> {
+fn read_pyproject_version(
+    path: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<CfmsServerVersion>> {
     if !path.is_file() {
+        notes.push("pyproject.toml: not found".to_string());
         return Ok(None);
     }
     let raw = std::fs::read_to_string(path).map_err(|e| {
@@ -411,17 +427,26 @@ fn read_pyproject_version(path: &Path) -> Result<Option<CfmsServerVersion>> {
     let doc = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
         CfmsError::Config(format!("Invalid TOML in '{}': {e}", path.display()))
     })?;
-    let Some(version_str) = doc
+    let Some(version_item) = doc
         .get("project")
         .and_then(|p| p.as_table_like())
         .and_then(|t| t.get("version"))
-        .and_then(|v| v.as_str())
     else {
+        notes.push("pyproject.toml: missing [project].version".to_string());
         return Ok(None);
     };
+    let version_str = version_item.as_str().ok_or_else(|| {
+        CfmsError::Config(format!(
+            "Field 'project.version' in '{}' must be a string",
+            path.display()
+        ))
+    })?;
     let trimmed = version_str.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        return Err(CfmsError::Config(format!(
+            "Field 'project.version' in '{}' cannot be empty",
+            path.display()
+        )));
     }
     CfmsServerVersion::parse(trimmed)
         .map(Some)
@@ -493,10 +518,38 @@ mod tests {
 
         let paths = WorkspacePaths::discover(Some(dir.path()), None).expect("paths");
 
+        // Fails strictly when no authoritative version source exists
+        let missing_dir = tempfile::tempdir().expect("tempdir");
+        let missing_src = missing_dir.path().join("src");
+        std::fs::create_dir_all(&missing_src).expect("src");
+        std::fs::write(missing_src.join("main.py"), "# cfms").expect("main.py");
+        let missing_paths =
+            WorkspacePaths::discover(Some(missing_dir.path()), None).expect("missing paths");
+        let missing_err = discover_server_version(&missing_paths)
+            .expect_err("missing all version sources must fail");
+        let missing_msg = missing_err.to_string();
+        assert!(missing_msg.contains("Unable to determine target CFMS server version"));
+        assert!(!missing_msg.contains("--server-version"));
+
+        // Unsupported dynamic CORE_VERSION expression in constants.py must fail immediately
+        let dynamic_cfg = missing_src.join("include").join("config");
+        std::fs::create_dir_all(&dynamic_cfg).expect("dynamic_cfg");
+        std::fs::write(
+            missing_dir.path().join("pyproject.toml"),
+            "[project]\nname = \"cfms\"\nversion = \"0.12.0\"\n",
+        )
+        .expect("pyproject");
+        std::fs::write(
+            dynamic_cfg.join("constants.py"),
+            "CORE_VERSION = load_version()\n",
+        )
+        .expect("dynamic constants");
+        let dynamic_err = discover_server_version(&missing_paths)
+            .expect_err("unsupported CORE_VERSION expression must not silently fall back");
+        assert!(dynamic_err.to_string().contains("Unsupported CORE_VERSION expression"));
+
         // Fallback to pyproject.toml
-        let detected = discover_server_version(&paths, None)
-            .expect("ok")
-            .expect("pyproject");
+        let detected = discover_server_version(&paths).expect("pyproject");
         assert_eq!(detected.version.as_str(), "0.12.0");
         assert_eq!(detected.source, ServerVersionSource::PyprojectToml);
 
@@ -506,9 +559,7 @@ mod tests {
             "from include.config.version import Version\nCORE_VERSION: Version = Version(\"0.14.0\")\n",
         )
         .expect("constants.py");
-        let detected = discover_server_version(&paths, None)
-            .expect("ok")
-            .expect("constants");
+        let detected = discover_server_version(&paths).expect("constants");
         assert_eq!(detected.version.as_str(), "0.14.0");
         assert_eq!(detected.source, ServerVersionSource::ConstantsAst);
 
@@ -518,18 +569,9 @@ mod tests {
             r#"{"version": "0.15.1"}"#,
         )
         .expect("release-manifest");
-        let detected = discover_server_version(&paths, None)
-            .expect("ok")
-            .expect("manifest");
+        let detected = discover_server_version(&paths).expect("manifest");
         assert_eq!(detected.version.as_str(), "0.15.1");
         assert_eq!(detected.source, ServerVersionSource::ReleaseManifest);
-
-        // CLI override beats everything
-        let detected = discover_server_version(&paths, Some("0.16.0_rc2"))
-            .expect("ok")
-            .expect("cli");
-        assert_eq!(detected.version.as_str(), "0.16.0_rc2");
-        assert_eq!(detected.source, ServerVersionSource::CliOverride);
     }
 
     #[test]

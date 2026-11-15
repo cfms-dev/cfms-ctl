@@ -96,7 +96,7 @@ mod tests {
         fs::write(server_root.join("main.py"), "# stub\n").unwrap();
         fs::write(
             project_root.join("release-manifest.json"),
-            r#"{"version":"0.14.0-test"}"#,
+            r#"{"version":"0.14.0_alpha1"}"#,
         )
         .unwrap();
 
@@ -333,7 +333,7 @@ secret_key = "{secret_key}"
         let header = read_backup_header(&archive_path).unwrap();
         assert_eq!(header.content_type, "cfms-backup");
         assert_eq!(header.version, 2);
-        assert_eq!(header.server_version, "0.14.0-test");
+        assert_eq!(header.server_version, "0.14.0_alpha1");
         assert_eq!(header.compression, "zstd");
         assert_eq!(header.container, "cfms-stream-v2");
         assert_eq!(header.components.len(), 5);
@@ -1041,5 +1041,34 @@ secret_key = "{secret_key}"
         .unwrap_err();
         assert!(matches!(inner_import_err, CfmsError::ArchiveIntegrity(_)));
         assert!(inner_import_err.to_string().contains("future_manifest_rule"));
+    }
+
+    #[tokio::test]
+    async fn backup_export_fails_when_server_version_cannot_be_determined() {
+        let tmp = TempDir::new().unwrap();
+        let src_ws = create_test_workspace(
+            &tmp.path().join("src_ws_no_version"),
+            "app.db",
+            "local",
+            "src-pepper-secret",
+            "src-server-secret",
+        );
+        let _ = seed_source_database(&src_ws).await;
+        fs::remove_file(src_ws.join("release-manifest.json")).unwrap();
+
+        let archive_path = tmp.path().join("should_not_exist.confbak");
+        let err = export::run_export(
+            &test_ctx(&src_ws),
+            BackupExportArgs {
+                output_path: Some(archive_path.clone()),
+                key_out: None,
+                components: vec![],
+                interactive: false,
+            },
+        )
+        .await
+        .expect_err("backup export must fail when server version cannot be determined");
+        assert!(err.to_string().contains("Unable to determine target CFMS server version"));
+        assert!(!archive_path.exists());
     }
 }

@@ -35,7 +35,7 @@ pub struct ExtensionTogglePlan {
     pub already_in_desired_state: Vec<String>,
     pub removed_uninstalled: Vec<String>,
     pub reordered_existing: bool,
-    pub server_version: Option<DetectedServerVersion>,
+    pub server_version: DetectedServerVersion,
     pub warnings: Vec<String>,
     pub candidate_doc: ConfigDocument,
 }
@@ -62,7 +62,6 @@ pub fn plan_enable(
     config_doc: &ConfigDocument,
     paths: &WorkspacePaths,
     raw_targets: &[String],
-    server_version_override: Option<&str>,
     schema_path: Option<&Path>,
 ) -> Result<ExtensionTogglePlan> {
     let targets = normalize_targets(raw_targets)?;
@@ -80,12 +79,7 @@ pub fn plan_enable(
     let previous_enabled = prev_state.entries;
 
     // Fail safely when the target workspace server version cannot be determined.
-    let server = discover_server_version(paths, server_version_override)?.ok_or_else(|| {
-        CfmsError::Extension(
-            "Unable to determine target CFMS server version from release-manifest.json, include/config/constants.py, or pyproject.toml; pass --server-version <VERSION> to specify it explicitly"
-                .to_string(),
-        )
-    })?;
+    let server = discover_server_version(paths)?;
 
     // Check currently installed built-in extension compatibility when present on disk.
     if let Some(builtin_ext) = catalog.extensions.get(BUILTIN_EXTENSION_ID) {
@@ -107,7 +101,7 @@ pub fn plan_enable(
         resolve_dependency_dfs(
             root,
             catalog,
-            Some(&server),
+            &server,
             &prev_set,
             false,
             &mut visit_state,
@@ -121,7 +115,7 @@ pub fn plan_enable(
         resolve_dependency_dfs(
             root,
             catalog,
-            Some(&server),
+            &server,
             &prev_set,
             true,
             &mut visit_state,
@@ -195,7 +189,7 @@ pub fn plan_enable(
         already_in_desired_state,
         removed_uninstalled: Vec::new(),
         reordered_existing,
-        server_version: Some(server),
+        server_version: server,
         warnings,
         candidate_doc,
     })
@@ -271,7 +265,7 @@ pub fn plan_disable(
         warnings.extend(schema_warnings);
     }
 
-    let detected_server = discover_server_version(paths, None).ok().flatten();
+    let detected_server = discover_server_version(paths)?;
 
     Ok(ExtensionTogglePlan {
         action: ToggleAction::Disable,
@@ -299,7 +293,7 @@ pub struct ExtensionInstallPlan {
     pub version: String,
     pub target_directory: PathBuf,
     pub package_sha256: String,
-    pub server_version: Option<DetectedServerVersion>,
+    pub server_version: DetectedServerVersion,
     pub warnings: Vec<String>,
 }
 
@@ -317,7 +311,7 @@ pub struct ExtensionUpgradePlan {
     pub auto_enabled: Vec<String>,
     pub config_changed: bool,
     pub candidate_doc: ConfigDocument,
-    pub server_version: Option<DetectedServerVersion>,
+    pub server_version: DetectedServerVersion,
     pub warnings: Vec<String>,
 }
 
@@ -456,11 +450,11 @@ pub fn plan_install(
         ));
     }
 
-    let server_version = discover_server_version(paths, None)?;
+    let server_version = discover_server_version(paths)?;
     collect_manifest_advisories(
         manifest,
         catalog,
-        server_version.as_ref(),
+        &server_version,
         &mut warnings,
     );
 
@@ -588,7 +582,7 @@ pub fn plan_upgrade(
         .extensions
         .insert(id.clone(), new_manifest.clone());
 
-    let server_version = discover_server_version(paths, None)?;
+    let server_version = discover_server_version(paths)?;
     let mut next_enabled = previous_enabled.clone();
     let mut auto_enabled = Vec::new();
 
@@ -599,49 +593,18 @@ pub fn plan_upgrade(
         let mut visit_state: HashMap<String, DfsMark> = HashMap::new();
         let mut dfs_stack = Vec::new();
 
-        // Check server compatibility if detectable; fail only when bounds require verification and none was found.
-        if let Some(server) = server_version.as_ref() {
-            resolve_dependency_dfs(
-                id,
-                &future_catalog,
-                Some(server),
-                &prev_set,
-                true,
-                &mut visit_state,
-                &mut dfs_stack,
-                &mut visited,
-                &mut active_closure,
-                Some(&mut closure_targets),
-            )?;
-        } else {
-            resolve_dependency_dfs(
-                id,
-                &future_catalog,
-                None,
-                &prev_set,
-                true,
-                &mut visit_state,
-                &mut dfs_stack,
-                &mut visited,
-                &mut active_closure,
-                Some(&mut closure_targets),
-            )?;
-            let needs_server_check = active_closure.iter().any(|ext_id| {
-                future_catalog.extensions.get(ext_id).is_some_and(|e| {
-                    e.minimum_server_version.is_some() || e.maximum_server_version.is_some()
-                })
-            });
-            if needs_server_check {
-                return Err(CfmsError::Extension(
-                    "Unable to determine target CFMS server version from release-manifest.json, include/config/constants.py, or pyproject.toml to verify upgraded extension compatibility"
-                        .to_string(),
-                ));
-            }
-            warnings.push(
-                "Unable to detect CFMS server version; skipped compatibility check because upgraded closure declares no server version bounds"
-                    .to_string(),
-            );
-        }
+        resolve_dependency_dfs(
+            id,
+            &future_catalog,
+            &server_version,
+            &prev_set,
+            true,
+            &mut visit_state,
+            &mut dfs_stack,
+            &mut visited,
+            &mut active_closure,
+            Some(&mut closure_targets),
+        )?;
 
         let newly_added: Vec<String> = closure_targets
             .into_iter()
@@ -662,7 +625,7 @@ pub fn plan_upgrade(
         collect_manifest_advisories(
             new_manifest,
             &future_catalog,
-            server_version.as_ref(),
+            &server_version,
             &mut warnings,
         );
     }
@@ -830,6 +793,7 @@ pub fn plan_purge_data(
         )));
     }
     validate_extension_identifier(identifier)?;
+    let server_version = discover_server_version(paths)?;
 
     let retired_identifier = RETIRED_EXTENSION_IDS.contains(&identifier);
     let enabled_state = read_enabled_config(config_doc, true)?;
@@ -883,8 +847,7 @@ pub fn plan_purge_data(
         data_module = declared_data_module(&ext.raw).map(ToString::to_string);
         option_namespaces = declared_option_namespaces(&ext.raw);
 
-        let server_version = discover_server_version(paths, None).ok().flatten();
-        collect_manifest_advisories(ext, catalog, server_version.as_ref(), &mut warnings);
+        collect_manifest_advisories(ext, catalog, &server_version, &mut warnings);
 
         if !options_only {
             match resolve_target_load_closure(catalog, identifier) {
@@ -1052,16 +1015,14 @@ fn resolve_target_load_closure(
 fn collect_manifest_advisories(
     ext: &InstalledExtension,
     catalog: &ExtensionCatalog,
-    server: Option<&DetectedServerVersion>,
+    server: &DetectedServerVersion,
     warnings: &mut Vec<String>,
 ) {
-    if let Some(sv) = server
-        && let Err(reason) = check_server_compatibility(
-            &sv.version,
-            ext.minimum_server_version.as_ref(),
-            ext.maximum_server_version.as_ref(),
-        )
-    {
+    if let Err(reason) = check_server_compatibility(
+        &server.version,
+        ext.minimum_server_version.as_ref(),
+        ext.maximum_server_version.as_ref(),
+    ) {
         warnings.push(format!("Server compatibility notice: '{}' {reason}", ext.identifier));
     }
 
@@ -1228,7 +1189,7 @@ fn check_extension_server_compat(
 fn resolve_dependency_dfs(
     id: &str,
     catalog: &ExtensionCatalog,
-    server: Option<&DetectedServerVersion>,
+    server: &DetectedServerVersion,
     prev_set: &BTreeSet<String>,
     record_target_postorder: bool,
     visit_state: &mut HashMap<String, DfsMark>,
@@ -1267,9 +1228,7 @@ fn resolve_dependency_dfs(
         None
     };
     let ext = ensure_usable_extension(catalog, id, context_note.as_deref())?;
-    if let Some(sv) = server {
-        check_extension_server_compat(ext, sv)?;
-    }
+    check_extension_server_compat(ext, server)?;
 
     visit_state.insert(id.to_string(), DfsMark::Visiting);
     dfs_stack.push(id.to_string());
@@ -1461,7 +1420,7 @@ mod tests {
         let catalog = discover_catalog(ext_root).expect("catalog");
         let doc = ConfigDocument::load(&paths.config_path).expect("config");
 
-        let plan = plan_enable(&catalog, &doc, &paths, &["http_api".to_string()], None, None)
+        let plan = plan_enable(&catalog, &doc, &paths, &["http_api".to_string()], None)
             .expect("plan");
         assert!(plan.changed);
         assert_eq!(plan.next_enabled, vec!["base_auth", "http_api"]);
@@ -1495,7 +1454,7 @@ mod tests {
         let catalog = discover_catalog(ext_root).expect("catalog");
         let doc = ConfigDocument::load(&paths.config_path).expect("config");
 
-        let plan = plan_enable(&catalog, &doc, &paths, &["core_dep".to_string()], None, None)
+        let plan = plan_enable(&catalog, &doc, &paths, &["core_dep".to_string()], None)
             .expect("plan");
         assert_eq!(plan.next_enabled, vec!["other_ext", "core_dep", "consumer"]);
     }
@@ -1529,11 +1488,11 @@ mod tests {
         let catalog = discover_catalog(ext_root).expect("catalog");
         let doc = ConfigDocument::load(&paths.config_path).expect("config");
 
-        let cycle_err = plan_enable(&catalog, &doc, &paths, &["ext_a".to_string()], None, None)
+        let cycle_err = plan_enable(&catalog, &doc, &paths, &["ext_a".to_string()], None)
             .expect_err("cycle rejected");
         assert!(cycle_err.to_string().contains("ext_a -> ext_b -> ext_a"));
 
-        let min_err = plan_enable(&catalog, &doc, &paths, &["too_new".to_string()], None, None)
+        let min_err = plan_enable(&catalog, &doc, &paths, &["too_new".to_string()], None)
             .expect_err("min server version rejected");
         assert!(min_err.to_string().contains("0.14.0 or newer"));
 
@@ -1543,29 +1502,19 @@ mod tests {
             &paths,
             &["too_old_server".to_string()],
             None,
-            None,
         )
         .expect_err("max server version rejected");
         assert!(max_err.to_string().contains("up to 0.9.0"));
 
-        // Overriding --server-version works, while deleting constants.py fails safe!
-        assert!(
-            plan_enable(
-                &catalog,
-                &doc,
-                &paths,
-                &["too_new".to_string()],
-                Some("0.14.0"),
-                None
-            )
-            .is_ok()
-        );
+        // Deleting constants.py with no other version files fails strictly!
         std::fs::remove_file(dir.path().join("src/include/config/constants.py"))
             .expect("rm constants");
         let unknown_ver_err =
-            plan_enable(&catalog, &doc, &paths, &["too_new".to_string()], None, None)
+            plan_enable(&catalog, &doc, &paths, &["too_new".to_string()], None)
                 .expect_err("unknown server version fails safe");
-        assert!(unknown_ver_err.to_string().contains("--server-version"));
+        let err_msg = unknown_ver_err.to_string();
+        assert!(err_msg.contains("Unable to determine target CFMS server version"));
+        assert!(!err_msg.contains("--server-version"));
     }
 
     #[test]
@@ -1661,7 +1610,6 @@ mod tests {
             &paths,
             &["consumer_ext".to_string()],
             None,
-            None,
         )
         .expect_err("dep version mismatch");
         assert!(ver_err.to_string().contains(">=1.0.0"));
@@ -1673,14 +1621,13 @@ mod tests {
             &paths,
             &["clean_ext".to_string()],
             None,
-            None,
         )
         .expect_err("scoped staging blocks target");
         assert!(stage_err.to_string().contains("Unfinished extension transaction"));
 
         // ...but does NOT block enabling an unrelated healthy extension `dep_ext`.
         let unrelated_plan =
-            plan_enable(&catalog, &doc, &paths, &["dep_ext".to_string()], None, None)
+            plan_enable(&catalog, &doc, &paths, &["dep_ext".to_string()], None)
                 .expect("unrelated enable succeeds with warning");
         assert!(
             unrelated_plan
@@ -1884,10 +1831,7 @@ mod tests {
         )
         .expect("write broken target manifest");
 
-        // Remove constants.py as well: purge-data must still inspect/clean without server version!
-        std::fs::remove_file(dir.path().join("src/include/config/constants.py"))
-            .expect("rm constants");
-
+        // Healthy target ignores broken siblings and treats server version bounds as advisory warnings.
         let catalog = discover_catalog(ext_root).expect("catalog");
         let doc = ConfigDocument::load(&paths.config_path).expect("config");
 
@@ -1900,6 +1844,12 @@ mod tests {
             .collect();
         assert_eq!(closure_ids, vec!["dep_ext", "app_ext"]);
         assert!(app_plan.dependency_error.is_none());
+        assert!(
+            app_plan
+                .warnings
+                .iter()
+                .any(|w| w.contains("Server compatibility notice"))
+        );
 
         // Broken, retired, and uninstalled targets fail without --options-only...
         assert!(plan_purge_data("broken_target", false, false, &catalog, &doc, &paths).is_err());
@@ -1921,5 +1871,69 @@ mod tests {
             .expect("uninstalled target --options-only");
         assert!(!ghost_plan.retired_identifier);
         assert!(!ghost_plan.installed);
+
+        // Removing constants.py leaves no detectable server version -> purge-data refuses to run.
+        std::fs::remove_file(dir.path().join("src/include/config/constants.py"))
+            .expect("rm constants");
+        let missing_ver_err = plan_purge_data("app_ext", false, false, &catalog, &doc, &paths)
+            .expect_err("purge-data rejects missing server version");
+        assert!(
+            missing_ver_err
+                .to_string()
+                .contains("Unable to determine target CFMS server version")
+        );
+        assert!(plan_purge_data("broken_target", true, false, &catalog, &doc, &paths).is_err());
+    }
+
+    #[test]
+    fn install_upgrade_and_disable_fail_when_server_version_cannot_be_determined() {
+        let (dir, paths) = setup_workspace("0.14.0", "[extensions]\nenabled = [\"app_ext\"]\n");
+        let ext_root = &paths.extensions_root;
+        write_manifest_ext(
+            ext_root,
+            "app_ext",
+            "manifest_version = 3\n[extension]\nidentifier = \"app_ext\"\nname = \"App\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+        );
+
+        let catalog = discover_catalog(ext_root).expect("catalog");
+        let doc = ConfigDocument::load(&paths.config_path).expect("config");
+        let managed = BTreeSet::from(["builtin".to_string()]);
+
+        let new_pkg_manifest = crate::ops::extension::catalog::parse_extension_manifest_str(
+            "manifest_version = 3\n[extension]\nidentifier = \"fresh_ext\"\nname = \"Fresh\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+            Path::new("pkg/manifest.toml"),
+            Path::new("pkg"),
+            Path::new("pkg/_extension.py"),
+        )
+        .expect("parse fresh");
+        let fresh_pkg = VerifiedExtensionPackage {
+            package_path: PathBuf::from("fresh-1.0.0.zip"),
+            package_sha256: "a".repeat(64),
+            manifest: new_pkg_manifest,
+            member_count: 2,
+            declared_uncompressed_bytes: 64,
+        };
+
+        let upgrade_manifest = crate::ops::extension::catalog::parse_extension_manifest_str(
+            "manifest_version = 3\n[extension]\nidentifier = \"app_ext\"\nname = \"App\"\nversion = \"2.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+            Path::new("pkg/manifest.toml"),
+            Path::new("pkg"),
+            Path::new("pkg/_extension.py"),
+        )
+        .expect("parse upgrade");
+        let upgrade_pkg = VerifiedExtensionPackage {
+            package_path: PathBuf::from("app-2.0.0.zip"),
+            package_sha256: "b".repeat(64),
+            manifest: upgrade_manifest,
+            member_count: 2,
+            declared_uncompressed_bytes: 64,
+        };
+
+        std::fs::remove_file(dir.path().join("src/include/config/constants.py"))
+            .expect("rm constants");
+
+        assert!(plan_install(&fresh_pkg, &catalog, &doc, &paths, &managed).is_err());
+        assert!(plan_upgrade(&upgrade_pkg, &catalog, &doc, &paths, &managed, None).is_err());
+        assert!(plan_disable(&catalog, &doc, &paths, &["app_ext".to_string()], None).is_err());
     }
 }

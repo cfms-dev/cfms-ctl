@@ -142,15 +142,16 @@ pub async fn handle_status(ctx: &AppContext, args: DeploymentStatusArgs) -> Resu
     };
 
     let active_id = active_manifest.as_ref().map(|m| m.release_id.clone());
-    let detected_version = active_manifest
-        .as_ref()
-        .map(|m| m.manifest.version.clone())
-        .or_else(|| {
-            discover_server_version(&paths, None)
-                .ok()
-                .flatten()
-                .map(|d| d.version.to_string())
-        });
+    let detected_version = match active_manifest.as_ref() {
+        Some(m) => Some(m.manifest.version.clone()),
+        None => match discover_server_version(&paths) {
+            Ok(detected) => Some(detected.version.to_string()),
+            Err(err) => {
+                warnings.push(format!("Unable to determine CFMS server version: {err}"));
+                None
+            }
+        },
+    };
 
     let active_summary = active_manifest.as_ref().map(|m| ReleaseManifestSummary {
         release_id: Some(m.release_id.clone()),
@@ -307,21 +308,37 @@ pub async fn run_check_with_config(
     args: DeploymentCheckArgs,
     cfg: &OnlineClientConfig,
 ) -> Result<()> {
-    let current_version = ctx.resolve_paths().ok().and_then(|p| {
-        if p.release_manifest_path.is_file() {
-            load_manifest_file(&p.release_manifest_path)
-                .ok()
-                .map(|m| m.manifest.version)
-        } else {
-            discover_server_version(&p, None)
-                .ok()
-                .flatten()
-                .map(|d| d.version.to_string())
+    let mut check_warnings = Vec::new();
+    let current_version = match ctx.resolve_paths() {
+        Ok(p) => {
+            if p.release_manifest_path.is_file() {
+                match load_manifest_file(&p.release_manifest_path) {
+                    Ok(m) => Some(m.manifest.version),
+                    Err(err) => {
+                        check_warnings.push(format!(
+                            "Unable to read release-manifest.json for current version comparison: {err}"
+                        ));
+                        None
+                    }
+                }
+            } else {
+                match discover_server_version(&p) {
+                    Ok(d) => Some(d.version.to_string()),
+                    Err(err) => {
+                        check_warnings.push(format!(
+                            "Unable to determine current CFMS server version: {err}"
+                        ));
+                        None
+                    }
+                }
+            }
         }
-    });
-    let report =
+        Err(_) => None,
+    };
+    let mut report =
         check_github_release_with_config(cfg, &args.online, current_version.as_deref(), false)
             .await?;
+    report.warnings.extend(check_warnings);
     ctx.ui.render(&report);
     Ok(())
 }
@@ -2958,5 +2975,34 @@ mod tests {
         .unwrap();
 
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn status_diagnostic_succeeds_when_unmanaged_server_version_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let (files, _manifest_bytes) = build_release_bundle_map(
+            "0.14.0",
+            &[("e952c02c1454", None)],
+            &base_config_template(""),
+            &[],
+        );
+
+        let unpacked = tmp.path().join("unpacked_no_ver");
+        write_unpacked_workspace(&unpacked, &files, None);
+        fs::write(unpacked.join("src").join("config.toml"), base_config_template("")).unwrap();
+        let pyproject = unpacked.join("pyproject.toml");
+        if pyproject.exists() {
+            fs::remove_file(&pyproject).unwrap();
+        }
+        let constants = unpacked.join("src/include/config/constants.py");
+        if constants.exists() {
+            fs::remove_file(&constants).unwrap();
+        }
+        assert!(!unpacked.join("release-manifest.json").exists());
+
+        let ctx = test_ctx(&unpacked);
+        handle_status(&ctx, DeploymentStatusArgs { verify: false })
+            .await
+            .expect("diagnostic status must still succeed without detectable server version");
     }
 }

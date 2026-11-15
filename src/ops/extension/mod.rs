@@ -52,7 +52,7 @@ pub struct ExtensionSummary {
     pub description: String,
     pub minimum_server_version: Option<String>,
     pub maximum_server_version: Option<String>,
-    pub compatible: Option<bool>,
+    pub compatible: bool,
     pub dependencies: BTreeMap<String, String>,
     pub issues: Vec<String>,
     pub path: String,
@@ -62,7 +62,7 @@ pub struct ExtensionSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExtensionListReport {
     pub extensions_root: String,
-    pub server_version: Option<String>,
+    pub server_version: String,
     pub extensions: Vec<ExtensionSummary>,
     pub missing_enabled: Vec<String>,
     pub diagnostics: Vec<CatalogDiagnostic>,
@@ -78,8 +78,8 @@ pub struct ExtensionToggleReport {
     pub applied: bool,
     pub config_path: String,
     pub backup_path: Option<String>,
-    pub server_version: Option<String>,
-    pub server_version_source: Option<String>,
+    pub server_version: String,
+    pub server_version_source: String,
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub cascade_dependents: Vec<String>,
@@ -184,13 +184,7 @@ pub struct ExtensionPurgeDataReport {
 impl CommandReport for ExtensionListReport {
     fn render_human(&self, ui: &UiConsole) {
         ui.print_section(&format!("Installed Extensions ({})", self.extensions_root));
-        if let Some(ver) = &self.server_version {
-            println!("Detected Server Version: {ver}");
-        } else {
-            ui.print_warning(
-                "Target server version could not be detected; compatibility is reported as unknown.",
-            );
-        }
+        println!("Detected Server Version: {}", self.server_version);
 
         if self.extensions.is_empty() {
             println!("No valid extensions installed.");
@@ -216,10 +210,10 @@ impl CommandReport for ExtensionListReport {
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
-                let (compat_label, compat_color) = match ext.compatible {
-                    Some(true) => ("ok", Color::Green),
-                    Some(false) => ("incompatible", Color::Red),
-                    None => ("unknown", Color::Yellow),
+                let (compat_label, compat_color) = if ext.compatible {
+                    ("ok", Color::Green)
+                } else {
+                    ("incompatible", Color::Red)
                 };
                 let issues_text = if ext.issues.is_empty() {
                     "-".to_string()
@@ -284,11 +278,12 @@ impl CommandReport for ExtensionSummary {
             .row("Active / Enabled", self.enabled.to_string())
             .row(
                 "Server Compatibility",
-                match self.compatible {
-                    Some(true) => "compatible".to_string(),
-                    Some(false) => "incompatible".to_string(),
-                    None => "unknown".to_string(),
-                },
+                if self.compatible {
+                    "compatible"
+                } else {
+                    "incompatible"
+                }
+                .to_string(),
             )
             .row("Description", self.description.clone())
             .row(
@@ -337,15 +332,11 @@ impl CommandReport for ExtensionToggleReport {
             .row("Configuration File", self.config_path.clone())
             .row("Dry Run", self.dry_run.to_string())
             .row("Changed", self.changed.to_string())
-            .row("Applied", self.applied.to_string());
-
-        if let Some(ver) = &self.server_version {
-            let formatted = self
-                .server_version_source
-                .as_ref()
-                .map_or_else(|| ver.clone(), |src| format!("{ver} ({src})"));
-            table.row("Server Version", formatted);
-        }
+            .row("Applied", self.applied.to_string())
+            .row(
+                "Server Version",
+                format!("{} ({})", self.server_version, self.server_version_source),
+            );
 
         if !self.added.is_empty() {
             table.row("Added Extensions", self.added.join(", "));
@@ -686,13 +677,12 @@ fn handle_list(ctx: &AppContext) -> Result<()> {
     let enabled_state = read_enabled_config(&config_doc, true)?;
     let enabled_set: BTreeSet<String> = enabled_state.entries.iter().cloned().collect();
     let catalog = discover_catalog(&paths.extensions_root)?;
-    let server_version = discover_server_version(&paths, None)?
-        .map(|detected| detected.version);
+    let server_version = discover_server_version(&paths)?.version;
 
     let extensions: Vec<ExtensionSummary> = catalog
         .extensions
         .values()
-        .map(|ext| summarize_extension(ext, &catalog, &enabled_set, server_version.as_ref()))
+        .map(|ext| summarize_extension(ext, &catalog, &enabled_set, &server_version))
         .collect();
 
     let missing_enabled: Vec<String> = enabled_state
@@ -703,7 +693,7 @@ fn handle_list(ctx: &AppContext) -> Result<()> {
 
     let report = ExtensionListReport {
         extensions_root: paths.extensions_root.display().to_string(),
-        server_version: server_version.map(|v| v.to_string()),
+        server_version: server_version.to_string(),
         extensions,
         missing_enabled,
         diagnostics: catalog.diagnostics,
@@ -719,8 +709,7 @@ fn handle_info(ctx: &AppContext, args: ExtensionIdentifierArgs) -> Result<()> {
     let enabled_state = read_enabled_config(&config_doc, true)?;
     let enabled_set: BTreeSet<String> = enabled_state.entries.iter().cloned().collect();
     let catalog = discover_catalog(&paths.extensions_root)?;
-    let server_version = discover_server_version(&paths, None)?
-        .map(|detected| detected.version);
+    let server_version = discover_server_version(&paths)?.version;
 
     if let Some(dirs) = catalog.conflicted_identifiers.get(&args.identifier) {
         let joined = dirs
@@ -750,7 +739,7 @@ fn handle_info(ctx: &AppContext, args: ExtensionIdentifierArgs) -> Result<()> {
         )));
     };
 
-    let summary = summarize_extension(ext, &catalog, &enabled_set, server_version.as_ref());
+    let summary = summarize_extension(ext, &catalog, &enabled_set, &server_version);
     ctx.ui.render(&summary);
     Ok(())
 }
@@ -765,7 +754,6 @@ fn handle_enable(ctx: &AppContext, args: ExtensionEnableArgs) -> Result<()> {
         &config_doc,
         &paths,
         &args.identifiers,
-        args.server_version.as_deref(),
         schema_path.as_deref(),
     )?;
     execute_toggle_plan(ctx, &paths, plan, args.dry_run)
@@ -800,14 +788,8 @@ fn execute_toggle_plan(
         applied: false,
         config_path: paths.config_path.display().to_string(),
         backup_path: None,
-        server_version: plan
-            .server_version
-            .as_ref()
-            .map(|s| s.version.as_str().to_string()),
-        server_version_source: plan
-            .server_version
-            .as_ref()
-            .map(|s| s.source.label().to_string()),
+        server_version: plan.server_version.version.as_str().to_string(),
+        server_version_source: plan.server_version.source.label().to_string(),
         added: plan.added,
         removed: plan.removed,
         cascade_dependents: plan.cascade_dependents,
@@ -1291,7 +1273,7 @@ fn summarize_extension(
     ext: &InstalledExtension,
     catalog: &ExtensionCatalog,
     enabled_set: &BTreeSet<String>,
-    server_version: Option<&CfmsServerVersion>,
+    server_version: &CfmsServerVersion,
 ) -> ExtensionSummary {
     let active = ext.builtin || enabled_set.contains(&ext.identifier);
     let mut issues = Vec::new();
@@ -1320,20 +1302,16 @@ fn summarize_extension(
         }
     }
 
-    let compatible = if let Some(ver) = server_version {
-        match check_server_compatibility(
-            ver,
-            ext.minimum_server_version.as_ref(),
-            ext.maximum_server_version.as_ref(),
-        ) {
-            Ok(()) => Some(true),
-            Err(msg) => {
-                issues.push(msg);
-                Some(false)
-            }
+    let compatible = match check_server_compatibility(
+        server_version,
+        ext.minimum_server_version.as_ref(),
+        ext.maximum_server_version.as_ref(),
+    ) {
+        Ok(()) => true,
+        Err(msg) => {
+            issues.push(msg);
+            false
         }
-    } else {
-        None
     };
 
     ExtensionSummary {
@@ -1451,7 +1429,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: true,
-                server_version: None,
                 schema: None,
             }),
         )
@@ -1468,7 +1445,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: false,
-                server_version: None,
                 schema: None,
             }),
         )
@@ -1489,7 +1465,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: false,
-                server_version: None,
                 schema: None,
             }),
         )
@@ -1549,6 +1524,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_list_and_info_fail_when_server_version_missing() {
+        let dir = setup_workspace("[extensions]\nenabled = []\n");
+        std::fs::remove_file(dir.path().join("src/include/config/constants.py"))
+            .expect("rm constants");
+        let ctx = test_ctx(dir.path(), OutputFormat::Json, true);
+
+        let list_err = handle(&ctx, ExtensionCommand::List)
+            .await
+            .expect_err("extension list requires detectable server version");
+        assert!(
+            list_err
+                .to_string()
+                .contains("Unable to determine target CFMS server version")
+        );
+
+        let info_err = handle(
+            &ctx,
+            ExtensionCommand::Info(ExtensionIdentifierArgs {
+                identifier: "oidc_sso".to_string(),
+            }),
+        )
+        .await
+        .expect_err("extension info requires detectable server version");
+        assert!(
+            info_err
+                .to_string()
+                .contains("Unable to determine target CFMS server version")
+        );
+    }
+
+    #[tokio::test]
     async fn enable_sets_restart_required_when_server_locked_and_is_idempotent() {
         let dir = setup_workspace("debug = false\n# no [extensions] section initially\n");
         let cfg_path = dir.path().join("src").join("config.toml");
@@ -1560,7 +1566,7 @@ mod tests {
 
         let catalog = discover_catalog(&paths.extensions_root).expect("catalog");
         let doc = ctx.load_config(&paths).expect("load");
-        let plan = plan_enable(&catalog, &doc, &paths, &["oidc_sso".to_string()], None, None)
+        let plan = plan_enable(&catalog, &doc, &paths, &["oidc_sso".to_string()], None)
             .expect("enable plan");
         assert!(plan.changed);
         let backup = plan.candidate_doc.save_with_backup().expect("save");
@@ -1583,7 +1589,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["oidc_sso".to_string()],
                 dry_run: false,
-                server_version: None,
                 schema: None,
             }),
         )
@@ -1657,7 +1662,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: false,
-                server_version: None,
                 schema: Some(schema_path),
             }),
         )
@@ -1803,7 +1807,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["consumer_ext".to_string()],
                 dry_run: false,
-                server_version: None,
                 schema: None,
             }),
         )
