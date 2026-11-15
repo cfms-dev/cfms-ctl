@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use pep440_rs::Version as Pep440Version;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use crate::core::{CfmsError, ConfigDocument, Result};
+use crate::core::{CfmsError, ConfigDocument, Result, WorkspacePaths};
 use crate::ops::extension::version::{
     CfmsServerVersion, DependencyConstraint, parse_pep440_version,
 };
@@ -19,11 +19,13 @@ pub const RESERVED_EXTENSION_IDS: &[&str] = &["core"];
 pub const RETIRED_EXTENSION_IDS: &[&str] = &["scheduling"];
 pub const MANIFEST_FILENAME: &str = "manifest.toml";
 pub const ENTRYPOINT_FILENAME: &str = "_extension.py";
+pub const RELEASE_MANIFEST_FILENAME: &str = "release-manifest.json";
 pub const MAX_EXTENSION_IDENTIFIER_LEN: usize = 255;
 pub const MAX_EXTENSION_SCAN_ENTRIES: usize = 1024;
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
-const TRANSACTION_PREFIXES: &[&str] = &[".cfms-extension-stage-", ".cfms-extension-rollback-"];
+pub(crate) const TRANSACTION_PREFIXES: &[&str] =
+    &[".cfms-extension-stage-", ".cfms-extension-rollback-"];
 
 /// Open-world representation of `[extension]` inside `manifest.toml`.
 /// Unknown fields introduced by newer CFMS versions are captured in `extra`.
@@ -121,11 +123,20 @@ pub struct StagingMarker {
     pub target_identifier: Option<String>,
 }
 
+/// Resolved uninstall candidate on disk under `extensions_root`.
+#[derive(Debug, Clone)]
+pub enum UninstallTarget<'a> {
+    Installed(&'a InstalledExtension),
+    Broken(&'a CatalogDiagnostic),
+}
+
 /// Complete extension catalog discovered under `<server_root>/include/extensions`.
 #[derive(Debug, Clone)]
 pub struct ExtensionCatalog {
     pub extensions_root: PathBuf,
     pub root_exists: bool,
+    pub root_entry_count: usize,
+    pub root_entry_names_lower: BTreeMap<String, PathBuf>,
     pub extensions: BTreeMap<String, InstalledExtension>,
     pub conflicted_identifiers: BTreeMap<String, Vec<PathBuf>>,
     pub diagnostics: Vec<CatalogDiagnostic>,
@@ -140,6 +151,138 @@ impl ExtensionCatalog {
                 || d.directory.file_name().and_then(|n| n.to_str()) == Some(identifier)
         })
     }
+
+    /// Resolve a target extension for uninstall, permitting broken diagnostic directories.
+    pub fn resolve_uninstall_target(&self, identifier: &str) -> Result<UninstallTarget<'_>> {
+        if let Some(dirs) = self.conflicted_identifiers.get(identifier) {
+            let joined = dirs
+                .iter()
+                .map(|p| format!("'{}'", p.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(CfmsError::Extension(format!(
+                "Duplicate extension identifier '{identifier}' found in {joined}"
+            )));
+        }
+        if let Some(ext) = self.extensions.get(identifier) {
+            return Ok(UninstallTarget::Installed(ext));
+        }
+        let matching_diags: Vec<&CatalogDiagnostic> = self
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.identifier_hint.as_deref() == Some(identifier)
+                    || d.directory
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case(identifier))
+            })
+            .collect();
+        match matching_diags.as_slice() {
+            [diag] => Ok(UninstallTarget::Broken(diag)),
+            [] => Err(CfmsError::Extension(format!(
+                "Extension '{identifier}' is not installed under '{}'",
+                self.extensions_root.display()
+            ))),
+            many => {
+                let joined = many
+                    .iter()
+                    .map(|d| format!("'{}'", d.directory.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(CfmsError::Extension(format!(
+                    "Multiple broken extension directories match '{identifier}': {joined}"
+                )))
+            }
+        }
+    }
+}
+
+/// Return true if filesystem metadata describes a symlink or Windows reparse point (junction/mount).
+#[must_use]
+pub(crate) fn is_symlink_or_reparse_point(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read managed extension identifiers from `release-manifest.json` (plus `builtin`).
+pub fn read_managed_extensions(paths: &WorkspacePaths) -> Result<BTreeSet<String>> {
+    let mut managed = BTreeSet::new();
+    managed.insert(BUILTIN_EXTENSION_ID.to_string());
+
+    let manifest_path = &paths.release_manifest_path;
+    let Some(meta) = symlink_stat_if_present(manifest_path)? else {
+        return Ok(managed);
+    };
+    if !meta.is_file() {
+        return Err(CfmsError::Extension(format!(
+            "Release manifest '{}' must be a regular file",
+            manifest_path.display()
+        )));
+    }
+    if meta.len() > MAX_MANIFEST_BYTES {
+        return Err(CfmsError::Extension(format!(
+            "Release manifest '{}' exceeds the 1 MiB safety limit",
+            manifest_path.display()
+        )));
+    }
+
+    let raw = std::fs::read_to_string(manifest_path)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        CfmsError::Extension(format!(
+            "Invalid JSON in release manifest '{}': {e}",
+            manifest_path.display()
+        ))
+    })?;
+    let Some(obj) = parsed.as_object() else {
+        return Err(CfmsError::Extension(format!(
+            "Release manifest '{}' must decode to a JSON object",
+            manifest_path.display()
+        )));
+    };
+
+    if let Some(entries_val) = obj.get("managed_extensions") {
+        let Some(entries) = entries_val.as_array() else {
+            return Err(CfmsError::Extension(format!(
+                "Release manifest '{}' field 'managed_extensions' must be a JSON array of strings",
+                manifest_path.display()
+            )));
+        };
+        for item in entries {
+            let Some(id) = item.as_str() else {
+                return Err(CfmsError::Extension(format!(
+                    "Release manifest '{}' field 'managed_extensions' must contain only strings",
+                    manifest_path.display()
+                )));
+            };
+            validate_extension_identifier(id)?;
+            managed.insert(id.to_string());
+        }
+    }
+
+    Ok(managed)
+}
+
+/// Extract optional `[data].module` string declared inside an extension manifest.
+#[must_use]
+pub(crate) fn declared_data_module(raw: &RawExtensionManifest) -> Option<&str> {
+    raw.extra_sections
+        .get("data")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("module"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// Validated view of `[extensions].enabled` in `config.toml`.
@@ -230,6 +373,8 @@ pub fn discover_catalog(extensions_root: &Path) -> Result<ExtensionCatalog> {
     let mut catalog = ExtensionCatalog {
         extensions_root: extensions_root.to_path_buf(),
         root_exists: false,
+        root_entry_count: 0,
+        root_entry_names_lower: BTreeMap::new(),
         extensions: BTreeMap::new(),
         conflicted_identifiers: BTreeMap::new(),
         diagnostics: Vec::new(),
@@ -241,7 +386,7 @@ pub fn discover_catalog(extensions_root: &Path) -> Result<ExtensionCatalog> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(catalog),
         Err(err) => return Err(CfmsError::Io(err)),
     };
-    if root_meta.file_type().is_symlink() {
+    if is_symlink_or_reparse_point(&root_meta) {
         return Err(CfmsError::Extension(format!(
             "Extension directory '{}' cannot be a symlink or junction",
             extensions_root.display()
@@ -266,6 +411,7 @@ pub fn discover_catalog(extensions_root: &Path) -> Result<ExtensionCatalog> {
         let entry = entry_res?;
         entries.push(entry.path());
     }
+    catalog.root_entry_count = entries.len();
     entries.sort();
 
     let mut seen_dirs: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
@@ -277,7 +423,7 @@ pub fn discover_catalog(extensions_root: &Path) -> Result<ExtensionCatalog> {
             .unwrap_or_default();
 
         let entry_meta = std::fs::symlink_metadata(&entry_path)?;
-        if entry_meta.file_type().is_symlink() {
+        if is_symlink_or_reparse_point(&entry_meta) {
             return Err(CfmsError::Extension(format!(
                 "Extension directory cannot contain symlinks or junctions: '{}'",
                 entry_path.display()
@@ -292,6 +438,13 @@ pub fn discover_catalog(extensions_root: &Path) -> Result<ExtensionCatalog> {
                 target_identifier,
             });
             continue;
+        }
+
+        if !name.is_empty() {
+            catalog
+                .root_entry_names_lower
+                .entry(name.to_ascii_lowercase())
+                .or_insert_with(|| entry_path.clone());
         }
 
         if name.starts_with('_') || name.starts_with('.') || !entry_meta.is_dir() {
@@ -376,10 +529,10 @@ pub fn discover_catalog(extensions_root: &Path) -> Result<ExtensionCatalog> {
     Ok(catalog)
 }
 
-fn symlink_stat_if_present(path: &Path) -> Result<Option<std::fs::Metadata>> {
+pub(crate) fn symlink_stat_if_present(path: &Path) -> Result<Option<std::fs::Metadata>> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
-            if meta.file_type().is_symlink() {
+            if is_symlink_or_reparse_point(&meta) {
                 return Err(CfmsError::Extension(format!(
                     "Extension path cannot be a symlink or junction: '{}'",
                     path.display()
@@ -406,13 +559,29 @@ fn parse_installed_extension(
     }
 
     let raw_str = std::fs::read_to_string(manifest_path)?;
-    let raw_table: toml::Table = toml::from_str(&raw_str).map_err(|e| {
+    parse_extension_manifest_str(&raw_str, manifest_path, dir_path, entrypoint_path)
+}
+
+/// Validate raw `manifest.toml` text into a parsed [`InstalledExtension`].
+pub(crate) fn parse_extension_manifest_str(
+    raw_str: &str,
+    manifest_path: &Path,
+    dir_path: &Path,
+    entrypoint_path: &Path,
+) -> Result<InstalledExtension> {
+    if raw_str.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(CfmsError::Extension(format!(
+            "Manifest '{}' exceeds the 1 MiB safety limit",
+            manifest_path.display()
+        )));
+    }
+    let raw_table: toml::Table = toml::from_str(raw_str).map_err(|e| {
         CfmsError::Extension(format!(
             "Invalid TOML in manifest '{}': {e}",
             manifest_path.display()
         ))
     })?;
-    let parsed: RawExtensionManifest = toml::from_str(&raw_str).map_err(|e| {
+    let parsed: RawExtensionManifest = toml::from_str(raw_str).map_err(|e| {
         CfmsError::Extension(format!(
             "Invalid manifest schema in '{}': {e}",
             manifest_path.display()

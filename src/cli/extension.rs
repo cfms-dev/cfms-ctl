@@ -80,6 +80,10 @@ pub struct ExtensionPackageArgs {
     /// Expected 64-hex-digit SHA-256 digest of the extension package.
     #[arg(long = "sha256")]
     pub sha256: Option<String>,
+
+    /// Preview package inspection, resolved metadata, and planned changes without writing to disk.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -91,6 +95,10 @@ pub struct ExtensionUninstallArgs {
     /// Also purge database options and system states owned by this extension (requires stopped server).
     #[arg(long = "purge-data")]
     pub purge_data: bool,
+
+    /// Preview configuration updates, directory removal, and optional data purge summary without modifying state.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -158,5 +166,57 @@ mod tests {
     fn rejects_extension_enable_without_identifiers() {
         assert!(Cli::try_parse_from(["cfms-ctl", "extension", "enable"]).is_err());
         assert!(Cli::try_parse_from(["cfms-ctl", "extension", "disable"]).is_err());
+    }
+
+    #[test]
+    fn parses_extension_install_upgrade_uninstall_flags() {
+        let install = Cli::try_parse_from([
+            "cfms-ctl",
+            "extension",
+            "install",
+            "pkg.zip",
+            "--sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--dry-run",
+        ])
+        .expect("parse install");
+        match install.command {
+            Commands::Extension(ExtensionCommand::Install(args)) => {
+                assert_eq!(args.package, std::path::PathBuf::from("pkg.zip"));
+                assert!(args.sha256.is_some());
+                assert!(args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let upgrade =
+            Cli::try_parse_from(["cfms-ctl", "extension", "upgrade", "pkg_v2.zip", "--dry-run"])
+                .expect("parse upgrade");
+        match upgrade.command {
+            Commands::Extension(ExtensionCommand::Upgrade(args)) => {
+                assert_eq!(args.package, std::path::PathBuf::from("pkg_v2.zip"));
+                assert!(args.sha256.is_none());
+                assert!(args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let uninstall = Cli::try_parse_from([
+            "cfms-ctl",
+            "extension",
+            "uninstall",
+            "sample_ext",
+            "--purge-data",
+            "--dry-run",
+        ])
+        .expect("parse uninstall");
+        match uninstall.command {
+            Commands::Extension(ExtensionCommand::Uninstall(args)) => {
+                assert_eq!(args.identifier, "sample_ext");
+                assert!(args.purge_data);
+                assert!(args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

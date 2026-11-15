@@ -6,14 +6,17 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use crate::core::{CfmsError, ConfigDocument, Result, WorkspacePaths};
 use crate::ops::extension::catalog::{
     BUILTIN_EXTENSION_ID, CatalogDiagnostic, ExtensionCatalog, InstalledExtension,
-    StagingMarker, ensure_not_retired, read_enabled_config, validate_extension_identifier,
+    MAX_EXTENSION_SCAN_ENTRIES, RESERVED_EXTENSION_IDS, StagingMarker, UninstallTarget,
+    declared_data_module, ensure_not_retired, read_enabled_config, validate_extension_identifier,
 };
+use crate::ops::extension::package::VerifiedExtensionPackage;
 use crate::ops::extension::version::{
     DetectedServerVersion, check_server_compatibility, discover_server_version,
+    parse_pep440_version,
 };
 
 /// Planned `config.toml` update computed in a single pass before confirmation/write.
@@ -102,7 +105,7 @@ pub fn plan_enable(
         resolve_dependency_dfs(
             root,
             catalog,
-            &server,
+            Some(&server),
             &prev_set,
             false,
             &mut visit_state,
@@ -116,7 +119,7 @@ pub fn plan_enable(
         resolve_dependency_dfs(
             root,
             catalog,
-            &server,
+            Some(&server),
             &prev_set,
             true,
             &mut visit_state,
@@ -252,9 +255,560 @@ pub fn plan_disable(
         false,
     )?;
 
-    // Build reverse dependency graph over readable manifests for currently enabled entries.
+    // Build reverse dependency graph and compute transitive closure of dependents to disable.
+    let (next_enabled, removed, cascade_dependents) =
+        compute_disable_closure(catalog, &previous_enabled, &target_set, &mut warnings);
+
+    let changed = next_enabled != previous_enabled;
+    let mut candidate_doc = config_doc.clone();
+    if changed {
+        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, schema_path)?;
+        warnings.extend(schema_warnings);
+    } else if schema_path.is_some() {
+        let schema_warnings = candidate_doc.validate_with_schema(schema_path)?;
+        warnings.extend(schema_warnings);
+    }
+
+    let detected_server = discover_server_version(paths, None).ok().flatten();
+
+    Ok(ExtensionTogglePlan {
+        action: ToggleAction::Disable,
+        targets,
+        changed,
+        previous_enabled,
+        next_enabled,
+        added: Vec::new(),
+        removed,
+        cascade_dependents,
+        already_in_desired_state,
+        removed_uninstalled,
+        reordered_existing: false,
+        server_version: detected_server,
+        warnings,
+        candidate_doc,
+    })
+}
+
+/// Planned local package installation computed before extracting files to disk.
+#[derive(Debug, Clone)]
+pub struct ExtensionInstallPlan {
+    pub identifier: String,
+    pub display_name: String,
+    pub version: String,
+    pub target_directory: PathBuf,
+    pub package_sha256: String,
+    pub server_version: Option<DetectedServerVersion>,
+    pub warnings: Vec<String>,
+}
+
+/// Planned third-party extension upgrade computed before swapping directories or updating config.
+#[derive(Debug, Clone)]
+pub struct ExtensionUpgradePlan {
+    pub identifier: String,
+    pub display_name: String,
+    pub previous_version: String,
+    pub version: String,
+    pub target_directory: PathBuf,
+    pub package_sha256: String,
+    pub was_enabled: bool,
+    pub next_enabled: Vec<String>,
+    pub auto_enabled: Vec<String>,
+    pub config_changed: bool,
+    pub candidate_doc: ConfigDocument,
+    pub server_version: Option<DetectedServerVersion>,
+    pub warnings: Vec<String>,
+}
+
+/// Planned extension uninstallation (healthy or broken directory) computed before mutation.
+#[derive(Debug, Clone)]
+pub struct ExtensionUninstallPlan {
+    pub identifier: String,
+    pub display_name: Option<String>,
+    pub version: Option<String>,
+    pub target_directory: PathBuf,
+    pub entrypoint_path: PathBuf,
+    pub broken_target: bool,
+    pub data_module: Option<String>,
+    pub purge_data: bool,
+    pub disabled_extensions: Vec<String>,
+    pub cascade_dependents: Vec<String>,
+    pub config_changed: bool,
+    pub candidate_doc: ConfigDocument,
+    pub warnings: Vec<String>,
+}
+
+/// Plan `cfms-ctl extension install <PACKAGE>` against the catalog, release ownership, and config.
+pub fn plan_install(
+    package: &VerifiedExtensionPackage,
+    catalog: &ExtensionCatalog,
+    config_doc: &ConfigDocument,
+    paths: &WorkspacePaths,
+    managed_extensions: &BTreeSet<String>,
+) -> Result<ExtensionInstallPlan> {
+    let manifest = &package.manifest;
+    let id = &manifest.identifier;
+    validate_extension_identifier(id)?;
+    ensure_not_retired(id)?;
+
+    if id == BUILTIN_EXTENSION_ID
+        || RESERVED_EXTENSION_IDS.contains(&id.as_str())
+        || managed_extensions.contains(id)
+    {
+        return Err(CfmsError::Extension(format!(
+            "Extension '{id}' is managed by the CFMS server release and cannot be installed separately"
+        )));
+    }
+
+    if let Some(dirs) = catalog.conflicted_identifiers.get(id) {
+        let joined = dirs
+            .iter()
+            .map(|p| format!("'{}'", p.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CfmsError::Extension(format!(
+            "Extension '{id}' already has conflicting installations on disk: {joined}"
+        )));
+    }
+    if let Some(existing) = catalog.extensions.get(id) {
+        return Err(CfmsError::Extension(format!(
+            "Extension '{id}' (version {}) is already installed at '{}'; use `cfms-ctl extension upgrade` instead",
+            existing.raw.extension.version,
+            existing.directory.display()
+        )));
+    }
+    if let Some(diag) = catalog.diagnostic_for(id) {
+        return Err(CfmsError::Extension(format!(
+            "Extension '{id}' has an existing broken directory at '{}' ({}); uninstall or remove it before installing",
+            diag.directory.display(),
+            diag.message
+        )));
+    }
+
+    if let Some(collision) = catalog
+        .root_entry_names_lower
+        .get(&id.to_ascii_lowercase())
+    {
+        return Err(CfmsError::Extension(format!(
+            "Cannot install extension '{id}': conflicting entry '{}' already exists under '{}'",
+            collision.display(),
+            catalog.extensions_root.display()
+        )));
+    }
+
+    if catalog.root_entry_count >= MAX_EXTENSION_SCAN_ENTRIES {
+        return Err(CfmsError::Extension(format!(
+            "Extension directory '{}' already has {MAX_EXTENSION_SCAN_ENTRIES} entries",
+            catalog.extensions_root.display()
+        )));
+    }
+
+    let mut warnings = Vec::new();
+    let target_set = BTreeSet::from([id.clone()]);
+    check_scoped_staging_markers(
+        &catalog.staging_markers,
+        &target_set,
+        &target_set,
+        &mut warnings,
+        true,
+    )?;
+
+    if let Ok(enabled_state) = read_enabled_config(config_doc, true)
+        && enabled_state.entries.iter().any(|entry| entry == id)
+    {
+        warnings.push(format!(
+            "Extension '{id}' is already listed in '{}' [extensions].enabled; verify compatibility and re-run `cfms-ctl extension enable {id}` or restart cautiously",
+            paths.config_path.display()
+        ));
+    }
+
+    let server_version = discover_server_version(paths, None)?;
+    collect_manifest_advisories(
+        manifest,
+        catalog,
+        server_version.as_ref(),
+        &mut warnings,
+    );
+
+    Ok(ExtensionInstallPlan {
+        identifier: id.clone(),
+        display_name: manifest.display_name.clone(),
+        version: manifest.raw.extension.version.clone(),
+        target_directory: catalog.extensions_root.join(id),
+        package_sha256: package.package_sha256.clone(),
+        server_version,
+        warnings,
+    })
+}
+
+/// Plan `cfms-ctl extension upgrade <PACKAGE>` against the installed catalog, enabled graph,
+/// server compatibility, and existing dependents.
+pub fn plan_upgrade(
+    package: &VerifiedExtensionPackage,
+    catalog: &ExtensionCatalog,
+    config_doc: &ConfigDocument,
+    paths: &WorkspacePaths,
+    managed_extensions: &BTreeSet<String>,
+    schema_path: Option<&Path>,
+) -> Result<ExtensionUpgradePlan> {
+    let new_manifest = &package.manifest;
+    let id = &new_manifest.identifier;
+    validate_extension_identifier(id)?;
+    ensure_not_retired(id)?;
+
+    if id == BUILTIN_EXTENSION_ID
+        || RESERVED_EXTENSION_IDS.contains(&id.as_str())
+        || managed_extensions.contains(id)
+    {
+        return Err(CfmsError::Extension(format!(
+            "Extension '{id}' is managed by the CFMS server release and cannot be upgraded via package install; upgrade the CFMS server deployment instead"
+        )));
+    }
+
+    if let Some(dirs) = catalog.conflicted_identifiers.get(id) {
+        let joined = dirs
+            .iter()
+            .map(|p| format!("'{}'", p.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CfmsError::Extension(format!(
+            "Extension '{id}' has duplicate definitions in {joined}; resolve duplicates before upgrading"
+        )));
+    }
+
+    let installed = match catalog.extensions.get(id) {
+        Some(ext) => ext,
+        None => {
+            if let Some(diag) = catalog.diagnostic_for(id) {
+                return Err(CfmsError::Extension(format!(
+                    "Installed extension '{id}' at '{}' is broken ({}) and cannot be version-compared; uninstall it first and run `install` instead",
+                    diag.directory.display(),
+                    diag.message
+                )));
+            }
+            return Err(CfmsError::Extension(format!(
+                "Extension '{id}' is not installed under '{}'; use `cfms-ctl extension install` instead",
+                catalog.extensions_root.display()
+            )));
+        }
+    };
+
+    let old_ver_str = &installed.raw.extension.version;
+    let new_ver_str = &new_manifest.raw.extension.version;
+    let old_pep440 = installed
+        .pep440_version
+        .clone()
+        .or_else(|| parse_pep440_version(old_ver_str).ok())
+        .ok_or_else(|| {
+            CfmsError::Extension(format!(
+                "Installed extension '{id}' version '{old_ver_str}' is not valid PEP 440; cannot verify upgrade ordering"
+            ))
+        })?;
+    let new_pep440 = new_manifest
+        .pep440_version
+        .clone()
+        .or_else(|| parse_pep440_version(new_ver_str).ok())
+        .ok_or_else(|| {
+            CfmsError::Extension(format!(
+                "Package extension '{id}' version '{new_ver_str}' is not valid PEP 440"
+            ))
+        })?;
+
+    if new_pep440 <= old_pep440 {
+        return Err(CfmsError::Extension(format!(
+            "Extension '{id}' upgrade requires a strictly newer version than installed '{old_ver_str}' (package is '{new_ver_str}')"
+        )));
+    }
+
+    let enabled_state = read_enabled_config(config_doc, true)?;
+    let previous_enabled = enabled_state.entries;
+    let prev_set: BTreeSet<String> = previous_enabled.iter().cloned().collect();
+    let was_enabled = prev_set.contains(id);
+
+    let mut warnings = Vec::new();
+
+    // Reverse-dependent constraint verification: never silently break currently enabled dependents.
+    for (sib_id, sib_ext) in &catalog.extensions {
+        if sib_id == id {
+            continue;
+        }
+        if let Some(parsed_dep) = sib_ext.dependencies.get(id)
+            && !parsed_dep.constraint.matches(&new_pep440)
+        {
+            if prev_set.contains(sib_id) {
+                return Err(CfmsError::Extension(format!(
+                    "Cannot upgrade '{id}' to '{new_ver_str}': enabled extension '{sib_id}' requires '{id}' {}",
+                    parsed_dep.constraint.requirement_summary()
+                )));
+            }
+            warnings.push(format!(
+                "Disabled extension '{sib_id}' requires '{id}' {}, which will not match upgraded version '{new_ver_str}'",
+                parsed_dep.constraint.requirement_summary()
+            ));
+        }
+    }
+
+    // Simulate the upgraded catalog to validate dependency closure and server compatibility.
+    let mut future_catalog = catalog.clone();
+    future_catalog
+        .extensions
+        .insert(id.clone(), new_manifest.clone());
+
+    let server_version = discover_server_version(paths, None)?;
+    let mut next_enabled = previous_enabled.clone();
+    let mut auto_enabled = Vec::new();
+
+    if was_enabled {
+        let mut closure_targets = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut active_closure = BTreeSet::new();
+        let mut visit_state: HashMap<String, DfsMark> = HashMap::new();
+        let mut dfs_stack = Vec::new();
+
+        // Check server compatibility if detectable; fail only when bounds require verification and none was found.
+        if let Some(server) = server_version.as_ref() {
+            resolve_dependency_dfs(
+                id,
+                &future_catalog,
+                Some(server),
+                &prev_set,
+                true,
+                &mut visit_state,
+                &mut dfs_stack,
+                &mut visited,
+                &mut active_closure,
+                Some(&mut closure_targets),
+            )?;
+        } else {
+            resolve_dependency_dfs(
+                id,
+                &future_catalog,
+                None,
+                &prev_set,
+                true,
+                &mut visit_state,
+                &mut dfs_stack,
+                &mut visited,
+                &mut active_closure,
+                Some(&mut closure_targets),
+            )?;
+            let needs_server_check = active_closure.iter().any(|ext_id| {
+                future_catalog.extensions.get(ext_id).is_some_and(|e| {
+                    e.minimum_server_version.is_some() || e.maximum_server_version.is_some()
+                })
+            });
+            if needs_server_check {
+                return Err(CfmsError::Extension(
+                    "Unable to determine target CFMS server version from release-manifest.json, include/config/constants.py, or pyproject.toml to verify upgraded extension compatibility"
+                        .to_string(),
+                ));
+            }
+            warnings.push(
+                "Unable to detect CFMS server version; skipped compatibility check because upgraded closure declares no server version bounds"
+                    .to_string(),
+            );
+        }
+
+        let newly_added: Vec<String> = closure_targets
+            .into_iter()
+            .filter(|dep| !prev_set.contains(dep))
+            .collect();
+
+        if !newly_added.is_empty() {
+            let mut priority_order = previous_enabled.clone();
+            priority_order.extend(newly_added);
+            next_enabled = topo_sort_preserving_priority(&future_catalog, &priority_order);
+            auto_enabled = next_enabled
+                .iter()
+                .filter(|item| !prev_set.contains(*item))
+                .cloned()
+                .collect();
+        }
+    } else {
+        collect_manifest_advisories(
+            new_manifest,
+            &future_catalog,
+            server_version.as_ref(),
+            &mut warnings,
+        );
+    }
+
+    let direct_set = BTreeSet::from([id.clone()]);
+    let mut affected_set = direct_set.clone();
+    affected_set.extend(auto_enabled.iter().cloned());
+    check_scoped_staging_markers(
+        &catalog.staging_markers,
+        &affected_set,
+        &direct_set,
+        &mut warnings,
+        true,
+    )?;
+
+    let config_changed = next_enabled != previous_enabled;
+    let mut candidate_doc = config_doc.clone();
+    if config_changed {
+        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, schema_path)?;
+        warnings.extend(schema_warnings);
+    }
+
+    Ok(ExtensionUpgradePlan {
+        identifier: id.clone(),
+        display_name: new_manifest.display_name.clone(),
+        previous_version: old_ver_str.clone(),
+        version: new_ver_str.clone(),
+        target_directory: installed.directory.clone(),
+        package_sha256: package.package_sha256.clone(),
+        was_enabled,
+        next_enabled,
+        auto_enabled,
+        config_changed,
+        candidate_doc,
+        server_version,
+        warnings,
+    })
+}
+
+/// Plan `cfms-ctl extension uninstall <IDENTIFIER>` (supporting broken diagnostic targets).
+pub fn plan_uninstall(
+    identifier: &str,
+    purge_data: bool,
+    catalog: &ExtensionCatalog,
+    config_doc: &ConfigDocument,
+    managed_extensions: &BTreeSet<String>,
+    schema_path: Option<&Path>,
+) -> Result<ExtensionUninstallPlan> {
+    validate_extension_identifier(identifier)?;
+
+    if identifier == BUILTIN_EXTENSION_ID
+        || RESERVED_EXTENSION_IDS.contains(&identifier)
+        || managed_extensions.contains(identifier)
+    {
+        return Err(CfmsError::Extension(format!(
+            "Extension '{identifier}' is managed by the CFMS server release and cannot be uninstalled"
+        )));
+    }
+
+    let resolved = catalog.resolve_uninstall_target(identifier)?;
+    let (target_directory, entrypoint_path, display_name, version, broken_target, data_module) =
+        match resolved {
+            UninstallTarget::Installed(ext) => (
+                ext.directory.clone(),
+                ext.entrypoint.clone(),
+                Some(ext.display_name.clone()),
+                Some(ext.raw.extension.version.clone()),
+                false,
+                declared_data_module(&ext.raw).map(ToString::to_string),
+            ),
+            UninstallTarget::Broken(diag) => (
+                diag.directory.clone(),
+                diag.directory.join(crate::ops::extension::catalog::ENTRYPOINT_FILENAME),
+                None,
+                None,
+                true,
+                None,
+            ),
+        };
+
+    let enabled_state = read_enabled_config(config_doc, true)?;
+    let previous_enabled = enabled_state.entries;
+    let target_set = BTreeSet::from([identifier.to_string()]);
+    let mut warnings = Vec::new();
+    if broken_target {
+        warnings.push(format!(
+            "Target extension directory '{}' failed normal manifest/entrypoint loading; proceeding with cleanup uninstall",
+            target_directory.display()
+        ));
+    }
+
+    let (next_enabled, disabled_extensions, cascade_dependents) =
+        compute_disable_closure(catalog, &previous_enabled, &target_set, &mut warnings);
+
+    let mut affected_set = target_set.clone();
+    affected_set.extend(disabled_extensions.iter().cloned());
+    check_scoped_staging_markers(
+        &catalog.staging_markers,
+        &affected_set,
+        &target_set,
+        &mut warnings,
+        true,
+    )?;
+
+    let config_changed = next_enabled != previous_enabled;
+    let mut candidate_doc = config_doc.clone();
+    if config_changed {
+        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, schema_path)?;
+        warnings.extend(schema_warnings);
+    }
+
+    Ok(ExtensionUninstallPlan {
+        identifier: identifier.to_string(),
+        display_name,
+        version,
+        target_directory,
+        entrypoint_path,
+        broken_target,
+        data_module,
+        purge_data,
+        disabled_extensions,
+        cascade_dependents,
+        config_changed,
+        candidate_doc,
+        warnings,
+    })
+}
+
+fn collect_manifest_advisories(
+    ext: &InstalledExtension,
+    catalog: &ExtensionCatalog,
+    server: Option<&DetectedServerVersion>,
+    warnings: &mut Vec<String>,
+) {
+    if let Some(sv) = server
+        && let Err(reason) = check_server_compatibility(
+            &sv.version,
+            ext.minimum_server_version.as_ref(),
+            ext.maximum_server_version.as_ref(),
+        )
+    {
+        warnings.push(format!("Server compatibility notice: '{}' {reason}", ext.identifier));
+    }
+
+    for (dep_id, parsed_dep) in &ext.dependencies {
+        if let Some(dep_ext) = catalog.extensions.get(dep_id) {
+            if let Some(dep_ver) = dep_ext.pep440_version.as_ref() {
+                if !parsed_dep.constraint.matches(dep_ver) {
+                    warnings.push(format!(
+                        "Dependency notice: '{}' requires '{dep_id}' {}, installed is '{}'",
+                        ext.identifier,
+                        parsed_dep.constraint.requirement_summary(),
+                        dep_ext.raw.extension.version
+                    ));
+                }
+            } else {
+                warnings.push(format!(
+                    "Dependency notice: installed '{dep_id}' has non-PEP-440 version '{}'",
+                    dep_ext.raw.extension.version
+                ));
+            }
+        } else {
+            warnings.push(format!(
+                "Dependency notice: '{}' requires '{dep_id}' {}, which is not currently installed",
+                ext.identifier,
+                parsed_dep.constraint.requirement_summary()
+            ));
+        }
+    }
+}
+
+fn compute_disable_closure(
+    catalog: &ExtensionCatalog,
+    previous_enabled: &[String],
+    target_set: &BTreeSet<String>,
+    warnings: &mut Vec<String>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let prev_set: BTreeSet<String> = previous_enabled.iter().cloned().collect();
     let mut reverse_deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for enabled_id in &previous_enabled {
+
+    for enabled_id in previous_enabled {
         if let Some(ext) = catalog.extensions.get(enabled_id) {
             for dep_id in ext.dependencies.keys() {
                 if prev_set.contains(dep_id) {
@@ -276,10 +830,9 @@ pub fn plan_disable(
         }
     }
 
-    // Collect targets + transitive enabled dependents.
     let mut remove_set = BTreeSet::new();
     let mut queue = VecDeque::new();
-    for id in &targets {
+    for id in target_set {
         if prev_set.contains(id) && remove_set.insert(id.clone()) {
             queue.push_back(id.clone());
         }
@@ -310,34 +863,7 @@ pub fn plan_disable(
         .cloned()
         .collect();
 
-    let changed = next_enabled != previous_enabled;
-    let mut candidate_doc = config_doc.clone();
-    if changed {
-        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, schema_path)?;
-        warnings.extend(schema_warnings);
-    } else if schema_path.is_some() {
-        let schema_warnings = candidate_doc.validate_with_schema(schema_path)?;
-        warnings.extend(schema_warnings);
-    }
-
-    let detected_server = discover_server_version(paths, None).ok().flatten();
-
-    Ok(ExtensionTogglePlan {
-        action: ToggleAction::Disable,
-        targets,
-        changed,
-        previous_enabled,
-        next_enabled,
-        added: Vec::new(),
-        removed,
-        cascade_dependents,
-        already_in_desired_state,
-        removed_uninstalled,
-        reordered_existing: false,
-        server_version: detected_server,
-        warnings,
-        candidate_doc,
-    })
+    (next_enabled, removed, cascade_dependents)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,7 +935,7 @@ fn check_extension_server_compat(
 fn resolve_dependency_dfs(
     id: &str,
     catalog: &ExtensionCatalog,
-    server: &DetectedServerVersion,
+    server: Option<&DetectedServerVersion>,
     prev_set: &BTreeSet<String>,
     record_target_postorder: bool,
     visit_state: &mut HashMap<String, DfsMark>,
@@ -448,7 +974,9 @@ fn resolve_dependency_dfs(
         None
     };
     let ext = ensure_usable_extension(catalog, id, context_note.as_deref())?;
-    check_extension_server_compat(ext, server)?;
+    if let Some(sv) = server {
+        check_extension_server_compat(ext, sv)?;
+    }
 
     visit_state.insert(id.to_string(), DfsMark::Visiting);
     dfs_stack.push(id.to_string());
@@ -867,5 +1395,105 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("Ignoring unrelated staging artifact"))
         );
+    }
+
+    #[test]
+    fn upgrade_blocks_breaking_enabled_dependents_and_enforces_server_max_version() {
+        let (_dir, paths) = setup_workspace("0.15.0", "[extensions]\nenabled = [\"dep_ext\", \"app_ext\"]\n");
+        let ext_root = &paths.extensions_root;
+
+        write_manifest_ext(
+            ext_root,
+            "dep_ext",
+            "manifest_version = 3\n[extension]\nidentifier = \"dep_ext\"\nname = \"Dep\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+        );
+        write_manifest_ext(
+            ext_root,
+            "app_ext",
+            "manifest_version = 3\n[extension]\nidentifier = \"app_ext\"\nname = \"App\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n[dependencies.extensions]\ndep_ext = \">=1.0.0,<2.0.0\"\n",
+        );
+
+        let catalog = discover_catalog(ext_root).expect("catalog");
+        let doc = ConfigDocument::load(&paths.config_path).expect("config");
+        let managed = BTreeSet::from(["builtin".to_string()]);
+
+        let dep_v2_manifest = crate::ops::extension::catalog::parse_extension_manifest_str(
+            "manifest_version = 3\n[extension]\nidentifier = \"dep_ext\"\nname = \"Dep\"\nversion = \"2.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+            Path::new("pkg/manifest.toml"),
+            Path::new("pkg"),
+            Path::new("pkg/_extension.py"),
+        )
+        .expect("parse v2");
+        let dep_v2_pkg = VerifiedExtensionPackage {
+            package_path: PathBuf::from("dep-2.0.0.zip"),
+            package_sha256: "a".repeat(64),
+            manifest: dep_v2_manifest,
+            member_count: 2,
+            declared_uncompressed_bytes: 64,
+        };
+
+        let break_err = plan_upgrade(&dep_v2_pkg, &catalog, &doc, &paths, &managed, None)
+            .expect_err("upgrading dep_ext to 2.0.0 breaks enabled app_ext");
+        assert!(break_err.to_string().contains("app_ext"));
+
+        let max_ver_manifest = crate::ops::extension::catalog::parse_extension_manifest_str(
+            "manifest_version = 3\n[extension]\nidentifier = \"app_ext\"\nname = \"App\"\nversion = \"2.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n[compatibility]\nmaximum_server_version = \"0.14.9\"\n",
+            Path::new("pkg/manifest.toml"),
+            Path::new("pkg"),
+            Path::new("pkg/_extension.py"),
+        )
+        .expect("parse app v2");
+        let max_ver_pkg = VerifiedExtensionPackage {
+            package_path: PathBuf::from("app-2.0.0.zip"),
+            package_sha256: "b".repeat(64),
+            manifest: max_ver_manifest,
+            member_count: 2,
+            declared_uncompressed_bytes: 64,
+        };
+
+        let compat_err = plan_upgrade(&max_ver_pkg, &catalog, &doc, &paths, &managed, None)
+            .expect_err("server 0.15.0 exceeds maximum_server_version 0.14.9");
+        assert!(compat_err.to_string().contains("0.14.9"));
+    }
+
+    #[test]
+    fn uninstall_resolves_broken_diagnostics_and_blocks_managed_extensions() {
+        let (dir, paths) = setup_workspace("0.14.0", "[extensions]\nenabled = [\"broken_ext\"]\n");
+        let ext_root = &paths.extensions_root;
+
+        // Create broken directory missing `_extension.py` but with valid manifest identifier hint.
+        let broken_dir = ext_root.join("broken_dir_on_disk");
+        std::fs::create_dir_all(&broken_dir).expect("mkdir broken");
+        std::fs::write(
+            broken_dir.join("manifest.toml"),
+            "manifest_version = 2\n[extension]\nidentifier = \"broken_ext\"\nname = \"Broken\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            dir.path().join("release-manifest.json"),
+            r#"{"version":"0.14.0","managed_extensions":["oidc_sso"]}"#,
+        )
+        .expect("write release manifest");
+        write_manifest_ext(
+            ext_root,
+            "oidc_sso",
+            "manifest_version = 2\n[extension]\nidentifier = \"oidc_sso\"\nname = \"OIDC\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+        );
+
+        let catalog = discover_catalog(ext_root).expect("catalog");
+        let doc = ConfigDocument::load(&paths.config_path).expect("config");
+        let managed = crate::ops::extension::catalog::read_managed_extensions(&paths).expect("managed");
+        assert!(managed.contains("oidc_sso"));
+
+        let managed_err = plan_uninstall("oidc_sso", false, &catalog, &doc, &managed, None)
+            .expect_err("managed extension cannot be uninstalled");
+        assert!(managed_err.to_string().contains("managed"));
+
+        let uninstall_plan = plan_uninstall("broken_ext", false, &catalog, &doc, &managed, None)
+            .expect("broken target uninstall planned");
+        assert!(uninstall_plan.broken_target);
+        assert_eq!(uninstall_plan.target_directory, broken_dir);
+        assert!(uninstall_plan.config_changed);
+        assert_eq!(uninstall_plan.disabled_extensions, vec!["broken_ext"]);
     }
 }

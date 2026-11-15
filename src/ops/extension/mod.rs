@@ -2,7 +2,9 @@
 //! management for built-in and third-party CFMS server extensions.
 
 pub mod catalog;
+pub mod package;
 pub mod planner;
+pub mod purge;
 pub mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,14 +14,22 @@ use crate::cli::extension::{
     ExtensionCommand, ExtensionDisableArgs, ExtensionEnableArgs, ExtensionIdentifierArgs,
     ExtensionPackageArgs, ExtensionPurgeDataArgs, ExtensionUninstallArgs,
 };
+use crate::core::atomic::atomic_write;
 use crate::core::{CfmsError, Result, RuntimeLock, WorkspacePaths};
 use crate::ops::AppContext;
 use crate::ui::{CommandReport, KeyValueTable, OutputFormat, UiConsole, confirm_or_abort, styled_table};
 use catalog::{
     CatalogDiagnostic, ExtensionCatalog, InstalledExtension, discover_catalog, read_enabled_config,
-    validate_extension_identifier,
+    read_managed_extensions, validate_extension_identifier,
 };
-use planner::{ExtensionTogglePlan, plan_disable, plan_enable};
+use package::{
+    ActiveUninstallRollback, ActiveUpgradeRollback, OpenedExtensionPackage, TRUSTED_CODE_NOTICE,
+    commit_install_directory,
+};
+use planner::{
+    ExtensionTogglePlan, plan_disable, plan_enable, plan_install, plan_uninstall, plan_upgrade,
+};
+use purge::{ExtensionPurgeSummary, execute_extension_purge, preview_extension_purge};
 use version::{CfmsServerVersion, check_server_compatibility, discover_server_version};
 
 pub use catalog::{
@@ -75,6 +85,65 @@ pub struct ExtensionToggleReport {
     pub reordered_existing: bool,
     pub previous_enabled: Vec<String>,
     pub enabled: Vec<String>,
+    pub restart_required: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Report for `cfms-ctl extension install`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtensionInstallReport {
+    pub identifier: String,
+    pub display_name: String,
+    pub version: String,
+    pub directory: String,
+    pub package_path: String,
+    pub package_sha256: String,
+    pub enabled: bool,
+    pub dry_run: bool,
+    pub applied: bool,
+    pub restart_required: bool,
+    pub trusted_code_notice: String,
+    pub warnings: Vec<String>,
+}
+
+/// Report for `cfms-ctl extension upgrade`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtensionUpgradeReport {
+    pub identifier: String,
+    pub display_name: String,
+    pub previous_version: String,
+    pub version: String,
+    pub directory: String,
+    pub package_path: String,
+    pub package_sha256: String,
+    pub was_enabled: bool,
+    pub enabled: Vec<String>,
+    pub auto_enabled: Vec<String>,
+    pub config_changed: bool,
+    pub backup_path: Option<String>,
+    pub dry_run: bool,
+    pub applied: bool,
+    pub restart_required: bool,
+    pub trusted_code_notice: String,
+    pub warnings: Vec<String>,
+}
+
+/// Report for `cfms-ctl extension uninstall`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtensionUninstallReport {
+    pub identifier: String,
+    pub display_name: Option<String>,
+    pub version: Option<String>,
+    pub directory: String,
+    pub broken_target: bool,
+    pub purge_data: bool,
+    pub purge_summary: Option<ExtensionPurgeSummary>,
+    pub disabled_extensions: Vec<String>,
+    pub cascade_dependents: Vec<String>,
+    pub config_changed: bool,
+    pub backup_path: Option<String>,
+    pub dry_run: bool,
+    pub applied: bool,
     pub restart_required: bool,
     pub warnings: Vec<String>,
 }
@@ -309,17 +378,152 @@ impl CommandReport for ExtensionToggleReport {
     }
 }
 
+impl CommandReport for ExtensionInstallReport {
+    fn render_human(&self, ui: &UiConsole) {
+        ui.print_section(&format!("Install Extension ({})", self.identifier));
+        let mut kv = KeyValueTable::new("Extension Install");
+        kv.row("Identifier", &self.identifier)
+            .row("Display Name", &self.display_name)
+            .row("Version", &self.version)
+            .row("Package", &self.package_path)
+            .row("Package SHA-256", &self.package_sha256)
+            .row("Target Directory", &self.directory)
+            .row("Enabled By Default", if self.enabled { "yes" } else { "no" })
+            .row("Dry Run", if self.dry_run { "yes" } else { "no" })
+            .row("Applied", if self.applied { "yes" } else { "no" });
+        kv.print();
+
+        println!("Notice: {}", self.trusted_code_notice);
+        for warning in &self.warnings {
+            ui.print_warning(warning);
+        }
+
+        if self.applied {
+            ui.print_success(&format!(
+                "Installed extension '{}' ({}) into '{}' (disabled). Enable with `cfms-ctl extension enable {}`.",
+                self.identifier, self.version, self.directory, self.identifier
+            ));
+            if self.restart_required {
+                ui.print_warning(
+                    "CFMS server appears to be running (server.lock is held). Restart the server after enabling.",
+                );
+            }
+        } else if self.dry_run {
+            ui.print_warning("Dry-run mode active: no files were extracted.");
+        }
+    }
+}
+
+impl CommandReport for ExtensionUpgradeReport {
+    fn render_human(&self, ui: &UiConsole) {
+        ui.print_section(&format!("Upgrade Extension ({})", self.identifier));
+        let mut kv = KeyValueTable::new("Extension Upgrade");
+        kv.row("Identifier", &self.identifier)
+            .row("Display Name", &self.display_name)
+            .row(
+                "Version Change",
+                format!("{} -> {}", self.previous_version, self.version),
+            )
+            .row("Directory", &self.directory)
+            .row("Package", &self.package_path)
+            .row("Package SHA-256", &self.package_sha256)
+            .row("Currently Enabled", if self.was_enabled { "yes" } else { "no" })
+            .row("Auto-Enabled Dependencies", format_enabled_list(&self.auto_enabled))
+            .row("Resulting Enabled List", format_enabled_list(&self.enabled))
+            .row("Config Changed", if self.config_changed { "yes" } else { "no" })
+            .row("Backup Path", self.backup_path.as_deref().unwrap_or("(none)"))
+            .row("Dry Run", if self.dry_run { "yes" } else { "no" })
+            .row("Applied", if self.applied { "yes" } else { "no" });
+        kv.print();
+
+        println!("Notice: {}", self.trusted_code_notice);
+        for warning in &self.warnings {
+            ui.print_warning(warning);
+        }
+
+        if self.applied {
+            ui.print_success(&format!(
+                "Upgraded extension '{}' from {} to {} at '{}'.",
+                self.identifier, self.previous_version, self.version, self.directory
+            ));
+            if self.restart_required {
+                ui.print_warning(
+                    "CFMS server appears to be running (server.lock is held). Restart the server for upgraded code to take effect.",
+                );
+            }
+        } else if self.dry_run {
+            ui.print_warning("Dry-run mode active: no files or config were modified.");
+        }
+    }
+}
+
+impl CommandReport for ExtensionUninstallReport {
+    fn render_human(&self, ui: &UiConsole) {
+        ui.print_section(&format!("Uninstall Extension ({})", self.identifier));
+        let mut kv = KeyValueTable::new("Extension Uninstall");
+        kv.row("Identifier", &self.identifier)
+            .row(
+                "Display Name",
+                self.display_name.as_deref().unwrap_or("(unavailable - broken extension)"),
+            )
+            .row(
+                "Installed Version",
+                self.version.as_deref().unwrap_or("(unavailable)"),
+            )
+            .row("Directory", &self.directory)
+            .row("Broken Target", if self.broken_target { "yes" } else { "no" })
+            .row(
+                "Disabled Extensions",
+                format_enabled_list(&self.disabled_extensions),
+            )
+            .row(
+                "Cascade Disabled Dependents",
+                format_enabled_list(&self.cascade_dependents),
+            )
+            .row("Config Changed", if self.config_changed { "yes" } else { "no" })
+            .row("Backup Path", self.backup_path.as_deref().unwrap_or("(none)"))
+            .row("Purge Data", if self.purge_data { "yes" } else { "no" });
+        if let Some(purge) = &self.purge_summary {
+            kv.row("Option Rows", purge.option_entries_deleted.to_string())
+                .row("State Rows", purge.state_entries_deleted.to_string())
+                .row(
+                    "Python Hook Executed",
+                    if purge.python_hook_executed { "yes" } else { "no" },
+                );
+        }
+        kv.row("Dry Run", if self.dry_run { "yes" } else { "no" })
+            .row("Applied", if self.applied { "yes" } else { "no" });
+        kv.print();
+
+        for warning in &self.warnings {
+            ui.print_warning(warning);
+        }
+
+        if self.applied {
+            ui.print_success(&format!(
+                "Uninstalled extension '{}' from '{}'.",
+                self.identifier, self.directory
+            ));
+            if self.restart_required {
+                ui.print_warning(
+                    "CFMS server appears to be running (server.lock is held). Restart the server to unload removed extension code.",
+                );
+            }
+        } else if self.dry_run {
+            ui.print_warning("Dry-run mode active: no files, config, or database data were modified.");
+        }
+    }
+}
+
 pub async fn handle(ctx: &AppContext, cmd: ExtensionCommand) -> Result<()> {
     match cmd {
         ExtensionCommand::List => handle_list(ctx),
         ExtensionCommand::Info(args) => handle_info(ctx, args),
         ExtensionCommand::Enable(args) => handle_enable(ctx, args),
         ExtensionCommand::Disable(args) => handle_disable(ctx, args),
-        ExtensionCommand::Install(_args) => Err(CfmsError::NotImplementedYet("extension install")),
-        ExtensionCommand::Upgrade(_args) => Err(CfmsError::NotImplementedYet("extension upgrade")),
-        ExtensionCommand::Uninstall(_args) => {
-            Err(CfmsError::NotImplementedYet("extension uninstall"))
-        }
+        ExtensionCommand::Install(args) => handle_install(ctx, args),
+        ExtensionCommand::Upgrade(args) => handle_upgrade(ctx, args),
+        ExtensionCommand::Uninstall(args) => handle_uninstall(ctx, args).await,
         ExtensionCommand::PurgeData(_args) => {
             Err(CfmsError::NotImplementedYet("extension purge-data"))
         }
@@ -471,6 +675,35 @@ fn execute_toggle_plan(
         return Ok(());
     }
 
+    let prompt = format!(
+        "Back up '{}' and apply extension {} change?",
+        paths.config_path.display(),
+        report.action
+    );
+    if !confirm_or_dry_run(ctx, &report, dry_run, &prompt)? {
+        return Ok(());
+    }
+
+    let backup_path = plan.candidate_doc.save_with_backup()?;
+    report.backup_path = Some(backup_path.display().to_string());
+    report.applied = true;
+    report.restart_required = RuntimeLock::is_locked(paths);
+
+    ctx.ui.render(&report);
+    Ok(())
+}
+
+fn confirm_or_dry_run<R: CommandReport>(
+    ctx: &AppContext,
+    report: &R,
+    dry_run: bool,
+    prompt: &str,
+) -> Result<bool> {
+    if dry_run {
+        ctx.ui.render(report);
+        return Ok(false);
+    }
+
     if ctx.ui.format() == OutputFormat::Json && !ctx.global.yes {
         return Err(CfmsError::InvalidArgument(
             "Refusing interactive confirmation in JSON output mode; pass --yes to apply or --dry-run to preview"
@@ -482,17 +715,247 @@ fn execute_toggle_plan(
         report.render_human(&ctx.ui);
     }
 
-    let prompt = format!(
-        "Back up '{}' and apply extension {} change?",
-        paths.config_path.display(),
-        report.action
-    );
-    confirm_or_abort(&prompt, ctx.global.yes)?;
+    confirm_or_abort(prompt, ctx.global.yes)?;
+    Ok(true)
+}
 
-    let backup_path = plan.candidate_doc.save_with_backup()?;
-    report.backup_path = Some(backup_path.display().to_string());
+fn handle_install(ctx: &AppContext, args: ExtensionPackageArgs) -> Result<()> {
+    let paths = ctx.resolve_paths()?;
+    let config_doc = ctx.load_config(&paths)?;
+    let catalog = discover_catalog(&paths.extensions_root)?;
+    let managed = read_managed_extensions(&paths)?;
+
+    let mut opened = OpenedExtensionPackage::open_and_verify(&args.package, args.sha256.as_deref())?;
+    let plan = plan_install(&opened.summary, &catalog, &config_doc, &paths, &managed)?;
+
+    let mut report = ExtensionInstallReport {
+        identifier: plan.identifier.clone(),
+        display_name: plan.display_name.clone(),
+        version: plan.version.clone(),
+        directory: plan.target_directory.display().to_string(),
+        package_path: args.package.display().to_string(),
+        package_sha256: plan.package_sha256.clone(),
+        enabled: false,
+        dry_run: args.dry_run,
+        applied: false,
+        restart_required: false,
+        trusted_code_notice: TRUSTED_CODE_NOTICE.to_string(),
+        warnings: plan.warnings.clone(),
+    };
+
+    let prompt = format!(
+        "Install extension '{}' ({}) into '{}' (disabled)?",
+        report.identifier, report.version, report.directory
+    );
+    if !confirm_or_dry_run(ctx, &report, args.dry_run, &prompt)? {
+        return Ok(());
+    }
+
+    let staged = opened.stage_into(&paths.extensions_root)?;
+    commit_install_directory(staged, &plan.target_directory)?;
     report.applied = true;
-    report.restart_required = RuntimeLock::is_locked(paths);
+    report.restart_required = RuntimeLock::is_locked(&paths);
+
+    ctx.ui.render(&report);
+    Ok(())
+}
+
+fn handle_upgrade(ctx: &AppContext, args: ExtensionPackageArgs) -> Result<()> {
+    let paths = ctx.resolve_paths()?;
+    let config_doc = ctx.load_config(&paths)?;
+    let catalog = discover_catalog(&paths.extensions_root)?;
+    let managed = read_managed_extensions(&paths)?;
+    let schema_path = paths.discover_config_schema_path(None)?;
+
+    let mut opened = OpenedExtensionPackage::open_and_verify(&args.package, args.sha256.as_deref())?;
+    let plan = plan_upgrade(
+        &opened.summary,
+        &catalog,
+        &config_doc,
+        &paths,
+        &managed,
+        schema_path.as_deref(),
+    )?;
+
+    let mut report = ExtensionUpgradeReport {
+        identifier: plan.identifier.clone(),
+        display_name: plan.display_name.clone(),
+        previous_version: plan.previous_version.clone(),
+        version: plan.version.clone(),
+        directory: plan.target_directory.display().to_string(),
+        package_path: args.package.display().to_string(),
+        package_sha256: plan.package_sha256.clone(),
+        was_enabled: plan.was_enabled,
+        enabled: plan.next_enabled.clone(),
+        auto_enabled: plan.auto_enabled.clone(),
+        config_changed: plan.config_changed,
+        backup_path: None,
+        dry_run: args.dry_run,
+        applied: false,
+        restart_required: false,
+        trusted_code_notice: TRUSTED_CODE_NOTICE.to_string(),
+        warnings: plan.warnings.clone(),
+    };
+
+    let prompt = format!(
+        "Upgrade extension '{}' from {} to {} at '{}'?",
+        report.identifier, report.previous_version, report.version, report.directory
+    );
+    if !confirm_or_dry_run(ctx, &report, args.dry_run, &prompt)? {
+        return Ok(());
+    }
+
+    let staged = opened.stage_into(&paths.extensions_root)?;
+    let swap = ActiveUpgradeRollback::begin(plan.target_directory.clone(), staged, &plan.identifier)?;
+    if plan.config_changed {
+        match plan.candidate_doc.save_with_backup() {
+            Ok(backup_path) => {
+                report.backup_path = Some(backup_path.display().to_string());
+            }
+            Err(err) => {
+                let _ = swap.revert();
+                return Err(err);
+            }
+        }
+    }
+    if let Some(cleanup_warning) = swap.finish() {
+        report.warnings.push(cleanup_warning);
+    }
+
+    report.applied = true;
+    report.restart_required = RuntimeLock::is_locked(&paths);
+
+    ctx.ui.render(&report);
+    Ok(())
+}
+
+async fn handle_uninstall(ctx: &AppContext, args: ExtensionUninstallArgs) -> Result<()> {
+    let paths = ctx.resolve_paths()?;
+    let config_doc = ctx.load_config(&paths)?;
+    let catalog = discover_catalog(&paths.extensions_root)?;
+    let managed = read_managed_extensions(&paths)?;
+    let schema_path = paths.discover_config_schema_path(None)?;
+
+    let plan = plan_uninstall(
+        &args.identifier,
+        args.purge_data,
+        &catalog,
+        &config_doc,
+        &managed,
+        schema_path.as_deref(),
+    )?;
+
+    let mut warnings = plan.warnings.clone();
+    let preview_summary = if args.purge_data && args.dry_run {
+        let db_cfg = config_doc.database_config()?;
+        let pool = crate::db::backend::DbPool::connect(&db_cfg, &paths).await?;
+        let res = preview_extension_purge(
+            &pool,
+            &plan.identifier,
+            &plan.entrypoint_path,
+            plan.data_module.as_deref(),
+            &mut warnings,
+        )
+        .await;
+        pool.close().await;
+        Some(res?)
+    } else {
+        None
+    };
+
+    let mut report = ExtensionUninstallReport {
+        identifier: plan.identifier.clone(),
+        display_name: plan.display_name.clone(),
+        version: plan.version.clone(),
+        directory: plan.target_directory.display().to_string(),
+        broken_target: plan.broken_target,
+        purge_data: plan.purge_data,
+        purge_summary: preview_summary,
+        disabled_extensions: plan.disabled_extensions.clone(),
+        cascade_dependents: plan.cascade_dependents.clone(),
+        config_changed: plan.config_changed,
+        backup_path: None,
+        dry_run: args.dry_run,
+        applied: false,
+        restart_required: false,
+        warnings,
+    };
+
+    let prompt = if plan.purge_data {
+        format!(
+            "Disable '{}', purge all owned database data, and remove '{}'?",
+            report.identifier, report.directory
+        )
+    } else {
+        format!(
+            "Uninstall extension '{}' from '{}' (retaining database data)?",
+            report.identifier, report.directory
+        )
+    };
+    if !confirm_or_dry_run(ctx, &report, args.dry_run, &prompt)? {
+        return Ok(());
+    }
+
+    if plan.purge_data {
+        let _server_lock = ctx.acquire_server_lock(&paths, false)?;
+        let db_cfg = config_doc.database_config()?;
+
+        if plan.config_changed {
+            let backup_path = plan.candidate_doc.save_with_backup()?;
+            report.backup_path = Some(backup_path.display().to_string());
+        }
+
+        let purge_res = execute_extension_purge(
+            &paths,
+            &db_cfg,
+            &plan.identifier,
+            &plan.entrypoint_path,
+            plan.data_module.as_deref(),
+            &mut report.warnings,
+        )
+        .await;
+
+        let summary = match purge_res {
+            Ok(s) => s,
+            Err(err) => {
+                if plan.config_changed {
+                    let _ = atomic_write(config_doc.path(), config_doc.raw_source().as_bytes());
+                }
+                return Err(err);
+            }
+        };
+        report.purge_summary = Some(summary);
+
+        let rb = ActiveUninstallRollback::begin(plan.target_directory.clone(), &plan.identifier)
+            .map_err(|err| {
+                CfmsError::Extension(format!(
+                    "Database data was purged and config updated, but directory removal failed: {err}"
+                ))
+            })?;
+        if let Some(cleanup_warning) = rb.finish() {
+            report.warnings.push(cleanup_warning);
+        }
+        report.applied = true;
+        report.restart_required = false;
+    } else {
+        let rb = ActiveUninstallRollback::begin(plan.target_directory.clone(), &plan.identifier)?;
+        if plan.config_changed {
+            match plan.candidate_doc.save_with_backup() {
+                Ok(backup_path) => {
+                    report.backup_path = Some(backup_path.display().to_string());
+                }
+                Err(err) => {
+                    let _ = rb.revert();
+                    return Err(err);
+                }
+            }
+        }
+        if let Some(cleanup_warning) = rb.finish() {
+            report.warnings.push(cleanup_warning);
+        }
+        report.applied = true;
+        report.restart_required = RuntimeLock::is_locked(&paths);
+    }
 
     ctx.ui.render(&report);
     Ok(())
@@ -578,17 +1041,14 @@ fn format_enabled_list(items: &[String]) -> String {
 }
 
 #[allow(dead_code)]
-type _UnusedArgs = (
-    ExtensionPackageArgs,
-    ExtensionUninstallArgs,
-    ExtensionPurgeDataArgs,
-);
+type _UnusedArgs = ExtensionPurgeDataArgs;
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
     use super::*;
     use crate::cli::GlobalOpts;
+    use crate::core::ConfigDocument;
 
     fn test_ctx(root: &Path, format: OutputFormat, yes: bool) -> AppContext {
         AppContext::new(
@@ -872,5 +1332,338 @@ mod tests {
         assert!(msg.contains("Schema validation failed"), "unexpected error: {msg}");
         assert!(msg.contains("extensions.enabled"), "unexpected error: {msg}");
         assert_eq!(std::fs::read_to_string(&cfg_path).expect("read"), original);
+    }
+
+    fn write_test_zip(pkg_path: &Path, manifest: &str, extra_files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        use zip::CompressionMethod;
+        use zip::ZipWriter;
+        use zip::write::SimpleFileOptions;
+
+        let file = std::fs::File::create(pkg_path).expect("create zip");
+        let mut writer = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        writer.start_file("manifest.toml", opts).expect("start manifest");
+        writer.write_all(manifest.as_bytes()).expect("write manifest");
+        writer.start_file("_extension.py", opts).expect("start entry");
+        writer.write_all(b"# extension entrypoint\n").expect("write entry");
+        for (name, content) in extra_files {
+            writer.start_file(*name, opts).expect("start extra");
+            writer.write_all(content).expect("write extra");
+        }
+        writer.finish().expect("finish zip");
+    }
+
+    #[tokio::test]
+    async fn install_upgrade_and_uninstall_full_lifecycle_including_topo_deps_and_broken_cleanup() {
+        let dir = setup_workspace(
+            "# keep header comment\n[database]\ntype = \"sqlite\"\nfile = \"cfms.db\"\n\n[extensions]\nenabled = []\n",
+        );
+        let ext_root = dir.path().join("src").join("include").join("extensions");
+
+        // Leave an unrelated broken sibling to ensure fault isolation across install/upgrade/uninstall.
+        std::fs::create_dir_all(ext_root.join("unrelated_broken")).expect("mkdir broken sibling");
+        std::fs::write(
+            ext_root.join("unrelated_broken").join("manifest.toml"),
+            "invalid = [",
+        )
+        .expect("write broken sibling");
+
+        // Mark `oidc_sso` as managed by release-manifest.json so install rejects it even if absent on disk.
+        std::fs::write(
+            dir.path().join("release-manifest.json"),
+            r#"{"version":"0.14.0","managed_extensions":["oidc_sso"]}"#,
+        )
+        .expect("release-manifest");
+
+        let pkgs_dir = dir.path().join("packages");
+        std::fs::create_dir_all(&pkgs_dir).expect("pkgs dir");
+
+        let managed_pkg = pkgs_dir.join("oidc_sso.zip");
+        write_test_zip(
+            &managed_pkg,
+            "manifest_version = 3\n[extension]\nidentifier = \"oidc_sso\"\nname = \"OIDC\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+            &[],
+        );
+        let json_yes_ctx = test_ctx(dir.path(), OutputFormat::Json, true);
+        let managed_err = handle(
+            &json_yes_ctx,
+            ExtensionCommand::Install(ExtensionPackageArgs {
+                package: managed_pkg,
+                sha256: None,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect_err("managed extension install blocked");
+        assert!(managed_err.to_string().contains("managed by the CFMS server release"));
+
+        // Install `dep_ext` 1.0.0 with --dry-run first, then real install with --sha256.
+        let dep_pkg = pkgs_dir.join("dep_ext-1.0.0.zip");
+        write_test_zip(
+            &dep_pkg,
+            "manifest_version = 3\n[extension]\nidentifier = \"dep_ext\"\nname = \"Dep\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+            &[],
+        );
+
+        let json_no_ctx = test_ctx(dir.path(), OutputFormat::Json, false);
+        handle(
+            &json_no_ctx,
+            ExtensionCommand::Install(ExtensionPackageArgs {
+                package: dep_pkg.clone(),
+                sha256: None,
+                dry_run: true,
+            }),
+        )
+        .await
+        .expect("dry-run succeeds without --yes in json mode");
+        assert!(!ext_root.join("dep_ext").exists());
+
+        let refused = handle(
+            &json_no_ctx,
+            ExtensionCommand::Install(ExtensionPackageArgs {
+                package: dep_pkg.clone(),
+                sha256: None,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect_err("mutating json mode without --yes refuses");
+        assert!(refused.to_string().contains("--yes"));
+
+        let opened_dep = OpenedExtensionPackage::open_and_verify(&dep_pkg, None).expect("hash dep");
+        let dep_sha = opened_dep.summary.package_sha256.clone();
+        drop(opened_dep);
+
+        handle(
+            &json_yes_ctx,
+            ExtensionCommand::Install(ExtensionPackageArgs {
+                package: dep_pkg,
+                sha256: Some(dep_sha),
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect("install dep_ext");
+        assert!(ext_root.join("dep_ext").join("manifest.toml").is_file());
+
+        // Install `consumer_ext` 1.0.0 into a custom directory name to test directory preservation across upgrade.
+        let custom_dir = ext_root.join("consumer_custom_folder");
+        std::fs::create_dir_all(&custom_dir).expect("mkdir custom");
+        std::fs::write(
+            custom_dir.join("manifest.toml"),
+            "manifest_version = 3\n[extension]\nidentifier = \"consumer_ext\"\nname = \"Consumer\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(custom_dir.join("_extension.py"), "# v1\n").expect("entry");
+        let mut ro_perms = std::fs::metadata(custom_dir.join("_extension.py"))
+            .unwrap()
+            .permissions();
+        ro_perms.set_readonly(true);
+        std::fs::set_permissions(custom_dir.join("_extension.py"), ro_perms).expect("set ro");
+
+        // Enable consumer_ext.
+        handle(
+            &json_yes_ctx,
+            ExtensionCommand::Enable(ExtensionEnableArgs {
+                identifiers: vec!["consumer_ext".to_string()],
+                dry_run: false,
+                server_version: None,
+                schema: None,
+            }),
+        )
+        .await
+        .expect("enable consumer_ext");
+
+        // Upgrade consumer_ext -> 2.0.0 adding dependency on `dep_ext >=1.0.0`.
+        let consumer_v2 = pkgs_dir.join("consumer-2.0.0.zip");
+        write_test_zip(
+            &consumer_v2,
+            "manifest_version = 3\n[extension]\nidentifier = \"consumer_ext\"\nname = \"Consumer\"\nversion = \"2.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n[dependencies.extensions]\ndep_ext = \">=1.0.0\"\n",
+            &[("extra/new_file.py", b"hello = True\n")],
+        );
+
+        // Same version upgrade fails cleanly; v2 succeeds cleanly preserving `consumer_custom_folder` & placing `dep_ext` BEFORE `consumer_ext`.
+        handle(
+            &json_yes_ctx,
+            ExtensionCommand::Upgrade(ExtensionPackageArgs {
+                package: consumer_v2.clone(),
+                sha256: None,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect("upgrade consumer_ext to 2.0.0");
+        assert!(custom_dir.join("extra").join("new_file.py").is_file());
+        assert!(!ext_root.join("consumer_ext").exists());
+
+        let doc = ConfigDocument::load(&dir.path().join("src").join("config.toml")).expect("reload");
+        assert_eq!(
+            doc.extensions_enabled_raw().expect("enabled"),
+            Some(vec!["dep_ext".to_string(), "consumer_ext".to_string()])
+        );
+        assert!(doc.raw_source().contains("# keep header comment"));
+
+        // Re-running upgrade with the same 2.0.0 package fails strictly.
+        let same_ver_err = handle(
+            &json_yes_ctx,
+            ExtensionCommand::Upgrade(ExtensionPackageArgs {
+                package: consumer_v2,
+                sha256: None,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect_err("reinstall/same version upgrade rejected");
+        assert!(same_ver_err.to_string().contains("strictly newer version"));
+
+        // Uninstall `dep_ext` cascades to disable `consumer_ext`, cleans config, and deletes `dep_ext`.
+        handle(
+            &json_yes_ctx,
+            ExtensionCommand::Uninstall(ExtensionUninstallArgs {
+                identifier: "dep_ext".to_string(),
+                purge_data: false,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect("uninstall dep_ext");
+        assert!(!ext_root.join("dep_ext").exists());
+        let doc_after_uninstall =
+            ConfigDocument::load(&dir.path().join("src").join("config.toml")).expect("reload");
+        assert_eq!(
+            doc_after_uninstall.extensions_enabled_raw().expect("enabled"),
+            Some(Vec::<String>::new())
+        );
+
+        // Clean up broken sibling via uninstall by directory name!
+        handle(
+            &json_yes_ctx,
+            ExtensionCommand::Uninstall(ExtensionUninstallArgs {
+                identifier: "unrelated_broken".to_string(),
+                purge_data: false,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect("uninstall broken sibling directory");
+        assert!(!ext_root.join("unrelated_broken").exists());
+    }
+
+    #[tokio::test]
+    async fn uninstall_with_purge_data_respects_server_lock_and_rolls_back_config_on_db_error() {
+        use crate::db::schema::ddl::create_head_schema;
+        use sqlx::Row;
+
+        let dir = setup_workspace(
+            "[database]\ntype = \"sqlite\"\nfile = \"cfms.db\"\n\n[extensions]\nenabled = [\"sample_ext\"]\n",
+        );
+        let ext_root = dir.path().join("src").join("include").join("extensions");
+        write_ext(
+            &ext_root,
+            "sample_ext",
+            "manifest_version = 3\n[extension]\nidentifier = \"sample_ext\"\nname = \"Sample\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+        );
+
+        let paths = WorkspacePaths::discover(Some(dir.path()), None).expect("paths");
+        let db_cfg = ConfigDocument::load(&paths.config_path)
+            .expect("cfg")
+            .database_config()
+            .expect("db");
+
+        // Note: database has NO tables yet, so purge fails cleanly and MUST roll back `config.toml`!
+        let ctx = test_ctx(dir.path(), OutputFormat::Json, true);
+        let before_cfg = std::fs::read_to_string(&paths.config_path).expect("read before");
+        let db_err = handle(
+            &ctx,
+            ExtensionCommand::Uninstall(ExtensionUninstallArgs {
+                identifier: "sample_ext".to_string(),
+                purge_data: true,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect_err("missing tables triggers rollback");
+        assert!(!db_err.to_string().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&paths.config_path).expect("restored config"),
+            before_cfg
+        );
+        assert!(ext_root.join("sample_ext").exists());
+
+        // Initialize DB tables and insert extension-owned rows.
+        let pool = crate::db::backend::DbPool::connect(&db_cfg, &paths)
+            .await
+            .expect("connect");
+        create_head_schema(&pool, false).await.expect("schema");
+        let crate::db::backend::DbPool::Sqlite(ref sp) = pool else {
+            panic!("sqlite");
+        };
+        sqlx::query(
+            "INSERT INTO options (namespace, owner, option_key, schema_version, revision, value_type, option_value, updated_at) VALUES ('ext.sample', 'sample_ext', 'k', 1, 1, 'str', '\"v\"', 1.0)",
+        )
+        .execute(sp)
+        .await
+        .expect("insert option");
+        pool.close().await;
+
+        // Running `uninstall --purge-data` while `server.lock` is held fails cleanly without touching DB or dir!
+        let server_lock = RuntimeLock::acquire(&paths, false).expect("hold server lock");
+        let locked_err = handle(
+            &ctx,
+            ExtensionCommand::Uninstall(ExtensionUninstallArgs {
+                identifier: "sample_ext".to_string(),
+                purge_data: true,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect_err("purge-data rejected while server holds lock");
+        assert!(locked_err.to_string().contains("lock"));
+        drop(server_lock);
+
+        // Once server is stopped, --dry-run previews without deleting, then real purge deletes everything cleanly.
+        handle(
+            &ctx,
+            ExtensionCommand::Uninstall(ExtensionUninstallArgs {
+                identifier: "sample_ext".to_string(),
+                purge_data: true,
+                dry_run: true,
+            }),
+        )
+        .await
+        .expect("dry-run purge succeeds");
+        assert!(ext_root.join("sample_ext").exists());
+
+        handle(
+            &ctx,
+            ExtensionCommand::Uninstall(ExtensionUninstallArgs {
+                identifier: "sample_ext".to_string(),
+                purge_data: true,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect("purge uninstall succeeds");
+        assert!(!ext_root.join("sample_ext").exists());
+
+        let verify_pool = crate::db::backend::DbPool::connect(&db_cfg, &paths)
+            .await
+            .expect("reconnect");
+        let crate::db::backend::DbPool::Sqlite(ref sp2) = verify_pool else {
+            panic!("sqlite");
+        };
+        let opt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM options WHERE owner = 'sample_ext'")
+            .fetch_one(sp2)
+            .await
+            .expect("count");
+        assert_eq!(opt_count, 0);
+        let audit = sqlx::query("SELECT action, target FROM audit_entries")
+            .fetch_one(sp2)
+            .await
+            .expect("audit");
+        assert_eq!(audit.get::<String, _>("action"), "purge_extension_data");
+        assert_eq!(audit.get::<String, _>("target"), "sample_ext");
+        verify_pool.close().await;
     }
 }

@@ -408,6 +408,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zeroize",
+ "zip",
  "zstd",
 ]
 
