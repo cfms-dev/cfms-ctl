@@ -39,10 +39,10 @@ pub use static_ast::{
     extract_static_schema_ir, parse_python_syntax_check,
 };
 pub use migrations::{
-    HybridUpgradeOptions, HybridUpgradeOutcome, HybridUpgradePlan, SchemaUpgradeOutcome,
-    StampOutcome, UpgradeStrategy, execute_hybrid_upgrade, inspect_upgrade_plan,
-    plan_hybrid_upgrade, run_alembic_upgrade_head, stamp_database_revision,
-    upgrade_database_schema,
+    AlembicDirection, HybridUpgradeOptions, HybridUpgradeOutcome, HybridUpgradePlan,
+    SchemaUpgradeOutcome, StampOutcome, UpgradeStrategy, execute_hybrid_upgrade,
+    inspect_upgrade_plan, plan_hybrid_upgrade, run_alembic_revision, run_alembic_upgrade_head,
+    stamp_database_revision, upgrade_database_schema,
 };
 pub use registry::{
     APPLICATION_TABLE_NAMES, DEFERRED_COLUMNS, DEFERRED_UPDATE_ORDER, KNOWN_EXTENSION_TABLES,

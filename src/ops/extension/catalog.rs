@@ -199,21 +199,7 @@ impl ExtensionCatalog {
 }
 
 /// Return true if filesystem metadata describes a symlink or Windows reparse point (junction/mount).
-#[must_use]
-pub(crate) fn is_symlink_or_reparse_point(meta: &std::fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return true;
-        }
-    }
-    false
-}
+pub(crate) use crate::core::is_symlink_or_reparse_point;
 
 /// Read managed extension identifiers from `release-manifest.json` (plus `builtin`).
 pub fn read_managed_extensions(paths: &WorkspacePaths) -> Result<BTreeSet<String>> {

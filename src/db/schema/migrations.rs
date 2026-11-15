@@ -880,16 +880,54 @@ async fn execute_diff_plan_sql(pool: &DbPool, plan: &SchemaDiffPlan) -> Result<u
     Ok(count)
 }
 
+/// Direction and target revision for delegating an Alembic execution to Python.
+#[derive(Debug, Clone)]
+pub enum AlembicDirection {
+    UpgradeHead,
+    UpgradeTo(String),
+    DowngradeTo(String),
+}
+
+impl AlembicDirection {
+    fn command_name(&self) -> &'static str {
+        match self {
+            Self::UpgradeHead | Self::UpgradeTo(_) => "upgrade",
+            Self::DowngradeTo(_) => "downgrade",
+        }
+    }
+
+    fn target_arg(&self) -> &str {
+        match self {
+            Self::UpgradeHead => "head",
+            Self::UpgradeTo(rev) | Self::DowngradeTo(rev) => rev.as_str(),
+        }
+    }
+
+    fn display_label(&self) -> String {
+        format!("alembic {} {}", self.command_name(), self.target_arg())
+    }
+}
+
 pub async fn run_alembic_upgrade_head(
     paths: &WorkspacePaths,
     alembic_paths: &AlembicPaths,
 ) -> Result<()> {
+    run_alembic_revision(paths, alembic_paths, AlembicDirection::UpgradeHead).await
+}
+
+/// Execute `alembic upgrade <rev>` or `alembic downgrade <rev>` using discovered Python environments
+/// inside `paths.server_root` without writing `.pyc` files.
+pub async fn run_alembic_revision(
+    paths: &WorkspacePaths,
+    alembic_paths: &AlembicPaths,
+    direction: AlembicDirection,
+) -> Result<()> {
+    let label = direction.display_label();
     let candidates = discover_python_candidates(paths);
     if candidates.is_empty() {
-        return Err(CfmsError::Config(
-            "Unable to locate a Python interpreter to run `alembic upgrade head`; install/activate CFMS virtualenv or pass `--no-alembic-delegate` for DDL-only preview"
-                .to_string(),
-        ));
+        return Err(CfmsError::Config(format!(
+            "Unable to locate a Python interpreter to run `{label}`; install/activate CFMS virtualenv or configure CFMS_PYTHON"
+        )));
     }
 
     const ALEMBIC_RUNNER_PY: &str = r#"
@@ -908,11 +946,18 @@ alembic_cfg.set_main_option("script_location", os.environ["CFMS_SCRIPT_LOCATION"
 with open(os.environ["CFMS_CONFIG_TOML"], "rb") as f:
     cfg_data = tomllib.load(f)
 
+direction = os.environ["CFMS_ALEMBIC_DIRECTION"]
+target = os.environ["CFMS_ALEMBIC_TARGET"]
 engine = create_database_engine(cfg_data["database"])
 try:
     with engine.connect() as conn:
         alembic_cfg.attributes["connection"] = conn
-        command.upgrade(alembic_cfg, "head")
+        if direction == "upgrade":
+            command.upgrade(alembic_cfg, target)
+        elif direction == "downgrade":
+            command.downgrade(alembic_cfg, target)
+        else:
+            raise ValueError(f"Unsupported Alembic direction: {direction}")
 finally:
     engine.dispose()
 "#;
@@ -933,6 +978,8 @@ finally:
             .env("CFMS_ALEMBIC_INI", &alembic_paths.ini_path)
             .env("CFMS_SCRIPT_LOCATION", &alembic_paths.script_location)
             .env("CFMS_CONFIG_TOML", &paths.config_path)
+            .env("CFMS_ALEMBIC_DIRECTION", direction.command_name())
+            .env("CFMS_ALEMBIC_TARGET", direction.target_arg())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -952,9 +999,9 @@ finally:
                 continue;
             }
             Err(_) => {
-                return Err(CfmsError::Database(
-                    "Timed out after 120s while executing `alembic upgrade head`".to_string(),
-                ));
+                return Err(CfmsError::Database(format!(
+                    "Timed out after 120s while executing `{label}`"
+                )));
             }
         };
 
@@ -978,7 +1025,7 @@ finally:
     }
 
     Err(CfmsError::Database(format!(
-        "`alembic upgrade head` failed across all Python candidates: {}",
+        "`{label}` failed across all Python candidates: {}",
         errors.join("; ")
     )))
 }

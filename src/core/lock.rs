@@ -90,6 +90,19 @@ impl RuntimeLock {
             true
         }
     }
+
+    /// Return the active holder PID recorded in `server.lock` when [`Self::is_locked`] is true.
+    #[must_use]
+    pub fn holder_pid(paths: &WorkspacePaths) -> Option<u32> {
+        if !Self::is_locked(paths) {
+            return None;
+        }
+        let raw = std::fs::read_to_string(paths.server_lock_path()).ok()?;
+        let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        val.get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    }
 }
 
 #[cfg(test)]

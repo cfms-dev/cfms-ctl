@@ -19,6 +19,7 @@ pub enum ErrorCode {
     BackupError,
     ArchiveIntegrityError,
     ExtensionError,
+    DeploymentError,
     InvalidArgument,
     OperationAborted,
     NotImplementedYet,
@@ -62,6 +63,9 @@ pub enum CfmsError {
     #[error("Extension error: {0}")]
     Extension(String),
 
+    #[error("Deployment error: {0}")]
+    Deployment(String),
+
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
@@ -94,6 +98,7 @@ impl CfmsError {
             Self::Backup(_) => ErrorCode::BackupError,
             Self::ArchiveIntegrity(_) => ErrorCode::ArchiveIntegrityError,
             Self::Extension(_) => ErrorCode::ExtensionError,
+            Self::Deployment(_) => ErrorCode::DeploymentError,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::OperationAborted => ErrorCode::OperationAborted,
             Self::NotImplementedYet(_) => ErrorCode::NotImplementedYet,

@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
 use rand::RngExt;
 use sha2::{Digest, Sha256};
@@ -14,7 +13,7 @@ use zip::CompressionMethod;
 use zip::read::ZipArchive;
 use zip::result::ZipError;
 
-use crate::core::{CfmsError, Result};
+use crate::core::{CfmsError, Result, is_windows_reserved_name, retry_fs_op};
 use crate::ops::extension::catalog::{
     ENTRYPOINT_FILENAME, InstalledExtension, MANIFEST_FILENAME, MAX_MANIFEST_BYTES,
     is_symlink_or_reparse_point, parse_extension_manifest_str, symlink_stat_if_present,
@@ -672,25 +671,6 @@ fn validate_archive_entry_path(
     Ok((rel_path, clean_segments.join("/")))
 }
 
-fn is_windows_reserved_name(segment: &str) -> bool {
-    let base = segment.split('.').next().unwrap_or(segment);
-    if base.eq_ignore_ascii_case("CON")
-        || base.eq_ignore_ascii_case("PRN")
-        || base.eq_ignore_ascii_case("AUX")
-        || base.eq_ignore_ascii_case("NUL")
-    {
-        return true;
-    }
-    let bytes = base.as_bytes();
-    if bytes.len() == 4
-        && (base[..3].eq_ignore_ascii_case("COM") || base[..3].eq_ignore_ascii_case("LPT"))
-        && matches!(bytes[3], b'1'..=b'9')
-    {
-        return true;
-    }
-    false
-}
-
 fn check_file_directory_conflicts(
     lower_key: &str,
     is_dir_entry: bool,
@@ -927,42 +907,6 @@ fn cleanup_directory_best_effort(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     })
-}
-
-fn retry_fs_op<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    #[cfg(windows)]
-    const RETRY_DELAYS_MS: &[u64] = &[20, 40, 80, 120];
-    #[cfg(not(windows))]
-    const RETRY_DELAYS_MS: &[u64] = &[0];
-
-    let mut attempt = 0usize;
-    loop {
-        match op() {
-            Ok(v) => return Ok(v),
-            Err(err) if is_transient_lock_error(&err) && attempt < RETRY_DELAYS_MS.len() => {
-                let delay = RETRY_DELAYS_MS[attempt];
-                attempt += 1;
-                if delay > 0 {
-                    std::thread::sleep(Duration::from_millis(delay));
-                }
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-fn is_transient_lock_error(err: &io::Error) -> bool {
-    if err.kind() == io::ErrorKind::PermissionDenied {
-        return cfg!(windows);
-    }
-    #[cfg(windows)]
-    {
-        // ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32)
-        if matches!(err.raw_os_error(), Some(5 | 32)) {
-            return true;
-        }
-    }
-    false
 }
 
 fn random_hex_suffix() -> String {

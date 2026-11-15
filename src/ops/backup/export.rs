@@ -141,17 +141,45 @@ pub async fn run_export(ctx: &AppContext, args: BackupExportArgs) -> Result<()> 
 
     let paths = ctx.resolve_paths()?;
     let _lock = ctx.acquire_server_lock(&paths, false)?;
-    let config = ctx.load_config(&paths)?;
-    let storage = resolve_local_storage(&paths, &config)?;
-    let configuration =
-        extract_configuration_payload(&config, options.selection.contains(BackupComponent::Configuration))?;
+    let report = execute_export_locked(ctx, &paths, &options).await?;
+    ctx.ui.render(&report);
+    Ok(())
+}
 
-    let pool = ctx.connect_db(&paths).await?;
-    let base_ir = extract_code_schema_ir(&paths, ExtractorMode::Auto, None, None, true, true)
+/// Create a full encrypted `.confbak` safety checkpoint when the caller already holds [`crate::core::ServerLockGuard`].
+pub async fn export_pre_mutation_backup(
+    ctx: &AppContext,
+    paths: &WorkspacePaths,
+    output_path: PathBuf,
+    key_out: Option<PathBuf>,
+) -> Result<BackupExportReport> {
+    let options = ResolvedExportOptions {
+        output_path,
+        key_out,
+        selection: ComponentSelection::all(),
+    };
+    validate_export_targets(&options)?;
+    execute_export_locked(ctx, paths, &options).await
+}
+
+async fn execute_export_locked(
+    ctx: &AppContext,
+    paths: &WorkspacePaths,
+    options: &ResolvedExportOptions,
+) -> Result<BackupExportReport> {
+    let config = ctx.load_config(paths)?;
+    let storage = resolve_local_storage(paths, &config)?;
+    let configuration = extract_configuration_payload(
+        &config,
+        options.selection.contains(BackupComponent::Configuration),
+    )?;
+
+    let pool = ctx.connect_db(paths).await?;
+    let base_ir = extract_code_schema_ir(paths, ExtractorMode::Auto, None, None, true, true)
         .await
         .unwrap_or_else(|_| builtin_schema_ir(true));
     let plan =
-        prepare_source_export_plan(&pool, &base_ir, Some(&paths), &options.selection).await?;
+        prepare_source_export_plan(&pool, &base_ir, Some(paths), &options.selection).await?;
     let active_rule_set_ids = if plan.table_order.iter().any(|t| t == "nodes")
         && plan
             .table_order
@@ -164,7 +192,7 @@ pub async fn run_export(ctx: &AppContext, args: BackupExportArgs) -> Result<()> 
     };
 
     let created_at = Utc::now().to_rfc3339();
-    let server_version = detect_server_version(&paths);
+    let server_version = detect_server_version(paths);
     let component_names = options.selection.component_names();
 
     let master_key = generate_backup_key();
@@ -213,17 +241,15 @@ pub async fn run_export(ctx: &AppContext, args: BackupExportArgs) -> Result<()> 
     }
 
     let file_size = std::fs::metadata(&options.output_path)?.len();
-    let report = build_export_report(
-        &options,
+    Ok(build_export_report(
+        options,
         &plan,
         &created_at,
         &server_version,
         file_size,
         stats,
         encoded_key,
-    );
-    ctx.ui.render(&report);
-    Ok(())
+    ))
 }
 
 struct ExportFinishStats {

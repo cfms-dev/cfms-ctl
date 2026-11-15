@@ -94,6 +94,15 @@ impl WorkspacePaths {
         Ok(Self::from_roots(project_root, clean, None))
     }
 
+    /// Construct [`WorkspacePaths`] for an explicit target `project_root` (even before CFMS files exist,
+    /// such as during `cfms-ctl deployment install`).
+    #[must_use]
+    pub fn for_target_project_root(project_root: &Path, config_override: Option<&Path>) -> Self {
+        let clean = Self::canonicalize_clean(project_root);
+        let server_root = clean.join("src");
+        Self::from_roots(clean, server_root, config_override)
+    }
+
     fn is_server_root(candidate: &Path) -> bool {
         candidate.join("main.py").is_file()
             || candidate.join("config.toml").is_file()

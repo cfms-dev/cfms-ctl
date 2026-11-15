@@ -102,6 +102,13 @@ impl UiConsole {
             eprintln!("{} {}", style("⚠ Warning:").yellow().bold(), message);
         }
     }
+
+    /// Print an error line in `Human` mode.
+    pub fn print_error(&self, message: &str) {
+        if self.format == OutputFormat::Human {
+            eprintln!("{} {}", style("✖").red().bold(), message);
+        }
+    }
 }
 
 /// Helper builder for two-column key-value summary tables in `Human` mode.
