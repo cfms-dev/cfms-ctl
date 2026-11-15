@@ -199,6 +199,19 @@ impl WorkspacePaths {
         }
     }
 
+    /// Ordered candidate locations checked when discovering named external schema/IR files.
+    #[must_use]
+    pub fn named_schema_candidates(&self, filename: &str) -> [PathBuf; 3] {
+        [
+            self.server_root.join(filename),
+            self.server_root
+                .join("include")
+                .join("schemas")
+                .join(filename),
+            self.project_root.join("schemas").join(filename),
+        ]
+    }
+
     fn discover_named_schema_file(
         &self,
         filename: &str,
@@ -216,15 +229,10 @@ impl WorkspacePaths {
             return Ok(Some(resolved));
         }
 
-        let candidates = [
-            self.server_root.join(filename),
-            self.server_root
-                .join("include")
-                .join("schemas")
-                .join(filename),
-            self.project_root.join("schemas").join(filename),
-        ];
-        Ok(candidates.into_iter().find(|p| p.is_file()))
+        Ok(self
+            .named_schema_candidates(filename)
+            .into_iter()
+            .find(|p| p.is_file()))
     }
 
     /// Discover the external `config.schema.json` file in the workspace or validate an explicit override.

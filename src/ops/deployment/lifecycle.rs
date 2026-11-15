@@ -38,7 +38,7 @@ use super::models::{
     DeploymentMutationReport, DeploymentPruneReport, DeploymentSettings, DeploymentStatusReport,
     DeploymentTransaction, DeploymentVerifyReport, RELEASE_MANIFEST_FILENAME,
     ReleaseIntegrityReport, ReleaseManifestSummary, TRANSACTION_FORMAT_VERSION,
-    TransactionOperation, TransactionPhase,
+    TransactionOperation, TransactionPhase, ValidatedManifest,
 };
 use super::online::{
     OnlineClientConfig, check_github_release_with_config, download_verified_github_release,
@@ -66,9 +66,53 @@ fn ensure_confirmed(ctx: &AppContext, prompt: &str, dry_run: bool) -> Result<()>
     confirm_or_abort(prompt, ctx.global.yes)
 }
 
+/// Resolve the effective `config.schema.json` path for configuration synchronization.
+///
+/// Before `apply_swap_with_journal`, pass `Some((target_dir, source_manifest))` so preflight
+/// previews match post-swap discovery: files present in `target_dir` take precedence slot-by-slot,
+/// tracked files in `source_manifest` that are absent from `target_dir` are ignored (the swap will
+/// remove them), and untracked workspace overrides remain visible.
+fn resolve_target_config_schema_path(
+    paths: &WorkspacePaths,
+    target_root: Option<(&Path, &ValidatedManifest)>,
+) -> Result<Option<PathBuf>> {
+    let Some((target_dir, source_manifest)) = target_root else {
+        return paths.discover_config_schema_path(None);
+    };
+    let target_paths = WorkspacePaths::for_target_project_root(target_dir, None);
+    for (target_candidate, live_candidate) in target_paths
+        .named_schema_candidates("config.schema.json")
+        .into_iter()
+        .zip(paths.named_schema_candidates("config.schema.json"))
+    {
+        if target_candidate.is_file() {
+            return Ok(Some(target_candidate));
+        }
+        if live_candidate.is_file()
+            && !is_tracked_file_removed_by_swap(&paths.project_root, &live_candidate, source_manifest)
+        {
+            return Ok(Some(live_candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn is_tracked_file_removed_by_swap(
+    project_root: &Path,
+    candidate: &Path,
+    source_manifest: &ValidatedManifest,
+) -> bool {
+    let Ok(rel) = candidate.strip_prefix(project_root) else {
+        return false;
+    };
+    let rel_posix = rel.to_string_lossy().replace('\\', "/");
+    source_manifest.manifest.files.contains_key(&rel_posix)
+}
+
 fn preview_or_apply_config_sync(
     paths: &WorkspacePaths,
     template_path: &Path,
+    target_root: Option<(&Path, &ValidatedManifest)>,
     write: bool,
 ) -> Result<(bool, Option<String>, Vec<String>)> {
     if !paths.config_path.is_file() || !template_path.is_file() {
@@ -76,7 +120,7 @@ fn preview_or_apply_config_sync(
     }
     let mut current = ConfigDocument::load(&paths.config_path)?;
     let template = ConfigDocument::load(template_path)?;
-    let schema_path = paths.discover_config_schema_path(None)?;
+    let schema_path = resolve_target_config_schema_path(paths, target_root)?;
     let plan = current.sync_with_template_and_schema(
         &template,
         &[],
@@ -514,7 +558,12 @@ async fn run_upgrade_flow(
 
     let delta = compute_delta_counts(Some(&source_manifest.manifest), &staged.manifest.manifest);
     let staged_template = staged.extracted_dir.join("src").join("config.toml.sample");
-    let (config_changed, _, cfg_warnings) = preview_or_apply_config_sync(paths, &staged_template, false)?;
+    let (config_changed, _, cfg_warnings) = preview_or_apply_config_sync(
+        paths,
+        &staged_template,
+        Some((&staged.extracted_dir, &source_manifest)),
+        false,
+    )?;
     warnings.extend(cfg_warnings);
 
     if dry_run {
@@ -625,7 +674,7 @@ async fn run_upgrade_flow(
     }
 
     let (applied_cfg_changed, cfg_bak_path, apply_cfg_warnings) =
-        match preview_or_apply_config_sync(paths, &paths.config_template_path, true) {
+        match preview_or_apply_config_sync(paths, &paths.config_template_path, None, true) {
             Ok(v) => v,
             Err(err) => {
                 let _ = rollback_swap_journal(paths, &journal_dir);
@@ -753,6 +802,7 @@ pub async fn handle_downgrade(ctx: &AppContext, args: DeploymentDowngradeArgs) -
         preview_or_apply_config_sync(
             &paths,
             &target.release_dir.join("src").join("config.toml.sample"),
+            Some((&target.release_dir, &source_manifest)),
             false,
         )?
     };
@@ -888,7 +938,7 @@ pub async fn handle_downgrade(ctx: &AppContext, args: DeploymentDowngradeArgs) -
         }
     } else {
         let (changed, bak, cfg_warn) =
-            preview_or_apply_config_sync(&paths, &paths.config_template_path, true)?;
+            preview_or_apply_config_sync(&paths, &paths.config_template_path, None, true)?;
         warnings.extend(cfg_warn);
         (changed, bak)
     };
@@ -1074,7 +1124,7 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                     args.skip_env,
                 )?;
                 sync_python_environment(&paths, &env_plan).await?;
-                preview_or_apply_config_sync(&paths, &paths.config_template_path, true)?;
+                preview_or_apply_config_sync(&paths, &paths.config_template_path, None, true)?;
                 let target_head = tx.target_head.clone().ok_or_else(|| {
                     CfmsError::Deployment("Missing target_head in transaction.json".to_string())
                 })?;
@@ -3004,5 +3054,351 @@ mod tests {
         handle_status(&ctx, DeploymentStatusArgs { verify: false })
             .await
             .expect("diagnostic status must still succeed without detectable server version");
+    }
+
+    #[tokio::test]
+    async fn upgrade_dry_run_uses_staged_schema_instead_of_old_workspace_schema() {
+        let tmp = TempDir::new().unwrap();
+
+        // Case A: Old 0.14.0 ships permissive schema (`port <= 80000`), live config has `port = 70000`.
+        // New 0.14.1 ships stricter schema (`port <= 65535`); dry-run must reject using staged schema.
+        let old_schema = br#"{
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 80000 } }
+                }
+            }
+        }"#;
+        let strict_schema = br#"{
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+                }
+            }
+        }"#;
+
+        let tpl = base_config_template("port = 5104\n");
+        let v140_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
+        let (v140_files, v140_mb) = build_release_bundle_map(
+            "0.14.0",
+            &[("e952c02c1454", None)],
+            &tpl,
+            &[("src/include/schemas/config.schema.json", old_schema)],
+        );
+        write_release_targz(&v140_pkg, "", &v140_files, &v140_mb);
+
+        let deploy = tmp.path().join("staged-schema-upgrade");
+        install_fixture_release(&deploy, &v140_pkg, false).await;
+        let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
+        let ctx = test_ctx(&deploy);
+
+        // Make live config pass old schema (`70000 <= 80000`) but fail new staged schema (`70000 > 65535`).
+        let mut live_cfg = fs::read_to_string(&paths.config_path).unwrap();
+        live_cfg = live_cfg.replace("port = 5104", "port = 70000");
+        fs::write(&paths.config_path, &live_cfg).unwrap();
+
+        let v141_pkg = tmp.path().join("cfms-0.14.1.tar.gz");
+        let (v141_files, v141_mb) = build_release_bundle_map(
+            "0.14.1",
+            &[("e952c02c1454", None)],
+            &tpl,
+            &[("src/include/schemas/config.schema.json", strict_schema)],
+        );
+        write_release_targz(&v141_pkg, "", &v141_files, &v141_mb);
+
+        let err = handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v141_pkg.clone(),
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: true,
+            },
+        )
+        .await
+        .expect_err("dry-run upgrade must validate against stricter staged config.schema.json");
+        assert!(
+            err.to_string().contains("Schema validation failed")
+                && err.to_string().contains("server.port"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            load_manifest_file(&paths.release_manifest_path)
+                .unwrap()
+                .manifest
+                .version,
+            "0.14.0"
+        );
+
+        // Case B: Old 0.14.0 has strict schema in slot 1 (`src/config.schema.json`, max 5000),
+        // while new 0.14.2 relocates relaxed schema (max 65535) to slot 2 (`src/include/schemas/config.schema.json`).
+        // Adjust live config to 5104 (violates old 0.14.0 slot-1 schema, satisfies new 0.14.2 slot-2 schema).
+        let tight_schema = br#"{
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 5000 } }
+                }
+            }
+        }"#;
+        let v140_slot1_pkg = tmp.path().join("cfms-0.14.0-slot1.tar.gz");
+        let (v140_s1_files, v140_s1_mb) = build_release_bundle_map(
+            "0.14.0",
+            &[("e952c02c1454", None)],
+            &tpl,
+            &[("src/config.schema.json", tight_schema)],
+        );
+        write_release_targz(&v140_slot1_pkg, "", &v140_s1_files, &v140_s1_mb);
+
+        let deploy2 = tmp.path().join("slot-relocate-upgrade");
+        install_fixture_release(&deploy2, &v140_slot1_pkg, false).await;
+        let paths2 = WorkspacePaths::discover(Some(&deploy2), None).unwrap();
+        let ctx2 = test_ctx(&deploy2);
+
+        let v142_pkg = tmp.path().join("cfms-0.14.2.tar.gz");
+        let (v142_files, v142_mb) = build_release_bundle_map(
+            "0.14.2",
+            &[("e952c02c1454", None)],
+            &tpl,
+            &[("src/include/schemas/config.schema.json", strict_schema)],
+        );
+        write_release_targz(&v142_pkg, "", &v142_files, &v142_mb);
+
+        handle_upgrade(
+            &ctx2,
+            DeploymentUpgradeArgs {
+                package: v142_pkg.clone(),
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: true,
+            },
+        )
+        .await
+        .expect("dry-run upgrade must ignore tracked slot-1 schema replaced by slot-2 schema in staged tree");
+
+        handle_upgrade(
+            &ctx2,
+            DeploymentUpgradeArgs {
+                package: v142_pkg,
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            load_manifest_file(&paths2.release_manifest_path)
+                .unwrap()
+                .manifest
+                .version,
+            "0.14.2"
+        );
+        assert!(!deploy2.join("src/config.schema.json").exists());
+    }
+
+    #[tokio::test]
+    async fn upgrade_dry_run_ignores_removed_tracked_schema_and_honors_untracked_workspace_schema() {
+        let tmp = TempDir::new().unwrap();
+        let tight_schema = br#"{
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 5000 } }
+                }
+            }
+        }"#;
+        let tpl = base_config_template("port = 5104\n");
+
+        // 0.14.0 tracks a strict schema (`port <= 5000`), while live config has `port = 5104`.
+        let v140_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
+        let (v140_files, v140_mb) = build_release_bundle_map(
+            "0.14.0",
+            &[("e952c02c1454", None)],
+            &tpl,
+            &[("src/include/schemas/config.schema.json", tight_schema)],
+        );
+        write_release_targz(&v140_pkg, "", &v140_files, &v140_mb);
+
+        let deploy = tmp.path().join("removed-schema-upgrade");
+        install_fixture_release(&deploy, &v140_pkg, false).await;
+        let ctx = test_ctx(&deploy);
+
+        // 0.14.1 ships no `config.schema.json` at all -> swap will remove the tracked 0.14.0 schema.
+        let v141_pkg = tmp.path().join("cfms-0.14.1.tar.gz");
+        let (v141_files, v141_mb) = build_release_bundle_map(
+            "0.14.1",
+            &[("e952c02c1454", None)],
+            &tpl,
+            &[],
+        );
+        write_release_targz(&v141_pkg, "", &v141_files, &v141_mb);
+
+        handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v141_pkg.clone(),
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: true,
+            },
+        )
+        .await
+        .expect("dry-run must not apply tracked source schema that will be deleted on swap");
+
+        // Adding an untracked workspace-local override in `schemas/config.schema.json` IS preserved across swap.
+        let local_schemas = deploy.join("schemas");
+        fs::create_dir_all(&local_schemas).unwrap();
+        fs::write(local_schemas.join("config.schema.json"), tight_schema).unwrap();
+
+        let err = handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v141_pkg,
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: true,
+            },
+        )
+        .await
+        .expect_err("dry-run must still validate against untracked workspace config.schema.json");
+        assert!(
+            err.to_string().contains("Schema validation failed")
+                && err.to_string().contains("server.port"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn downgrade_dry_run_validates_against_target_snapshot_schema() {
+        let tmp = TempDir::new().unwrap();
+        let strict_schema = br#"{
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+                }
+            }
+        }"#;
+        let permissive_schema = br#"{
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 80000 } }
+                }
+            }
+        }"#;
+        let tpl = base_config_template("port = 5104\n");
+
+        let v140_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
+        let (v140_files, v140_mb) = build_release_bundle_map(
+            "0.14.0",
+            &[("e952c02c1454", None)],
+            &tpl,
+            &[("src/include/schemas/config.schema.json", strict_schema)],
+        );
+        write_release_targz(&v140_pkg, "", &v140_files, &v140_mb);
+
+        let deploy = tmp.path().join("downgrade-schema-check");
+        install_fixture_release(&deploy, &v140_pkg, false).await;
+        let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
+        let ctx = test_ctx(&deploy);
+
+        let v150_pkg = tmp.path().join("cfms-0.15.0.tar.gz");
+        let (v150_files, v150_mb) = build_release_bundle_map(
+            "0.15.0",
+            &[("e952c02c1454", None)],
+            &tpl,
+            &[("src/include/schemas/config.schema.json", permissive_schema)],
+        );
+        write_release_targz(&v150_pkg, "", &v150_files, &v150_mb);
+
+        handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v150_pkg,
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Set `port = 70000` (valid under active 0.15.0 permissive schema, invalid under stored 0.14.0 snapshot schema).
+        let mut live_cfg = fs::read_to_string(&paths.config_path).unwrap();
+        live_cfg = live_cfg.replace("port = 5104", "port = 70000");
+        fs::write(&paths.config_path, &live_cfg).unwrap();
+
+        let err = handle_downgrade(
+            &ctx,
+            DeploymentDowngradeArgs {
+                release_id: None,
+                version: Some("0.14.0".to_string()),
+                restore_snapshot_config: false,
+                quarantine_extensions: false,
+                skip_env: true,
+                backup: SafetyBackupArgs::default(),
+                dry_run: true,
+            },
+        )
+        .await
+        .expect_err("dry-run downgrade must validate against target snapshot schema");
+        assert!(
+            err.to_string().contains("Schema validation failed")
+                && err.to_string().contains("server.port"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            load_manifest_file(&paths.release_manifest_path)
+                .unwrap()
+                .manifest
+                .version,
+            "0.15.0"
+        );
     }
 }
