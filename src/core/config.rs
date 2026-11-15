@@ -613,6 +613,26 @@ impl ConfigDocument {
         validate_instance_against_schema(&schema_json, &config_json, "config.toml")?;
         evaluate_schema_invariants(&schema_json, &config_json)
     }
+
+    /// Extract normalized `[extensions.oidc_sso].issuer` if configured (trailing `/` stripped).
+    #[must_use]
+    pub fn oidc_sso_issuer(&self) -> Option<String> {
+        let issuer = self
+            .doc
+            .get("extensions")
+            .and_then(|v| v.as_table_like())
+            .and_then(|ext| ext.get("oidc_sso"))
+            .and_then(|v| v.as_table_like())
+            .and_then(|oidc| oidc.get("issuer"))
+            .and_then(|v| v.as_str())?
+            .trim()
+            .trim_end_matches('/');
+        if issuer.is_empty() {
+            None
+        } else {
+            Some(issuer.to_string())
+        }
+    }
 }
 
 fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
@@ -1313,5 +1333,26 @@ file = "app.db"
         std::fs::write(&bad_path, "[extensions]\nenabled = \"http_api\"\n").expect("write bad");
         let bad = ConfigDocument::load(&bad_path).expect("load bad");
         assert!(bad.extensions_enabled_raw().is_err());
+    }
+
+    #[test]
+    fn oidc_sso_issuer_normalizes_trailing_slash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[extensions.oidc_sso]\nissuer = \"https://idp.example.com///\"\n",
+        )
+        .expect("write");
+        let doc = ConfigDocument::load(&path).expect("load");
+        assert_eq!(
+            doc.oidc_sso_issuer().as_deref(),
+            Some("https://idp.example.com")
+        );
+
+        let empty_path = dir.path().join("empty.toml");
+        std::fs::write(&empty_path, "[extensions.oidc_sso]\nissuer = \"   \"\n").expect("write");
+        let empty = ConfigDocument::load(&empty_path).expect("load empty");
+        assert_eq!(empty.oidc_sso_issuer(), None);
     }
 }
