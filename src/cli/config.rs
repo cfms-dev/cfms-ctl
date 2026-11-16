@@ -8,9 +8,6 @@ pub enum ConfigCommand {
     /// Losslessly merge new template settings from `config.toml.sample` into `config.toml`.
     SyncTemplate(ConfigSyncTemplateArgs),
 
-    /// Migrate legacy business options from `config.toml` into the database `options` table.
-    MigrateOptions(ConfigMigrateOptionsArgs),
-
     /// Generate and store a 32-byte hex `security.pepper` in `config.toml` when missing.
     FillPepper,
 
@@ -20,41 +17,14 @@ pub enum ConfigCommand {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct ConfigMigrateOptionsArgs {
-    /// Preview pending DB option imports, conflicts, and TOML cleanups without writing.
-    #[arg(long)]
-    pub check: bool,
-
-    /// Discard legacy TOML values when an option namespace key already has an authoritative DB revision > 0.
-    #[arg(long = "discard-legacy")]
-    pub discard_legacy: bool,
-
-    /// Optional options JSON Schema directory or core `options.schema.json` path.
-    #[arg(long = "schema", value_name = "OPTIONS_SCHEMA")]
-    pub schema: Option<PathBuf>,
-
-    /// Optional `config.migrations.json` manifest path.
-    #[arg(long = "migrations", value_name = "MIGRATIONS_FILE")]
-    pub migrations: Option<PathBuf>,
-
-    /// Optional `config.schema.json` file to validate the cleaned `config.toml` against.
-    #[arg(long = "config-schema", value_name = "CONFIG_SCHEMA_FILE")]
-    pub config_schema: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Args)]
 pub struct ConfigSyncTemplateArgs {
     /// Configuration template to merge into `config.toml` (defaults to `config.toml.sample`).
     #[arg(long = "template", value_name = "FILE")]
     pub template: Option<PathBuf>,
 
-    /// Optional JSON Schema file to validate the merged configuration against (defaults to workspace `config.schema.json` if present).
-    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
-    pub schema: Option<PathBuf>,
-
-    /// Optional `config.migrations.json` manifest path for rule-driven TOML migrations.
-    #[arg(long = "migrations", value_name = "MIGRATIONS_FILE")]
-    pub migrations: Option<PathBuf>,
+    /// Optional core configuration contract JSON or `release-manifest.json` path.
+    #[arg(long = "contract", value_name = "FILE")]
+    pub contract: Option<PathBuf>,
 
     /// Report whether synchronization is needed without modifying `config.toml` (exits 1 if dirty).
     #[arg(long = "check")]
@@ -77,13 +47,13 @@ pub enum OptionsCommand {
     /// Read a single stored setting and its revision without loading extension code.
     Get(OptionsGetArgs),
 
-    /// Set a single option value from a JSON file using optimistic concurrency (`--expected-revision`).
+    /// Set a single core option value from a JSON file using optimistic concurrency (`--expected-revision`).
     Set(OptionsSetArgs),
 
-    /// Atomically update multiple keys in a namespace from a JSON file.
+    /// Atomically update multiple keys in a core namespace from a JSON file.
     SetMany(OptionsSetManyArgs),
 
-    /// Reset a setting to its default value using its expected revision.
+    /// Reset a core setting to its contract default value using its expected revision.
     Reset(OptionsResetArgs),
 }
 
@@ -93,9 +63,9 @@ pub struct OptionsListArgs {
     #[arg(long = "namespace")]
     pub namespace: Option<String>,
 
-    /// Optional JSON Schema file for option definitions (defaults to workspace `options.schema.json` if present).
-    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
-    pub schema: Option<PathBuf>,
+    /// Optional core configuration contract JSON or `release-manifest.json` path.
+    #[arg(long = "contract", value_name = "FILE")]
+    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -104,9 +74,9 @@ pub struct OptionsGetArgs {
     pub namespace: String,
     /// Option key (e.g. `name`).
     pub option_key: String,
-    /// Optional JSON Schema file for option definitions (defaults to workspace `options.schema.json` if present).
-    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
-    pub schema: Option<PathBuf>,
+    /// Optional core configuration contract JSON or `release-manifest.json` path.
+    #[arg(long = "contract", value_name = "FILE")]
+    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -121,9 +91,9 @@ pub struct OptionsSetArgs {
     /// Expected current revision (0 creates a new entry).
     #[arg(long = "expected-revision")]
     pub expected_revision: u64,
-    /// Optional JSON Schema file for option definitions (defaults to workspace `options.schema.json` if present).
-    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
-    pub schema: Option<PathBuf>,
+    /// Optional core configuration contract JSON or `release-manifest.json` path.
+    #[arg(long = "contract", value_name = "FILE")]
+    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -133,9 +103,9 @@ pub struct OptionsSetManyArgs {
     /// Path to JSON file mapping `option_key -> { value, expected_revision }`.
     #[arg(value_name = "PAYLOAD_FILE")]
     pub payload_file: PathBuf,
-    /// Optional JSON Schema file for option definitions (defaults to workspace `options.schema.json` if present).
-    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
-    pub schema: Option<PathBuf>,
+    /// Optional core configuration contract JSON or `release-manifest.json` path.
+    #[arg(long = "contract", value_name = "FILE")]
+    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -147,7 +117,7 @@ pub struct OptionsResetArgs {
     /// Expected current revision.
     #[arg(long = "expected-revision")]
     pub expected_revision: u64,
-    /// Optional JSON Schema file for option definitions (defaults to workspace `options.schema.json` if present).
-    #[arg(long = "schema", value_name = "SCHEMA_FILE")]
-    pub schema: Option<PathBuf>,
+    /// Optional core configuration contract JSON or `release-manifest.json` path.
+    #[arg(long = "contract", value_name = "FILE")]
+    pub contract: Option<PathBuf>,
 }

@@ -213,6 +213,10 @@ pub fn parse_and_validate_manifest_bytes(
         }
     }
 
+    if let Some(ref contract) = manifest.core_config_contract {
+        contract.validate()?;
+    }
+
     let release_id = sha256_hex(raw_bytes);
     let mut validated_manifest = manifest;
     validated_manifest.files = normalized_files;
@@ -357,6 +361,7 @@ pub(crate) mod tests {
             requires_python: ">=3.14".to_string(),
             managed_extensions: vec!["builtin".to_string()],
             files,
+            core_config_contract: None,
         };
         serde_json::to_vec_pretty(&manifest).unwrap()
     }

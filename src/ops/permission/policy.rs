@@ -138,7 +138,7 @@ pub async fn resolve_purge_config(
         load_db_policy(
             pool,
             paths,
-            args.schema.as_deref(),
+            args.contract.as_deref(),
             need_db_retention,
             need_db_batch,
         )
@@ -188,12 +188,12 @@ pub async fn resolve_purge_config(
 async fn load_db_policy(
     pool: &DbPool,
     paths: Option<&WorkspacePaths>,
-    explicit_schema: Option<&Path>,
+    explicit_contract: Option<&Path>,
     validate_retention: bool,
     validate_batch: bool,
 ) -> Result<PermissionRetentionPolicy> {
     let registry = match paths {
-        Some(p) => OptionsSchemaRegistry::from_workspace(p, explicit_schema)?,
+        Some(p) => OptionsSchemaRegistry::from_workspace(p, explicit_contract)?,
         None => OptionsSchemaRegistry::empty(),
     };
     let records = list_options(pool, &registry, Some(PERMISSION_RETENTION_NAMESPACE)).await?;
@@ -277,7 +277,7 @@ mod tests {
             retention_days: None,
             scope: PermissionScope::All,
             batch_size: None,
-            schema: None,
+            contract: None,
             dry_run: true,
         }
     }

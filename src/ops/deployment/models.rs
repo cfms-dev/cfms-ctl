@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use crate::core::CoreConfigContract;
 use crate::ui::{CommandReport, KeyValueTable, UiConsole};
 
 pub const RELEASE_MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -64,7 +65,7 @@ pub struct ReleaseManifestSummary {
 }
 
 /// Full release manifest stored in `release-manifest.json` (`format_version == 1`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReleaseManifest {
     pub format_version: u32,
     pub product: String,
@@ -74,6 +75,8 @@ pub struct ReleaseManifest {
     pub managed_extensions: Vec<String>,
     #[serde(default)]
     pub files: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_config_contract: Option<CoreConfigContract>,
 }
 
 /// Validated manifest paired with its exact canonical byte SHA-256 (`release_id`) and raw bytes.

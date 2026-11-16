@@ -8,13 +8,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Key, Table, TableLike, Value};
 use crate::core::atomic::write_with_timestamped_backup;
+use crate::core::contract::CoreConfigContract;
 use crate::core::error::{CfmsError, Result};
-use crate::core::migration::{
-    apply_toml_migrations, find_present_obsolete_paths, find_present_option_migration_paths,
-    has_dotted_path as migration_has_dotted_path, load_config_migrations,
-};
 use crate::core::paths::WorkspacePaths;
-use crate::core::schema::{load_json_schema_file, validate_config_against_schema};
 use crate::db::DatabaseKind;
 
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
@@ -198,16 +194,24 @@ pub struct ServerConfigSummary {
     pub database: DatabaseSectionConfig,
 }
 
+/// Core TOML path renamed cleanly via `x-renamed-from` in `core_config_contract`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenamedPathRecord {
+    pub from: String,
+    pub to: String,
+}
+
 /// Result of synchronizing a `ConfigDocument` with a template `ConfigDocument`.
 #[derive(Debug, Clone, Serialize)]
 pub struct TemplateSyncPlan {
     pub config_path: PathBuf,
     pub template_path: PathBuf,
     pub changed: bool,
-    pub migrations_applied: Vec<String>,
+    pub renamed_paths: Vec<RenamedPathRecord>,
     pub added_paths: Vec<String>,
     pub removed_paths: Vec<String>,
     pub preserved_paths: Vec<String>,
+    pub preserved_unknown_core_paths: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -339,11 +343,11 @@ impl ConfigDocument {
     }
 
     /// Replace this document's `[database]` section with the `[database]` section from `target`,
-    /// validating the resulting document (including optional JSON Schema) before mutating `self`.
+    /// validating the resulting document (including optional core contract) before mutating `self`.
     pub fn replace_database_section(
         &mut self,
         target: &Self,
-        schema_path: Option<&Path>,
+        contract: Option<&CoreConfigContract>,
     ) -> Result<()> {
         if paths_refer_to_same_file(&self.path, &target.path) {
             return Err(CfmsError::Config(
@@ -372,7 +376,7 @@ impl ConfigDocument {
             raw_source: self.raw_source.clone(),
             doc: candidate,
         };
-        candidate_wrapper.validate_with_schema(schema_path)?;
+        candidate_wrapper.validate_with_contract(contract)?;
         self.doc = candidate_wrapper.doc;
         Ok(())
     }
@@ -415,12 +419,12 @@ impl ConfigDocument {
 
     /// Losslessly update `[extensions].enabled` in memory, preserving comments and formatting.
     ///
-    /// Creates the `[extensions]` table if absent, validates against `schema_path` when supplied,
+    /// Creates the `[extensions]` table if absent, validates against `contract` when supplied,
     /// and commits the candidate `DocumentMut` only if validation succeeds.
     pub fn set_extensions_enabled(
         &mut self,
         enabled: &[String],
-        schema_path: Option<&Path>,
+        contract: Option<&CoreConfigContract>,
     ) -> Result<Vec<String>> {
         let mut candidate = self.doc.clone();
         if !candidate.contains_key("extensions") {
@@ -465,8 +469,8 @@ impl ConfigDocument {
             raw_source: self.raw_source.clone(),
             doc: candidate,
         };
-        let warnings = if schema_path.is_some() {
-            candidate_wrapper.validate_with_schema(schema_path)?
+        let warnings = if contract.is_some() {
+            candidate_wrapper.validate_with_contract(contract)?
         } else {
             Vec::new()
         };
@@ -481,42 +485,23 @@ impl ConfigDocument {
         remove_paths: &[String],
         prune: bool,
     ) -> Result<TemplateSyncPlan> {
-        self.sync_with_template_and_schema(template, remove_paths, prune, None)
+        self.sync_with_contract(template, remove_paths, prune, None)
     }
 
-    /// Synchronize this configuration document in-place with `template` using `toml_edit` CST merging,
-    /// and optionally validate the resulting configuration against an external JSON Schema file.
-    pub fn sync_with_template_and_schema(
-        &mut self,
-        template: &Self,
-        remove_paths: &[String],
-        prune: bool,
-        schema_path: Option<&Path>,
-    ) -> Result<TemplateSyncPlan> {
-        self.sync_with_template_and_migrations(
-            template,
-            remove_paths,
-            prune,
-            schema_path,
-            None,
-            false,
-        )
-    }
-
-    /// Synchronize this configuration document in-place with `template`, applying declarative
-    /// `config.migrations.json` rules before template structural checks and schema validation.
+    /// Synchronize this configuration document in-place with `template` using `toml_edit` CST merging
+    /// and an optional [`CoreConfigContract`].
     ///
-    /// When `allow_unmigrated_options` is `false` and `migrations_path` is provided, any remaining
-    /// `options_migrations` or `obsolete_paths` entries cause an explicit error directing the user
-    /// to run `cfms-ctl config migrate-options` first.
-    pub fn sync_with_template_and_migrations(
+    /// When `contract` is provided:
+    /// - Core fields declaring `x-renamed-from` (e.g. `database.db_name -> database.name`) are moved
+    ///   before missing template defaults are merged.
+    /// - Unmanaged `[extensions.<id>]` subtables (`x-unmanaged-subtables: true`) are preserved verbatim.
+    /// - Removed/unknown core fields are preserved with warnings unless `--prune` removes them.
+    pub fn sync_with_contract(
         &mut self,
         template: &Self,
         remove_paths: &[String],
         prune: bool,
-        schema_path: Option<&Path>,
-        migrations_path: Option<&Path>,
-        allow_unmigrated_options: bool,
+        contract: Option<&CoreConfigContract>,
     ) -> Result<TemplateSyncPlan> {
         if paths_refer_to_same_file(&self.path, &template.path) {
             return Err(CfmsError::Config(
@@ -525,28 +510,8 @@ impl ConfigDocument {
         }
 
         let mut candidate = self.doc.clone();
-        let mut migrations_applied = Vec::new();
         let mut warnings = Vec::new();
-        let mut mig_changed = false;
-
-        if let Some(mig_path) = migrations_path {
-            let manifest = load_config_migrations(mig_path)?;
-            let outcome = apply_toml_migrations(&mut candidate, &manifest, Some(&template.doc))?;
-            mig_changed = outcome.changed;
-            migrations_applied = outcome.applied_rule_ids;
-            warnings.extend(outcome.warnings);
-
-            if !allow_unmigrated_options {
-                let mut pending = find_present_option_migration_paths(candidate.as_table(), &manifest);
-                pending.extend(find_present_obsolete_paths(candidate.as_table(), &manifest));
-                if !pending.is_empty() {
-                    return Err(CfmsError::Config(format!(
-                        "Run `cfms-ctl config migrate-options` before synchronizing the template; legacy database-backed or obsolete settings remain in config.toml: {}",
-                        pending.join(", ")
-                    )));
-                }
-            }
-        }
+        let mut renamed_paths = Vec::new();
 
         let mut unknown_roots = Vec::new();
         find_unknown_roots(
@@ -559,10 +524,12 @@ impl ConfigDocument {
         let requested_removals: BTreeSet<String> = remove_paths.iter().cloned().collect();
         let mut invalid_removals = Vec::new();
         for req in &requested_removals {
-            let exists_in_current = migration_has_dotted_path(candidate.as_table(), req);
-            let is_template_external = unknown_roots
-                .iter()
-                .any(|u| req == u || req.starts_with(&format!("{u}.")));
+            let exists_in_current = has_dotted_path(candidate.as_table(), req);
+            let is_template_external = !has_dotted_path(template.doc.as_table(), req)
+                && (unknown_roots
+                    .iter()
+                    .any(|u| req == u || req.starts_with(&format!("{u}.")))
+                    || is_unmanaged_extension_path(req));
             if !exists_in_current || !is_template_external {
                 invalid_removals.push(req.clone());
             }
@@ -582,6 +549,10 @@ impl ConfigDocument {
 
         for path in &selected_removals {
             remove_dotted_path(candidate.as_table_mut(), template.doc.as_table(), path);
+        }
+
+        if let Some(c) = contract {
+            apply_contract_renames(&mut candidate, c, &mut renamed_paths, &mut warnings);
         }
 
         let mut added_paths = Vec::new();
@@ -605,14 +576,33 @@ impl ConfigDocument {
             raw_source: self.raw_source.clone(),
             doc: candidate,
         };
-        warnings.extend(candidate_wrapper.validate_with_schema(schema_path)?);
+
+        let mut preserved_unknown_core_paths = Vec::new();
+        if let Some(c) = contract {
+            let config_json = candidate_wrapper.to_json_value()?;
+            let unknown_core = c.collect_unknown_core_toml_paths(&config_json);
+            if !prune {
+                for p in &unknown_core {
+                    warnings.push(format!(
+                        "Preserved removed/unknown core configuration path '{p}' (not present in core_config_contract.toml)"
+                    ));
+                }
+                preserved_unknown_core_paths = unknown_core.clone();
+            }
+            // Validate active core schema + invariants + `[extensions]`, ignoring any preserved unknown core paths.
+            candidate_wrapper.validate_structural_baseline()?;
+            warnings.extend(c.validate_toml(&config_json, &preserved_unknown_core_paths)?);
+        } else {
+            candidate_wrapper.validate_structural_baseline()?;
+        }
 
         added_paths.sort();
         let mut removed_paths = selected_removals;
         removed_paths.sort();
         preserved_paths.sort();
 
-        let changed = mig_changed || !added_paths.is_empty() || !removed_paths.is_empty();
+        let changed =
+            !renamed_paths.is_empty() || !added_paths.is_empty() || !removed_paths.is_empty();
         if changed {
             self.doc = candidate_wrapper.doc;
         }
@@ -621,17 +611,16 @@ impl ConfigDocument {
             config_path: self.path.clone(),
             template_path: template.path.clone(),
             changed,
-            migrations_applied,
+            renamed_paths,
             added_paths,
             removed_paths,
             preserved_paths,
+            preserved_unknown_core_paths,
             warnings,
         })
     }
 
-    /// Validate structural invariants and optionally evaluate an external `config.schema.json`
-    /// (including standard JSON Schema keywords, regex/integer normalization, and `x-invariants`).
-    pub fn validate_with_schema(&self, schema_path: Option<&Path>) -> Result<Vec<String>> {
+    fn validate_structural_baseline(&self) -> Result<()> {
         if let Some(sec_item) = self.doc.get("security")
             && !sec_item.is_table_like()
         {
@@ -642,20 +631,32 @@ impl ConfigDocument {
 
         // Verify that the minimal [database] connection table required by cfms-ctl is well-formed.
         let _ = self.database_config()?;
+        Ok(())
+    }
 
-        let Some(path) = schema_path else {
+    fn to_json_value(&self) -> Result<serde_json::Value> {
+        toml::from_str(&self.doc.to_string()).map_err(|e| {
+            CfmsError::Config(format!(
+                "Unable to convert '{}' for contract validation: {e}",
+                self.path.display()
+            ))
+        })
+    }
+
+    /// Validate structural invariants and strictly evaluate an optional [`CoreConfigContract`]
+    /// (`Draft 2020-12` JSON Schema, `x-normalize`, `x-invariants`, and `[extensions]` rules).
+    pub fn validate_with_contract(
+        &self,
+        contract: Option<&CoreConfigContract>,
+    ) -> Result<Vec<String>> {
+        self.validate_structural_baseline()?;
+
+        let Some(c) = contract else {
             return Ok(Vec::new());
         };
 
-        let schema_json = load_json_schema_file(path)?;
-        let config_json: serde_json::Value = toml::from_str(&self.doc.to_string()).map_err(|e| {
-            CfmsError::Config(format!(
-                "Unable to convert '{}' for schema validation: {e}",
-                self.path.display()
-            ))
-        })?;
-
-        validate_config_against_schema(&schema_json, &config_json)
+        let config_json = self.to_json_value()?;
+        c.validate_toml(&config_json, &[])
     }
 
     /// Extract normalized `[extensions.oidc_sso].issuer` if configured (trailing `/` stripped).
@@ -700,6 +701,10 @@ fn find_unknown_roots(
         if current_item.is_none() {
             continue;
         }
+        // Unmanaged `[extensions.<id>]` subtables are never flagged for pruning.
+        if prefix.len() == 1 && prefix[0] == "extensions" && key != "enabled" {
+            continue;
+        }
         let mut path = prefix.to_vec();
         path.push(key.to_string());
         let dotted = path.join(".");
@@ -722,6 +727,146 @@ fn find_unknown_roots(
         }
     }
     Ok(())
+}
+
+fn has_dotted_path(root: &dyn TableLike, dotted_path: &str) -> bool {
+    let parts: Vec<&str> = dotted_path.split('.').collect();
+    let Some((first, rest)) = parts.split_first() else {
+        return false;
+    };
+    let Some(mut item) = root.get(first) else {
+        return false;
+    };
+    if item.is_none() {
+        return false;
+    }
+    for part in rest {
+        let Some(table) = item.as_table_like() else {
+            return false;
+        };
+        let Some(next) = table.get(part) else {
+            return false;
+        };
+        if next.is_none() {
+            return false;
+        }
+        item = next;
+    }
+    true
+}
+
+fn is_unmanaged_extension_path(dotted_path: &str) -> bool {
+    let mut parts = dotted_path.split('.');
+    matches!((parts.next(), parts.next()), (Some("extensions"), Some(sub)) if sub != "enabled")
+}
+
+fn can_set_dotted_item(root: &dyn TableLike, dotted_path: &str) -> bool {
+    let parts: Vec<&str> = dotted_path.split('.').collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let mut current = root;
+    for part in &parts[..parts.len() - 1] {
+        match current.get(part) {
+            Some(item) if !item.is_none() => {
+                let Some(next) = item.as_table_like() else {
+                    return false;
+                };
+                current = next;
+            }
+            _ => return true,
+        }
+    }
+    true
+}
+
+fn take_dotted_item(current: &mut dyn TableLike, dotted_path: &str) -> Option<Item> {
+    let parts: Vec<&str> = dotted_path.split('.').collect();
+    take_parts_recursive(current, &parts)
+}
+
+fn take_parts_recursive(current: &mut dyn TableLike, parts: &[&str]) -> Option<Item> {
+    let (first, rest) = parts.split_first()?;
+    if rest.is_empty() {
+        let removed = current.remove(first)?;
+        return if removed.is_none() { None } else { Some(removed) };
+    }
+    let (taken, became_empty) = if let Some(child_item) = current.get_mut(first)
+        && let Some(child_table) = child_item.as_table_like_mut()
+    {
+        let item = take_parts_recursive(child_table, rest);
+        (item, child_table.is_empty())
+    } else {
+        return None;
+    };
+    if taken.is_some() && became_empty {
+        current.remove(first);
+    }
+    taken
+}
+
+fn set_dotted_item(current: &mut dyn TableLike, dotted_path: &str, item: Item) {
+    let parts: Vec<&str> = dotted_path.split('.').collect();
+    set_parts_recursive(current, &parts, item);
+}
+
+fn set_parts_recursive(current: &mut dyn TableLike, parts: &[&str], item: Item) {
+    let Some((first, rest)) = parts.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        current.insert(first, item);
+        return;
+    }
+    if !current.contains_key(first) || current.get(first).is_some_and(Item::is_none) {
+        let mut table = Table::new();
+        table.set_implicit(true);
+        current.insert(first, Item::Table(table));
+    }
+    if let Some(child) = current.get_mut(first).and_then(|i| i.as_table_like_mut()) {
+        set_parts_recursive(child, rest, item);
+    }
+}
+
+fn apply_contract_renames(
+    candidate: &mut DocumentMut,
+    contract: &CoreConfigContract,
+    renamed: &mut Vec<RenamedPathRecord>,
+    warnings: &mut Vec<String>,
+) {
+    for spec in contract.collect_toml_leaf_specs() {
+        if spec.renamed_from.is_empty() {
+            continue;
+        }
+        for old_path in &spec.renamed_from {
+            if !has_dotted_path(candidate.as_table(), old_path) {
+                continue;
+            }
+            if has_dotted_path(candidate.as_table(), &spec.dotted_path) {
+                warnings.push(format!(
+                    "Both legacy path '{old_path}' and new path '{}' exist; kept '{}'",
+                    spec.dotted_path, spec.dotted_path
+                ));
+                break;
+            }
+            if !can_set_dotted_item(candidate.as_table(), &spec.dotted_path) {
+                warnings.push(format!(
+                    "Could not rename '{old_path}' to '{}' because parent path is not a table; kept '{old_path}'",
+                    spec.dotted_path
+                ));
+                continue;
+            }
+            if let Some(mut moved_item) = take_dotted_item(candidate.as_table_mut(), old_path) {
+                clear_table_positions(&mut moved_item);
+                set_dotted_item(candidate.as_table_mut(), &spec.dotted_path, moved_item);
+                renamed.push(RenamedPathRecord {
+                    from: old_path.clone(),
+                    to: spec.dotted_path.clone(),
+                });
+                break;
+            }
+        }
+    }
 }
 
 fn remove_dotted_path(
@@ -1124,16 +1269,19 @@ sqlite_path = "./data.db"
     }
 
     #[test]
-    fn test_sync_template_with_external_json_schema_and_invariants() {
+    fn test_sync_with_contract_renames_preserves_extensions_and_enforces_invariants() {
+        use crate::core::contract::{CORE_CONFIG_CONTRACT_VERSION, DRAFT_2020_12_DIALECT};
+        use serde_json::json;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
         let template_path = dir.path().join("config.toml.sample");
-        let schema_path = dir.path().join("config.schema.json");
 
         let template_content = r#"[server]
 host = "0.0.0.0"
 port = 5104
 secret_key = ""
+file_chunk_size = 1048576
 
 [server.admission_control]
 max_connections = 64
@@ -1145,55 +1293,131 @@ pepper = ""
 
 [database]
 type = "sqlite"
-file = "app.db"
+name = "app_db"
 
 [database.pool]
 size = 5
 max_overflow = 10
-"#;
-        let schema_content = r#"{
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "object",
-            "properties": {
-                "server": {
-                    "type": "object",
-                    "properties": {
-                        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
-                    }
-                }
-            },
-            "x-invariants": [
-                {
-                    "rule": "order",
-                    "lower": "server.admission_control.max_connections_per_ip",
-                    "upper": "server.admission_control.max_connections",
-                    "allow_equal": true,
-                    "message": "server.admission_control.max_connections_per_ip must not exceed max_connections"
-                },
-                {
-                    "rule": "order",
-                    "lower": "server.admission_control.max_inflight_requests",
-                    "upper": ["database.pool.size", "database.pool.max_overflow"],
-                    "allow_equal": true,
-                    "severity": "warning",
-                    "message": "`server.admission_control.max_inflight_requests` exceeds `database.pool.size + database.pool.max_overflow`."
-                },
-                {
-                    "rule": "non_empty",
-                    "path": "security.pepper",
-                    "severity": "warning",
-                    "message": "Setting `security.pepper` to empty can lead to password storage security risks; run `cfms-ctl config fill-pepper`."
-                }
-            ]
-        }"#;
-        std::fs::write(&template_path, template_content).expect("write template");
-        std::fs::write(&schema_path, schema_content).expect("write schema");
 
-        // 1. Valid config with inflight > pool sum and empty pepper produces non-blocking warnings from schema
+[extensions]
+enabled = []
+"#;
+        let contract = CoreConfigContract {
+            contract_version: CORE_CONFIG_CONTRACT_VERSION.to_string(),
+            core_version: "0.14.0".to_string(),
+            schema_dialect: DRAFT_2020_12_DIALECT.to_string(),
+            toml: json!({
+                "$schema": DRAFT_2020_12_DIALECT,
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["server", "security", "database", "extensions"],
+                "properties": {
+                    "server": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["file_chunk_size"],
+                        "properties": {
+                            "host": { "type": "string", "minLength": 1, "x-normalize": "trim" },
+                            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                            "secret_key": { "type": "string" },
+                            "file_chunk_size": { "type": "integer", "exclusiveMinimum": 0 },
+                            "admission_control": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "max_connections": { "type": "integer", "minimum": 1 },
+                                    "max_connections_per_ip": { "type": "integer", "minimum": 1 },
+                                    "max_inflight_requests": { "type": "integer", "minimum": 1 }
+                                }
+                            }
+                        }
+                    },
+                    "security": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "pepper": { "type": "string" }
+                        }
+                    },
+                    "database": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["type"],
+                        "properties": {
+                            "type": { "type": "string", "enum": ["sqlite", "mysql", "postgresql"] },
+                            "name": {
+                                "type": "string",
+                                "default": "app_db",
+                                "x-renamed-from": ["database.db_name"]
+                            },
+                            "pool": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "size": { "type": "integer", "minimum": 1 },
+                                    "max_overflow": { "type": "integer", "minimum": 0 }
+                                }
+                            }
+                        }
+                    },
+                    "extensions": {
+                        "type": "object",
+                        "additionalProperties": { "type": "object" },
+                        "required": ["enabled"],
+                        "x-unmanaged-subtables": true,
+                        "properties": {
+                            "enabled": {
+                                "type": "array",
+                                "uniqueItems": true,
+                                "items": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_]*$",
+                                    "not": { "enum": ["builtin", "scheduling"] }
+                                }
+                            }
+                        }
+                    }
+                },
+                "x-invariants": [
+                    {
+                        "rule": "order",
+                        "lower": "server.admission_control.max_connections_per_ip",
+                        "upper": "server.admission_control.max_connections",
+                        "allow_equal": true,
+                        "message": "server.admission_control.max_connections_per_ip must not exceed max_connections"
+                    },
+                    {
+                        "rule": "order",
+                        "lower": "server.admission_control.max_inflight_requests",
+                        "upper": ["database.pool.size", "database.pool.max_overflow"],
+                        "allow_equal": true,
+                        "severity": "warning",
+                        "message": "`server.admission_control.max_inflight_requests` exceeds `database.pool.size + database.pool.max_overflow`."
+                    },
+                    {
+                        "rule": "non_empty",
+                        "path": "security.pepper",
+                        "severity": "warning",
+                        "message": "Setting `security.pepper` to empty can lead to password storage security risks; run `cfms-ctl config fill-pepper`."
+                    }
+                ]
+            }),
+            options: json!({
+                "$schema": DRAFT_2020_12_DIALECT,
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {}
+            }),
+        };
+        std::fs::write(&template_path, template_content).expect("write template");
+
+        // 1. Legacy database.db_name renames cleanly, removed core field is preserved with warning,
+        // unmanaged extension subtable is left untouched, and non-blocking invariant warnings surface.
         let valid_config = r#"[server]
-host = "127.0.0.1"
+host = "  127.0.0.1  "
 port = 5104
 secret_key = "secret"
+removed_core_flag = true
 
 [server.admission_control]
 max_inflight_requests = 20
@@ -1203,33 +1427,75 @@ pepper = ""
 
 [database]
 type = "sqlite"
-file = "app.db"
+db_name = "custom_legacy_db"
+
+[extensions]
+enabled = ["oidc_sso"]
+
+[extensions.oidc_sso]
+issuer = "https://idp.example.com"
+client_id = "cfms-web"
 "#;
         std::fs::write(&config_path, valid_config).expect("write config");
         let mut doc = ConfigDocument::load(&config_path).expect("load config");
         let template_doc = ConfigDocument::load(&template_path).expect("load template");
         let plan = doc
-            .sync_with_template_and_schema(&template_doc, &[], false, Some(&schema_path))
-            .expect("sync with schema");
-        assert_eq!(plan.warnings.len(), 2);
+            .sync_with_contract(&template_doc, &[], false, Some(&contract))
+            .expect("sync with contract");
+        assert_eq!(
+            plan.renamed_paths,
+            vec![RenamedPathRecord {
+                from: "database.db_name".to_string(),
+                to: "database.name".to_string(),
+            }]
+        );
+        assert_eq!(
+            plan.preserved_unknown_core_paths,
+            vec!["server.removed_core_flag"]
+        );
+        assert!(plan.warnings.len() >= 3);
+        let rendered = doc.document().to_string();
+        assert!(rendered.contains("name = \"custom_legacy_db\""));
+        assert!(!rendered.contains("db_name"));
+        assert!(rendered.contains("removed_core_flag = true"));
+        assert!(rendered.contains("[extensions.oidc_sso]"));
+        assert!(rendered.contains("issuer = \"https://idp.example.com\""));
+
+        // Strict validate still fails on preserved unknown core field
+        assert!(doc.validate_with_contract(Some(&contract)).is_err());
+
+        // Prune removes removed core key while keeping [extensions.oidc_sso] untouched
+        let prune_plan = doc
+            .sync_with_contract(&template_doc, &[], true, Some(&contract))
+            .expect("prune with contract");
+        assert_eq!(prune_plan.removed_paths, vec!["server.removed_core_flag"]);
+        assert!(doc.document().to_string().contains("[extensions.oidc_sso]"));
+        doc.validate_with_contract(Some(&contract))
+            .expect("valid after prune");
 
         // 2. Config violating blocking order invariant fails
         let bad_config = r#"[server]
 host = "127.0.0.1"
 port = 5104
+file_chunk_size = 1024
 
 [server.admission_control]
 max_connections = 32
 max_connections_per_ip = 64
 
+[security]
+pepper = "abc"
+
 [database]
 type = "sqlite"
-file = "app.db"
+
+[extensions]
+enabled = []
 "#;
         std::fs::write(&config_path, bad_config).expect("write bad config");
         let mut bad_doc = ConfigDocument::load(&config_path).expect("load bad config");
         let err = bad_doc
-            .sync_with_template_and_schema(&template_doc, &[], false, Some(&schema_path))
+            .sync_with_contract(&template_doc, &[], false, Some(&contract))
             .expect_err("blocking invariant violation");
         assert!(
             err.to_string()

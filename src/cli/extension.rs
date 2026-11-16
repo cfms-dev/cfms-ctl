@@ -47,9 +47,9 @@ pub struct ExtensionEnableArgs {
     #[arg(long = "dry-run")]
     pub dry_run: bool,
 
-    /// Optional JSON Schema file (`config.schema.json`) used to validate `config.toml` before write.
-    #[arg(long = "schema", value_name = "FILE")]
-    pub schema: Option<PathBuf>,
+    /// Optional core configuration contract JSON or `release-manifest.json` path used to validate `config.toml` before write.
+    #[arg(long = "contract", value_name = "FILE")]
+    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -62,9 +62,9 @@ pub struct ExtensionDisableArgs {
     #[arg(long = "dry-run")]
     pub dry_run: bool,
 
-    /// Optional JSON Schema file (`config.schema.json`) used to validate `config.toml` before write.
-    #[arg(long = "schema", value_name = "FILE")]
-    pub schema: Option<PathBuf>,
+    /// Optional core configuration contract JSON or `release-manifest.json` path used to validate `config.toml` before write.
+    #[arg(long = "contract", value_name = "FILE")]
+    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -126,8 +126,8 @@ mod tests {
             "http_api",
             "oidc_sso",
             "--dry-run",
-            "--schema",
-            "config.schema.json",
+            "--contract",
+            "release-manifest.json",
         ])
         .expect("valid extension enable args");
 
@@ -136,8 +136,8 @@ mod tests {
                 assert_eq!(args.identifiers, vec!["http_api", "oidc_sso"]);
                 assert!(args.dry_run);
                 assert_eq!(
-                    args.schema.as_deref(),
-                    Some(std::path::Path::new("config.schema.json"))
+                    args.contract.as_deref(),
+                    Some(std::path::Path::new("release-manifest.json"))
                 );
             }
             other => panic!("unexpected command: {other:?}"),
@@ -164,7 +164,7 @@ mod tests {
             Commands::Extension(ExtensionCommand::Disable(args)) => {
                 assert_eq!(args.identifiers, vec!["oidc_sso"]);
                 assert!(args.dry_run);
-                assert!(args.schema.is_none());
+                assert!(args.contract.is_none());
             }
             other => panic!("unexpected command: {other:?}"),
         }

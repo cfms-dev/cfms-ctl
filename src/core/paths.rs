@@ -235,38 +235,6 @@ impl WorkspacePaths {
             .find(|p| p.is_file()))
     }
 
-    /// Discover the external `config.schema.json` file in the workspace or validate an explicit override.
-    pub fn discover_config_schema_path(
-        &self,
-        override_path: Option<&Path>,
-    ) -> Result<Option<PathBuf>> {
-        self.discover_named_schema_file(
-            "config.schema.json",
-            "Configuration schema",
-            override_path,
-        )
-    }
-
-    /// Discover the external `config.migrations.json` file in the workspace or validate an explicit override.
-    pub fn discover_config_migrations_path(
-        &self,
-        override_path: Option<&Path>,
-    ) -> Result<Option<PathBuf>> {
-        self.discover_named_schema_file(
-            "config.migrations.json",
-            "Configuration migrations",
-            override_path,
-        )
-    }
-
-    /// Discover the external `options.schema.json` file in the workspace or validate an explicit override.
-    pub fn discover_options_schema_path(
-        &self,
-        override_path: Option<&Path>,
-    ) -> Result<Option<PathBuf>> {
-        self.discover_named_schema_file("options.schema.json", "Options schema", override_path)
-    }
-
     /// Discover a pre-exported `schema.ir.json` file in the workspace or validate an explicit override.
     pub fn discover_schema_ir_path(
         &self,
@@ -334,7 +302,6 @@ mod tests {
         std::fs::write(src.join("alembic.ini"), "[alembic]\n").unwrap();
         std::fs::write(src.join("alembic").join("env.py"), "# env\n").unwrap();
         std::fs::write(include_schemas.join("schema.ir.json"), "{}").unwrap();
-        std::fs::write(include_schemas.join("config.migrations.json"), "{}").unwrap();
 
         // Notice `config.toml` is absent: `from_code_dir` still works cleanly.
         let code_paths = WorkspacePaths::from_code_dir(&src).expect("from_code_dir");
@@ -347,20 +314,6 @@ mod tests {
             .expect("discover ir")
             .expect("some schema.ir.json");
         assert_eq!(ir_path, WorkspacePaths::canonicalize_clean(&include_schemas.join("schema.ir.json")));
-
-        let mig_path = code_paths
-            .discover_config_migrations_path(None)
-            .expect("discover migrations")
-            .expect("some config.migrations.json");
-        assert_eq!(
-            mig_path,
-            WorkspacePaths::canonicalize_clean(&include_schemas.join("config.migrations.json"))
-        );
-        assert!(
-            code_paths
-                .discover_config_migrations_path(Some(Path::new("missing.migrations.json")))
-                .is_err()
-        );
 
         let ap = code_paths.discover_alembic_paths().expect("alembic paths");
         assert_eq!(ap.ini_path, code_paths.server_root.join("alembic.ini"));

@@ -1,6 +1,7 @@
 //! Database-backed `options` CRUD with two-level optimistic concurrency (`options.revision`
 //! and `system_states` namespace write-skew guard), canonical tagged scalar/JSON encoding,
-//! external JSON Schema + `x-invariants` validation, and transactional `audit_entries` logging.
+//! `core_config_contract.options` (`Draft 2020-12` + `x-invariants`) validation, and transactional
+//! `audit_entries` logging.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -11,11 +12,12 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sqlx::{MySql, Postgres, Row, Sqlite, Transaction};
+use crate::core::contract::CoreConfigContract;
 use crate::core::error::{CfmsError, Result};
 use crate::core::paths::WorkspacePaths;
 use crate::core::schema::{
     evaluate_schema_invariants, format_canonical_float, is_canonical_int_str,
-    load_json_schema_file, normalize_and_precheck_value, validate_instance_against_schema,
+    normalize_and_precheck_value, validate_instance_against_schema,
 };
 use crate::db::backend::DbPool;
 
@@ -249,293 +251,122 @@ pub fn decode_option_value(value_type: &str, option_value: &str) -> Result<Value
     }
 }
 
-/// Property-level metadata extracted from a namespace's JSON Schema.
+/// Property-level metadata extracted from `core_config_contract.options`.
 #[derive(Debug, Clone)]
 pub struct OptionPropertySpec {
     pub option_key: String,
     pub schema_version: i32,
     pub default_value: Option<Value>,
+    pub renamed_from: Vec<String>,
     pub raw_property_schema: Value,
 }
 
-/// Namespace-level schema specification loaded from an external JSON Schema or extension manifest.
+/// Core namespace specification loaded from `core_config_contract.options`.
 #[derive(Debug, Clone)]
 pub struct NamespaceSchemaSpec {
     pub namespace: String,
     pub owner: String,
-    pub is_core: bool,
-    pub has_detailed_schema: bool,
     pub raw_schema: Value,
     pub properties: BTreeMap<String, OptionPropertySpec>,
 }
 
-/// Dynamically loaded registry of option namespace schemas discovered from the target workspace.
+/// Registry of core database option schemas loaded from `core_config_contract.options`.
+///
+/// Extension options are intentionally excluded; reads (`list` / `get`) return stored database
+/// rows across all owners while validated writes (`set` / `set-many` / `reset`) are restricted to
+/// declared core namespaces when a contract is active.
 #[derive(Debug, Clone, Default)]
 pub struct OptionsSchemaRegistry {
-    has_core_schema: bool,
+    has_core_contract: bool,
     namespaces: BTreeMap<String, NamespaceSchemaSpec>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ExtensionManifestOptions {
-    #[serde(default)]
-    option_namespaces: Vec<String>,
-    #[serde(default)]
-    options_schema: Option<toml::Value>,
-    #[serde(default)]
-    extension: ManifestExtId,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ManifestExtId {
-    #[serde(default)]
-    identifier: String,
-}
-
 impl OptionsSchemaRegistry {
-    /// Create an empty schema registry (schema-less fallback mode).
+    /// Create an empty registry (schema-less fallback mode for pre-contract workspaces).
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Discover and load core and extension option schemas from `WorkspacePaths`.
-    pub fn from_workspace(
-        paths: &WorkspacePaths,
-        explicit_schema: Option<&Path>,
-    ) -> Result<Self> {
-        let core_schema = paths.discover_options_schema_path(explicit_schema)?;
-        Self::load(core_schema.as_deref(), Some(&paths.extensions_root))
-    }
+    /// Build a registry directly from a [`CoreConfigContract`].
+    pub fn from_contract(contract: &CoreConfigContract) -> Result<Self> {
+        let mut registry = Self {
+            has_core_contract: true,
+            namespaces: BTreeMap::new(),
+        };
+        let Some(ns_map) = contract
+            .options
+            .as_object()
+            .and_then(|o| o.get("properties"))
+            .and_then(Value::as_object)
+        else {
+            return Err(CfmsError::Config(
+                "Invalid core_config_contract.options: missing top-level 'properties' object"
+                    .to_string(),
+            ));
+        };
 
-    /// Load an `OptionsSchemaRegistry` from an optional core JSON Schema path and extensions directory.
-    pub fn load(
-        core_schema_path: Option<&Path>,
-        extensions_root: Option<&Path>,
-    ) -> Result<Self> {
-        let mut registry = Self::empty();
-
-        if let Some(path) = core_schema_path {
-            let root_json = load_json_schema_file(path)?;
-            registry.has_core_schema = true;
-            registry.ingest_schema_document(&root_json, "core", true)?;
-        }
-
-        if let Some(ext_root) = extensions_root
-            && ext_root.is_dir()
-        {
-            registry.ingest_extensions_dir(ext_root)?;
+        for (ns_name, ns_val) in ns_map {
+            let Some(ns_obj) = ns_val.as_object() else {
+                return Err(CfmsError::Config(format!(
+                    "Namespace schema for '{ns_name}' in core_config_contract.options must be a JSON object"
+                )));
+            };
+            let spec = parse_namespace_schema_object(ns_name, ns_obj)?;
+            registry.namespaces.insert(spec.namespace.clone(), spec);
         }
 
         Ok(registry)
     }
 
-    /// Whether a core `options.schema.json` file was loaded.
-    #[must_use]
-    pub const fn has_core_schema(&self) -> bool {
-        self.has_core_schema
+    /// Discover and load core option schemas from the workspace `core_config_contract`
+    /// (explicit `--contract` override, `release-manifest.json`, or source Python reflection).
+    pub fn from_workspace(
+        paths: &WorkspacePaths,
+        explicit_contract: Option<&Path>,
+    ) -> Result<Self> {
+        let Some((contract, _source)) =
+            CoreConfigContract::from_workspace(paths, explicit_contract)?
+        else {
+            return Ok(Self::empty());
+        };
+        Self::from_contract(&contract)
     }
 
-    /// Look up a namespace schema specification by name.
+    /// Whether an active `core_config_contract` was loaded.
+    #[must_use]
+    pub const fn has_core_contract(&self) -> bool {
+        self.has_core_contract
+    }
+
+    /// Look up a core namespace schema specification by name.
     #[must_use]
     pub fn get_namespace(&self, namespace: &str) -> Option<&NamespaceSchemaSpec> {
         self.namespaces.get(namespace)
     }
 
-    /// Iterate over all loaded namespace specifications.
+    /// Iterate over all loaded core namespace specifications.
     pub fn namespaces(&self) -> impl Iterator<Item = (&String, &NamespaceSchemaSpec)> {
         self.namespaces.iter()
-    }
-
-    /// Ingest a JSON Schema document (either a multi-namespace catalog or a single-namespace schema).
-    pub fn ingest_schema_document(
-        &mut self,
-        doc: &Value,
-        default_owner: &str,
-        default_is_core: bool,
-    ) -> Result<()> {
-        let Some(root_obj) = doc.as_object() else {
-            return Err(CfmsError::Config(
-                "Options JSON Schema root must be a JSON object".to_string(),
-            ));
-        };
-
-        // Case 1: Single-namespace JSON Schema with `"x-namespace": "<ns>"`
-        if let Some(ns_name) = root_obj.get("x-namespace").and_then(Value::as_str) {
-            let spec = parse_namespace_schema_object(
-                ns_name,
-                root_obj,
-                default_owner,
-                default_is_core,
-            )?;
-            self.register_namespace_spec(spec)?;
-            return Ok(());
-        }
-
-        // Case 2: Multi-namespace catalog under `"namespaces"`, `"properties"`, `"$defs"`,
-        // or a direct top-level mapping `{ "<namespace>": { "properties": ... } }` (e.g. inline `[options_schema."<ns>"]` in `manifest.toml`).
-        let catalog_map = if let Some(ns_map) = root_obj
-            .get("namespaces")
-            .and_then(Value::as_object)
-            .or_else(|| root_obj.get("properties").and_then(Value::as_object))
-            .or_else(|| root_obj.get("$defs").and_then(Value::as_object))
-        {
-            ns_map
-        } else if !root_obj.is_empty()
-            && root_obj
-                .iter()
-                .filter(|(k, _)| !k.starts_with('$'))
-                .all(|(k, v)| v.is_object() && validate_option_namespace(k).is_ok())
-        {
-            root_obj
-        } else {
-            return Err(CfmsError::Config(
-                "Options JSON Schema must contain 'properties', 'namespaces', or 'x-namespace'"
-                    .to_string(),
-            ));
-        };
-
-        for (ns_name, ns_val) in catalog_map {
-            if ns_name.starts_with('$') {
-                continue;
-            }
-            let Some(ns_obj) = ns_val.as_object() else {
-                return Err(CfmsError::Config(format!(
-                    "Namespace schema for '{ns_name}' must be a JSON object"
-                )));
-            };
-            let spec =
-                parse_namespace_schema_object(ns_name, ns_obj, default_owner, default_is_core)?;
-            self.register_namespace_spec(spec)?;
-        }
-
-        Ok(())
-    }
-
-    fn ingest_extensions_dir(&mut self, extensions_root: &Path) -> Result<()> {
-        let mut entries: Vec<_> = std::fs::read_dir(extensions_root)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-
-        for entry in entries {
-            let dir = entry.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            let manifest_path = dir.join("manifest.toml");
-            let mut ext_owner = entry.file_name().to_string_lossy().to_string();
-            let mut declared_namespaces = Vec::new();
-            let mut inline_or_linked_loaded = false;
-
-            if manifest_path.is_file() {
-                let raw = std::fs::read_to_string(&manifest_path)?;
-                let parsed: ExtensionManifestOptions = toml::from_str(&raw).map_err(|e| {
-                    CfmsError::Extension(format!(
-                        "Invalid extension manifest '{}': {e}",
-                        manifest_path.display()
-                    ))
-                })?;
-                if !parsed.extension.identifier.is_empty() {
-                    ext_owner = parsed.extension.identifier;
-                }
-                validate_option_owner(&ext_owner)?;
-                declared_namespaces = parsed.option_namespaces;
-
-                if let Some(opt_schema_toml) = parsed.options_schema {
-                    match opt_schema_toml {
-                        toml::Value::String(rel_file) => {
-                            let schema_file = dir.join(rel_file);
-                            let json_doc = load_json_schema_file(&schema_file)?;
-                            self.ingest_schema_document(&json_doc, &ext_owner, false)?;
-                            inline_or_linked_loaded = true;
-                        }
-                        toml::Value::Table(_) => {
-                            let json_doc: Value =
-                                serde_json::to_value(opt_schema_toml).map_err(|e| {
-                                    CfmsError::Extension(format!(
-                                        "Invalid inline options_schema in '{}': {e}",
-                                        manifest_path.display()
-                                    ))
-                                })?;
-                            self.ingest_schema_document(&json_doc, &ext_owner, false)?;
-                            inline_or_linked_loaded = true;
-                        }
-                        _ => {
-                            return Err(CfmsError::Extension(format!(
-                                "Invalid 'options_schema' in '{}': must be a file path string or table",
-                                manifest_path.display()
-                            )));
-                        }
-                    }
-                }
-            }
-
-            let standalone_schema_path = dir.join("options.schema.json");
-            if !inline_or_linked_loaded && standalone_schema_path.is_file() {
-                validate_option_owner(&ext_owner)?;
-                let json_doc = load_json_schema_file(&standalone_schema_path)?;
-                self.ingest_schema_document(&json_doc, &ext_owner, false)?;
-            }
-
-            for ns in declared_namespaces {
-                validate_option_namespace(&ns)?;
-                if let Some(existing) = self.namespaces.get(&ns) {
-                    if existing.owner != ext_owner {
-                        return Err(CfmsError::Config(format!(
-                            "Multiple owners declare option namespace '{ns}': {}, {ext_owner}",
-                            existing.owner
-                        )));
-                    }
-                } else {
-                    self.namespaces.insert(
-                        ns.clone(),
-                        NamespaceSchemaSpec {
-                            namespace: ns,
-                            owner: ext_owner.clone(),
-                            is_core: false,
-                            has_detailed_schema: false,
-                            raw_schema: json!({"type": "object"}),
-                            properties: BTreeMap::new(),
-                        },
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn register_namespace_spec(&mut self, spec: NamespaceSchemaSpec) -> Result<()> {
-        if let Some(existing) = self.namespaces.get(&spec.namespace)
-            && existing.owner != spec.owner
-        {
-            return Err(CfmsError::Config(format!(
-                "Multiple owners declare option namespace '{}': {}, {}",
-                spec.namespace, existing.owner, spec.owner
-            )));
-        }
-        self.namespaces.insert(spec.namespace.clone(), spec);
-        Ok(())
     }
 }
 
 fn parse_namespace_schema_object(
     namespace: &str,
     ns_obj: &Map<String, Value>,
-    default_owner: &str,
-    default_is_core: bool,
 ) -> Result<NamespaceSchemaSpec> {
     validate_option_namespace(namespace)?;
     let owner = ns_obj
         .get("x-owner")
         .and_then(Value::as_str)
-        .unwrap_or(default_owner)
+        .unwrap_or("core")
         .to_string();
     validate_option_owner(&owner)?;
-
-    let is_core = ns_obj
-        .get("x-core")
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| default_is_core && owner == "core");
+    if owner != "core" {
+        return Err(CfmsError::Config(format!(
+            "Namespace '{namespace}' in core_config_contract.options has non-core owner '{owner}'"
+        )));
+    }
 
     let mut properties = BTreeMap::new();
     if let Some(props_obj) = ns_obj.get("properties").and_then(Value::as_object) {
@@ -560,12 +391,23 @@ fn parse_namespace_schema_object(
             if let Some(ref def_val) = default_value {
                 let _ = encode_option_value(def_val)?;
             }
+            let renamed_from = prop_obj
+                .get("x-renamed-from")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             properties.insert(
                 opt_key.clone(),
                 OptionPropertySpec {
                     option_key: opt_key.clone(),
                     schema_version,
                     default_value,
+                    renamed_from,
                     raw_property_schema: prop_val.clone(),
                 },
             );
@@ -583,8 +425,6 @@ fn parse_namespace_schema_object(
     Ok(NamespaceSchemaSpec {
         namespace: namespace.to_string(),
         owner,
-        is_core,
-        has_detailed_schema: true,
         raw_schema: Value::Object(raw_schema_map),
         properties,
     })
@@ -709,14 +549,9 @@ pub async fn list_options(
     }
 
     for (ns_name, spec) in registry.namespaces() {
-        if !spec.has_detailed_schema {
-            continue;
-        }
-        if let Some(filter) = namespace {
-            if filter != ns_name {
-                continue;
-            }
-        } else if !spec.is_core {
+        if let Some(filter) = namespace
+            && filter != ns_name
+        {
             continue;
         }
 
@@ -745,7 +580,7 @@ pub async fn list_options(
     Ok(records)
 }
 
-/// Read a single option by `(namespace, option_key)` using database state and optional external schema defaults.
+/// Read a single option by `(namespace, option_key)` using database state and optional core contract defaults.
 pub async fn get_option(
     pool: &DbPool,
     registry: &OptionsSchemaRegistry,
@@ -759,9 +594,7 @@ pub async fn get_option(
         return row.into_resolved();
     }
 
-    if let Some(spec) = registry.get_namespace(namespace)
-        && spec.has_detailed_schema
-    {
+    if let Some(spec) = registry.get_namespace(namespace) {
         if let Some(prop) = spec.properties.get(option_key)
             && let Some(ref def_val) = prop.default_value
         {
@@ -785,7 +618,7 @@ pub async fn get_option(
     )))
 }
 
-/// Reset a single option in `namespace` to its external schema default using optimistic concurrency.
+/// Reset a single core option in `namespace` to its contract default using optimistic concurrency.
 pub async fn reset_option(
     pool: &DbPool,
     registry: &OptionsSchemaRegistry,
@@ -797,15 +630,15 @@ pub async fn reset_option(
     validate_option_key(option_key)?;
 
     let Some(spec) = registry.get_namespace(namespace) else {
+        if registry.has_core_contract() {
+            return Err(CfmsError::Config(format!(
+                "Option namespace '{namespace}' is not part of core_config_contract; extension/custom options must be managed via the CFMS server or Python maintenance CLI"
+            )));
+        }
         return Err(CfmsError::Config(format!(
             "No schema default definition for {namespace}/{option_key}"
         )));
     };
-    if !spec.has_detailed_schema {
-        return Err(CfmsError::Config(format!(
-            "No schema default definition for {namespace}/{option_key}"
-        )));
-    }
     let Some(prop) = spec.properties.get(option_key) else {
         return Err(CfmsError::Config(format!(
             "No option definition for {namespace}/{option_key}"
@@ -854,6 +687,81 @@ pub async fn fetch_stored_options(
     Ok(map)
 }
 
+/// Specification for renaming a core database option row (`WHERE owner = 'core'`).
+#[derive(Debug, Clone)]
+pub struct CoreOptionRename {
+    pub old_namespace: String,
+    pub old_key: String,
+    pub new_namespace: String,
+    pub new_key: String,
+    pub schema_version: i32,
+}
+
+/// Rename core database option keys in a single SQL transaction (`WHERE owner = 'core'`).
+pub async fn rename_core_option_keys(
+    pool: &DbPool,
+    renames: &[CoreOptionRename],
+) -> Result<u64> {
+    if renames.is_empty() {
+        return Ok(0);
+    }
+    let mut moved = 0u64;
+    match pool {
+        DbPool::Sqlite(sqlite_pool) => {
+            let mut tx = sqlite_pool.begin().await?;
+            for r in renames {
+                let res = sqlx::query(
+                    "UPDATE options SET namespace = ?, option_key = ?, schema_version = ? WHERE owner = 'core' AND namespace = ? AND option_key = ?",
+                )
+                .bind(&r.new_namespace)
+                .bind(&r.new_key)
+                .bind(r.schema_version)
+                .bind(&r.old_namespace)
+                .bind(&r.old_key)
+                .execute(&mut *tx)
+                .await?;
+                moved += res.rows_affected();
+            }
+            tx.commit().await?;
+        }
+        DbPool::Mysql(mysql_pool) => {
+            let mut tx = mysql_pool.begin().await?;
+            for r in renames {
+                let res = sqlx::query(
+                    "UPDATE options SET namespace = ?, option_key = ?, schema_version = ? WHERE owner = 'core' AND namespace = ? AND option_key = ?",
+                )
+                .bind(&r.new_namespace)
+                .bind(&r.new_key)
+                .bind(r.schema_version)
+                .bind(&r.old_namespace)
+                .bind(&r.old_key)
+                .execute(&mut *tx)
+                .await?;
+                moved += res.rows_affected();
+            }
+            tx.commit().await?;
+        }
+        DbPool::Postgres(pg_pool) => {
+            let mut tx = pg_pool.begin().await?;
+            for r in renames {
+                let res = sqlx::query(
+                    "UPDATE options SET namespace = $1, option_key = $2, schema_version = $3 WHERE owner = 'core' AND namespace = $4 AND option_key = $5",
+                )
+                .bind(&r.new_namespace)
+                .bind(&r.new_key)
+                .bind(r.schema_version)
+                .bind(&r.old_namespace)
+                .bind(&r.old_key)
+                .execute(&mut *tx)
+                .await?;
+                moved += res.rows_affected();
+            }
+            tx.commit().await?;
+        }
+    }
+    Ok(moved)
+}
+
 fn validate_batch_target<'a>(
     registry: &'a OptionsSchemaRegistry,
     namespace: &str,
@@ -870,15 +778,13 @@ fn validate_batch_target<'a>(
     }
 
     let ns_spec = registry.get_namespace(namespace);
-    if ns_spec.is_none() && registry.has_core_schema() {
+    if ns_spec.is_none() && registry.has_core_contract() {
         return Err(CfmsError::Config(format!(
-            "Cannot resolve option declarations for '{namespace}'"
+            "Option namespace '{namespace}' is not part of core_config_contract; extension/custom option writes must be managed via the CFMS server or Python maintenance CLI"
         )));
     }
 
-    if let Some(spec) = ns_spec
-        && spec.has_detailed_schema
-    {
+    if let Some(spec) = ns_spec {
         let allow_additional = spec
             .raw_schema
             .get("additionalProperties")
@@ -1066,9 +972,7 @@ fn prepare_namespace_mutation(
     };
 
     let mut previous_resolved: BTreeMap<String, ResolvedOptionRecord> = BTreeMap::new();
-    if let Some(spec) = ns_spec
-        && spec.has_detailed_schema
-    {
+    if let Some(spec) = ns_spec {
         for prop in spec.properties.values() {
             if let Some(stored) = stored_map.get(&prop.option_key) {
                 if stored.schema_version != prop.schema_version {
@@ -1145,9 +1049,7 @@ fn prepare_namespace_mutation(
         merged_values.insert(key.clone(), update.value.clone());
     }
 
-    let normalized_map = if let Some(spec) = ns_spec
-        && spec.has_detailed_schema
-    {
+    let normalized_map = if let Some(spec) = ns_spec {
         validate_namespace_values_with_schema(spec, &merged_values)?
     } else {
         for val in merged_values.values() {
@@ -1928,6 +1830,7 @@ async fn fetch_single_option_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::contract::{CORE_CONFIG_CONTRACT_VERSION, DRAFT_2020_12_DIALECT};
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn setup_sqlite_pool() -> DbPool {
@@ -1990,155 +1893,105 @@ mod tests {
         DbPool::Sqlite(pool)
     }
 
-    fn write_sample_schemas(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-        let core_schema_path = root.join("options.schema.json");
-        let ext_root = root.join("extensions");
-        std::fs::create_dir_all(&ext_root).expect("create extensions root");
-
-        let core_schema = json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "object",
-            "properties": {
-                "security.password": {
-                    "type": "object",
-                    "x-owner": "core",
-                    "x-core": true,
-                    "additionalProperties": false,
-                    "properties": {
-                        "passwd_min_length": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "default": 8,
-                            "x-schema-version": 1
+    fn sample_contract() -> CoreConfigContract {
+        CoreConfigContract {
+            contract_version: CORE_CONFIG_CONTRACT_VERSION.to_string(),
+            core_version: "0.14.0".to_string(),
+            schema_dialect: DRAFT_2020_12_DIALECT.to_string(),
+            toml: json!({
+                "$schema": DRAFT_2020_12_DIALECT,
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {}
+            }),
+            options: json!({
+                "$schema": DRAFT_2020_12_DIALECT,
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "security.password": {
+                        "type": "object",
+                        "x-owner": "core",
+                        "additionalProperties": false,
+                        "properties": {
+                            "passwd_min_length": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "default": 8,
+                                "x-schema-version": 1
+                            },
+                            "passwd_max_length": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "default": 32,
+                                "x-schema-version": 1
+                            },
+                            "passwd_rules": {
+                                "type": "array",
+                                "items": { "type": "string", "x-format": "regex" },
+                                "default": ["[A-Z]", "[a-z]", "[0-9]"],
+                                "x-schema-version": 1
+                            }
                         },
-                        "passwd_max_length": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "default": 32,
-                            "x-schema-version": 1
-                        },
-                        "passwd_rules": {
-                            "type": "array",
-                            "items": { "type": "string", "x-format": "regex" },
-                            "default": ["[A-Z]", "[a-z]", "[0-9]"],
-                            "x-schema-version": 1
-                        }
+                        "x-invariants": [
+                            {
+                                "rule": "order",
+                                "lower": "passwd_min_length",
+                                "upper": "passwd_max_length",
+                                "allow_equal": true,
+                                "message": "Invalid options for security.password: Minimum password length exceeds maximum"
+                            }
+                        ]
                     },
-                    "x-invariants": [
-                        {
-                            "rule": "order",
-                            "lower": "passwd_min_length",
-                            "upper": "passwd_max_length",
-                            "allow_equal": true,
-                            "message": "Invalid options for security.password: Minimum password length exceeds maximum"
+                    "security.request_rate_control": {
+                        "type": "object",
+                        "x-owner": "core",
+                        "additionalProperties": false,
+                        "properties": {
+                            "account_capacity": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "default": 100,
+                                "x-schema-version": 1
+                            },
+                            "action_costs": {
+                                "type": "object",
+                                "additionalProperties": { "type": "integer", "minimum": 1 },
+                                "propertyNames": { "minLength": 1 },
+                                "x-normalize-keys": "trim",
+                                "default": { "download": 5 },
+                                "x-schema-version": 1
+                            }
+                        },
+                        "x-invariants": [
+                            {
+                                "rule": "map_values_lte",
+                                "map": "action_costs",
+                                "uppers": ["account_capacity"],
+                                "message": "action_costs exceed account_capacity"
+                            }
+                        ]
+                    },
+                    "server": {
+                        "type": "object",
+                        "x-owner": "core",
+                        "additionalProperties": false,
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "default": "CFMS Server",
+                                "x-schema-version": 1,
+                                "x-renamed-from": ["server/display_name"]
+                            }
                         }
-                    ]
+                    }
                 }
-            }
-        });
-        std::fs::write(
-            &core_schema_path,
-            serde_json::to_string_pretty(&core_schema).expect("serialize core schema"),
-        )
-        .expect("write core options.schema.json");
-
-        // Extension 1: `brute_force_lockdown` with its own `options.schema.json`
-        let bf_dir = ext_root.join("brute_force_lockdown");
-        std::fs::create_dir_all(&bf_dir).expect("create bf_dir");
-        std::fs::write(
-            bf_dir.join("manifest.toml"),
-            r#"
-option_namespaces = ["security.brute_force_lockdown"]
-
-[extension]
-identifier = "brute_force_lockdown"
-"#,
-        )
-        .expect("write bf manifest");
-        let bf_schema = json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-namespace": "security.brute_force_lockdown",
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "failure_threshold": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "default": 50,
-                    "x-schema-version": 1
-                },
-                "distinct_account_threshold": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "default": 10,
-                    "x-schema-version": 1
-                },
-                "reason": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 1024,
-                    "x-normalize": "trim",
-                    "default": "Automatic security lockdown",
-                    "x-schema-version": 1
-                }
-            },
-            "x-invariants": [
-                {
-                    "rule": "order",
-                    "lower": "distinct_account_threshold",
-                    "upper": "failure_threshold",
-                    "allow_equal": true,
-                    "message": "Invalid options for security.brute_force_lockdown: distinct_account_threshold must not exceed failure_threshold"
-                }
-            ]
-        });
-        std::fs::write(
-            bf_dir.join("options.schema.json"),
-            serde_json::to_string_pretty(&bf_schema).expect("serialize bf schema"),
-        )
-        .expect("write bf options.schema.json");
-
-        // Extension 2: `oidc_sso` with inline `[options_schema]` inside `manifest.toml`
-        let oidc_dir = ext_root.join("oidc_sso");
-        std::fs::create_dir_all(&oidc_dir).expect("create oidc_dir");
-        std::fs::write(
-            oidc_dir.join("manifest.toml"),
-            r#"
-[extension]
-identifier = "oidc_sso"
-
-[options_schema."identity.oidc"]
-type = "object"
-additionalProperties = false
-
-[options_schema."identity.oidc".properties.default_groups]
-type = "array"
-default = ["user"]
-items = { type = "string", minLength = 1 }
-"#,
-        )
-        .expect("write oidc manifest");
-
-        // Extension 3: `acme_sso` declaring only `option_namespaces` (schema-less extension)
-        let acme_dir = ext_root.join("acme_sso");
-        std::fs::create_dir_all(&acme_dir).expect("create acme_dir");
-        std::fs::write(
-            acme_dir.join("manifest.toml"),
-            r#"
-option_namespaces = ["identity.acme_sso"]
-
-[extension]
-identifier = "acme_sso"
-"#,
-        )
-        .expect("write acme manifest");
-
-        (core_schema_path, ext_root)
+            }),
+        }
     }
 
     #[test]
     fn test_option_value_codec_roundtrip_and_strict_rejection() {
-        // 1. Scalars and arbitrary-precision integers (2^80 + 1)
         let big_int: Value =
             serde_json::from_str("1208925819614629174706177").expect("parse big int");
         let (vtype, encoded) = encode_option_value(&big_int).expect("encode big int");
@@ -2147,7 +2000,6 @@ identifier = "acme_sso"
         let decoded = decode_option_value(vtype.as_str(), &encoded).expect("decode big int");
         assert_eq!(decoded, big_int);
 
-        // 2. Float canonical representation
         let float_val: Value = serde_json::from_str("1.500").expect("parse float");
         let (ft, fe) = encode_option_value(&float_val).expect("encode float");
         assert_eq!(ft, OptionValueType::Float);
@@ -2160,7 +2012,6 @@ identifier = "acme_sso"
         assert_eq!(wft, OptionValueType::Float);
         assert_eq!(wfe, "2.0");
 
-        // 3. Bool and null
         assert_eq!(
             encode_option_value(&json!(true)).expect("bool true"),
             (OptionValueType::Bool, "1".to_string())
@@ -2174,7 +2025,6 @@ identifier = "acme_sso"
             (OptionValueType::Null, String::new())
         );
 
-        // 4. JSON objects/arrays and scalar rejection in "json" type
         let obj = json!({"b": 1, "a": [true, null]});
         let (jt, je) = encode_option_value(&obj).expect("encode json");
         assert_eq!(jt, OptionValueType::Json);
@@ -2186,8 +2036,6 @@ identifier = "acme_sso"
 
         let err = decode_option_value("json", "\"scalar-secret\"").expect_err("reject scalar json");
         assert!(!err.to_string().contains("scalar-secret"));
-
-        // 5. Ensure invalid stored values never echo back secret strings
         let err = decode_option_value("int", "super-secret-token-123").expect_err("bad int");
         assert!(!err.to_string().contains("super-secret-token-123"));
         let err = decode_option_value("bool", "secret-bool").expect_err("bad bool");
@@ -2195,18 +2043,44 @@ identifier = "acme_sso"
     }
 
     #[tokio::test]
-    async fn test_options_list_and_get_defaults_from_external_schema_without_db_writes() {
+    async fn test_options_list_and_get_core_defaults_plus_stored_extension_rows() {
         let pool = setup_sqlite_pool().await;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (core_schema_path, ext_root) = write_sample_schemas(dir.path());
-        let registry = OptionsSchemaRegistry::load(Some(&core_schema_path), Some(&ext_root))
-            .expect("load registry");
+        let registry =
+            OptionsSchemaRegistry::from_contract(&sample_contract()).expect("load contract");
+
+        // Pre-populate one stored extension row owned by `oidc_sso`
+        let DbPool::Sqlite(ref sqlite) = pool else {
+            unreachable!()
+        };
+        sqlx::query(
+            "INSERT INTO options (namespace, owner, option_key, schema_version, revision, value_type, option_value, updated_at) VALUES ('identity.oidc', 'oidc_sso', 'issuer', 1, 1, 'str', 'https://idp.example.com', 100.0)",
+        )
+        .execute(sqlite)
+        .await
+        .expect("insert extension row");
 
         let all = list_options(&pool, &registry, None)
             .await
             .expect("list all options");
-        assert_eq!(all.len(), 3);
-        assert!(all.iter().all(|r| r.revision == 0 && r.updated_at.is_none()));
+        // 6 core defaults + 1 stored extension row
+        assert_eq!(all.len(), 7);
+        assert!(all.iter().any(|r| {
+            r.namespace == "identity.oidc"
+                && r.owner == "oidc_sso"
+                && r.option_key == "issuer"
+                && r.value == json!("https://idp.example.com")
+        }));
+
+        let filtered_ext = list_options(&pool, &registry, Some("identity.oidc"))
+            .await
+            .expect("list extension namespace");
+        assert_eq!(filtered_ext.len(), 1);
+        assert_eq!(filtered_ext[0].owner, "oidc_sso");
+
+        let ext_item = get_option(&pool, &registry, "identity.oidc", "issuer")
+            .await
+            .expect("get stored extension option");
+        assert_eq!(ext_item.owner, "oidc_sso");
 
         let min_len = get_option(&pool, &registry, "security.password", "passwd_min_length")
             .await
@@ -2216,39 +2090,20 @@ identifier = "acme_sso"
         assert_eq!(min_len.revision, 0);
         assert_eq!(min_len.value, json!(8));
 
-        // Verify extension defaults can also be queried directly via `get_option`!
-        let bf_default = get_option(
-            &pool,
-            &registry,
-            "security.brute_force_lockdown",
-            "failure_threshold",
-        )
-        .await
-        .expect("get extension default");
-        assert_eq!(bf_default.owner, "brute_force_lockdown");
-        assert_eq!(bf_default.revision, 0);
-        assert_eq!(bf_default.value, json!(50));
-
-        // Verify no rows were written to `options`
-        let DbPool::Sqlite(ref sqlite) = pool else {
-            unreachable!()
-        };
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM options")
-            .fetch_one(sqlite)
-            .await
-            .expect("count options");
-        assert_eq!(count, 0);
+        let renamed_spec = registry
+            .get_namespace("server")
+            .and_then(|s| s.properties.get("name"))
+            .expect("server/name spec");
+        assert_eq!(renamed_spec.renamed_from, vec!["server/display_name"]);
     }
 
     #[tokio::test]
-    async fn test_options_set_set_many_reset_optimistic_concurrency_and_audit() {
+    async fn test_options_set_reset_concurrency_audit_and_rejects_non_core_writes() {
         let pool = setup_sqlite_pool().await;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (core_schema_path, ext_root) = write_sample_schemas(dir.path());
-        let registry = OptionsSchemaRegistry::load(Some(&core_schema_path), Some(&ext_root))
-            .expect("load registry");
+        let registry =
+            OptionsSchemaRegistry::from_contract(&sample_contract()).expect("load contract");
 
-        // 1. Set single option (revision 0 -> 1)
+        // 1. Set single core option (revision 0 -> 1)
         let mut updates = BTreeMap::new();
         updates.insert(
             "passwd_min_length".to_string(),
@@ -2273,36 +2128,24 @@ identifier = "acme_sso"
             .expect_err("must fail with conflict");
         assert!(matches!(conflict_err, CfmsError::OptionConflict(_)));
 
-        // 3. Batch update in extension `security.brute_force_lockdown`
-        let mut bf_updates = BTreeMap::new();
-        bf_updates.insert(
-            "failure_threshold".to_string(),
+        // 3. Writes/resets to non-core/extension namespaces are rejected when contract is active
+        let mut ext_updates = BTreeMap::new();
+        ext_updates.insert(
+            "issuer".to_string(),
             OptionUpdateInput {
-                value: json!(80),
+                value: json!("https://idp.example.com"),
                 expected_revision: 0,
             },
         );
-        bf_updates.insert(
-            "reason".to_string(),
-            OptionUpdateInput {
-                value: json!("  Lockdown triggered by policy  "),
-                expected_revision: 0,
-            },
-        );
-        let bf_written = write_options_batch(
-            &pool,
-            &registry,
-            "security.brute_force_lockdown",
-            bf_updates,
-        )
-        .await
-        .expect("write brute_force_lockdown");
+        let ext_err = write_options_batch(&pool, &registry, "identity.oidc", ext_updates)
+            .await
+            .expect_err("non-core namespace rejected on write");
+        assert!(ext_err.to_string().contains("core_config_contract"));
 
-        // Verify `x-normalize: "trim"` normalization from extension schema
-        assert_eq!(
-            bf_written["reason"].value,
-            json!("Lockdown triggered by policy")
-        );
+        let reset_ext_err = reset_option(&pool, &registry, "identity.oidc", "issuer", 0)
+            .await
+            .expect_err("non-core namespace rejected on reset");
+        assert!(reset_ext_err.to_string().contains("core_config_contract"));
 
         // 4. Verify `system_states` namespace revision guard was incremented
         let DbPool::Sqlite(ref sqlite) = pool else {
@@ -2337,11 +2180,10 @@ identifier = "acme_sso"
         .fetch_all(sqlite)
         .await
         .expect("fetch audit entries");
-        assert_eq!(audit_rows.len(), 3);
+        assert_eq!(audit_rows.len(), 2);
         for (action, result, data_str) in &audit_rows {
             assert_eq!(action, "update_options");
             assert_eq!(*result, 0);
-            assert!(!data_str.contains("Lockdown triggered by policy"));
             let data: Value = serde_json::from_str(data_str).expect("parse audit json");
             assert_eq!(data["source"], json!("maintenance_cli"));
             assert!(data.get("changed_keys").is_some());
@@ -2351,14 +2193,12 @@ identifier = "acme_sso"
     }
 
     #[tokio::test]
-    async fn test_external_json_schema_validation_and_schemaless_fallback() {
+    async fn test_core_contract_validation_and_schemaless_fallback() {
         let pool = setup_sqlite_pool().await;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (core_schema_path, ext_root) = write_sample_schemas(dir.path());
-        let registry = OptionsSchemaRegistry::load(Some(&core_schema_path), Some(&ext_root))
-            .expect("load registry");
+        let registry =
+            OptionsSchemaRegistry::from_contract(&sample_contract()).expect("load contract");
 
-        // 1. Strict type check: integer field rejects string `"12"` and float `12.0`
+        // 1. Strict type check: integer field rejects string `"12"`, float `12.0`, and bool
         for bad_val in [json!("12"), json!(12.0), json!(true)] {
             let mut updates = BTreeMap::new();
             updates.insert(
@@ -2375,66 +2215,40 @@ identifier = "acme_sso"
             );
         }
 
-        // 2. Cross-field validation via `x-invariants`: `distinct_account_threshold <= failure_threshold`
-        let mut bad_bf = BTreeMap::new();
-        bad_bf.insert(
-            "failure_threshold".to_string(),
+        // 2. Cross-field validation via `x-invariants` + `x-normalize-keys: "trim"`
+        let mut rate_updates = BTreeMap::new();
+        rate_updates.insert(
+            "action_costs".to_string(),
             OptionUpdateInput {
-                value: json!(10),
+                value: json!({ "  upload  ": 20 }),
                 expected_revision: 0,
             },
         );
-        bad_bf.insert(
-            "distinct_account_threshold".to_string(),
-            OptionUpdateInput {
-                value: json!(25),
-                expected_revision: 0,
-            },
-        );
-        let err = write_options_batch(
-            &pool,
-            &registry,
-            "security.brute_force_lockdown",
-            bad_bf,
-        )
-        .await
-        .expect_err("cross-field failure");
-        assert!(
-            err.to_string()
-                .contains("distinct_account_threshold must not exceed failure_threshold")
-        );
-
-        // 3. Inline manifest.toml `[options_schema]` validation: default_groups requires non-empty strings
-        let mut bad_oidc = BTreeMap::new();
-        bad_oidc.insert(
-            "default_groups".to_string(),
-            OptionUpdateInput {
-                value: json!([""]),
-                expected_revision: 0,
-            },
-        );
-        let oidc_err = write_options_batch(&pool, &registry, "identity.oidc", bad_oidc)
-            .await
-            .expect_err("oidc default_groups rejects empty string");
-        assert!(oidc_err.to_string().contains("default_groups"));
-
-        // 4. Schema-less extension fallback (`acme_sso/manifest.toml` with only `option_namespaces`)
-        let mut ext_updates = BTreeMap::new();
-        ext_updates.insert(
-            "tenant_id".to_string(),
-            OptionUpdateInput {
-                value: json!("acme-prod"),
-                expected_revision: 0,
-            },
-        );
-        let ext_written =
-            write_options_batch(&pool, &registry, "identity.acme_sso", ext_updates)
+        let rate_written =
+            write_options_batch(&pool, &registry, "security.request_rate_control", rate_updates)
                 .await
-                .expect("write manifest-discovered extension option");
-        assert_eq!(ext_written["tenant_id"].owner, "acme_sso");
-        assert_eq!(ext_written["tenant_id"].revision, 1);
+                .expect("write normalized action_costs");
+        assert_eq!(rate_written["action_costs"].value, json!({ "upload": 20 }));
 
-        // 5. Pure schema-less workspace (OptionsSchemaRegistry::empty()) allows basic CRUD without any schema file
+        let mut bad_rate = BTreeMap::new();
+        bad_rate.insert(
+            "action_costs".to_string(),
+            OptionUpdateInput {
+                value: json!({ "upload": 250 }),
+                expected_revision: 1,
+            },
+        );
+        let rate_err =
+            write_options_batch(&pool, &registry, "security.request_rate_control", bad_rate)
+                .await
+                .expect_err("map_values_lte invariant failure");
+        assert!(
+            rate_err
+                .to_string()
+                .contains("action_costs exceed account_capacity")
+        );
+
+        // 3. Pure schema-less workspace (OptionsSchemaRegistry::empty()) allows basic CRUD without any contract
         let empty_registry = OptionsSchemaRegistry::empty();
         let mut custom_updates = BTreeMap::new();
         custom_updates.insert(

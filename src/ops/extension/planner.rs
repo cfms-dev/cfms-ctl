@@ -6,9 +6,9 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use serde::Serialize;
-use crate::core::{CfmsError, ConfigDocument, Result, WorkspacePaths};
+use crate::core::{CfmsError, ConfigDocument, CoreConfigContract, Result, WorkspacePaths};
 use crate::ops::extension::catalog::{
     BUILTIN_EXTENSION_ID, CatalogDiagnostic, ExtensionCatalog, InstalledExtension,
     MAX_EXTENSION_SCAN_ENTRIES, RETIRED_EXTENSION_IDS, RESERVED_EXTENSION_IDS, StagingMarker,
@@ -62,7 +62,7 @@ pub fn plan_enable(
     config_doc: &ConfigDocument,
     paths: &WorkspacePaths,
     raw_targets: &[String],
-    schema_path: Option<&Path>,
+    contract: Option<&CoreConfigContract>,
 ) -> Result<ExtensionTogglePlan> {
     let targets = normalize_targets(raw_targets)?;
     for id in &targets {
@@ -170,10 +170,10 @@ pub fn plan_enable(
 
     let mut candidate_doc = config_doc.clone();
     if changed {
-        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, schema_path)?;
+        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, contract)?;
         warnings.extend(schema_warnings);
-    } else if schema_path.is_some() {
-        let schema_warnings = candidate_doc.validate_with_schema(schema_path)?;
+    } else if contract.is_some() {
+        let schema_warnings = candidate_doc.validate_with_contract(contract)?;
         warnings.extend(schema_warnings);
     }
 
@@ -205,7 +205,7 @@ pub fn plan_disable(
     config_doc: &ConfigDocument,
     paths: &WorkspacePaths,
     raw_targets: &[String],
-    schema_path: Option<&Path>,
+    contract: Option<&CoreConfigContract>,
 ) -> Result<ExtensionTogglePlan> {
     let targets = normalize_targets(raw_targets)?;
     for id in &targets {
@@ -258,10 +258,10 @@ pub fn plan_disable(
     let changed = next_enabled != previous_enabled;
     let mut candidate_doc = config_doc.clone();
     if changed {
-        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, schema_path)?;
+        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, contract)?;
         warnings.extend(schema_warnings);
-    } else if schema_path.is_some() {
-        let schema_warnings = candidate_doc.validate_with_schema(schema_path)?;
+    } else if contract.is_some() {
+        let schema_warnings = candidate_doc.validate_with_contract(contract)?;
         warnings.extend(schema_warnings);
     }
 
@@ -477,7 +477,7 @@ pub fn plan_upgrade(
     config_doc: &ConfigDocument,
     paths: &WorkspacePaths,
     managed_extensions: &BTreeSet<String>,
-    schema_path: Option<&Path>,
+    contract: Option<&CoreConfigContract>,
 ) -> Result<ExtensionUpgradePlan> {
     let new_manifest = &package.manifest;
     let id = &new_manifest.identifier;
@@ -644,7 +644,7 @@ pub fn plan_upgrade(
     let config_changed = next_enabled != previous_enabled;
     let mut candidate_doc = config_doc.clone();
     if config_changed {
-        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, schema_path)?;
+        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, contract)?;
         warnings.extend(schema_warnings);
     }
 
@@ -672,7 +672,7 @@ pub fn plan_uninstall(
     catalog: &ExtensionCatalog,
     config_doc: &ConfigDocument,
     managed_extensions: &BTreeSet<String>,
-    schema_path: Option<&Path>,
+    contract: Option<&CoreConfigContract>,
 ) -> Result<ExtensionUninstallPlan> {
     validate_extension_identifier(identifier)?;
 
@@ -754,7 +754,7 @@ pub fn plan_uninstall(
     let config_changed = next_enabled != previous_enabled;
     let mut candidate_doc = config_doc.clone();
     if config_changed {
-        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, schema_path)?;
+        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, contract)?;
         warnings.extend(schema_warnings);
     }
 
@@ -1367,6 +1367,7 @@ pub(crate) fn check_scoped_staging_markers(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use super::*;
     use crate::ops::extension::catalog::discover_catalog;
 

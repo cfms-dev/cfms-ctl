@@ -59,7 +59,7 @@ impl Default for PasswordPolicyConfig {
 }
 
 impl PasswordPolicyConfig {
-    /// Load `security.password` options from database, workspace `options.schema.json` (when present),
+    /// Load `security.password` options from database, workspace `core_config_contract` (when present),
     /// and built-in CFMS server defaults.
     pub async fn load(pool: &DbPool, paths: &WorkspacePaths) -> Result<Self> {
         let registry = OptionsSchemaRegistry::from_workspace(paths, None)?;

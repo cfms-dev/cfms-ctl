@@ -13,7 +13,7 @@ use crate::cli::database::{
     DatabaseMigrateArgs, DatabaseStampArgs, DatabaseUpgradeArgs, SchemaSourceArgs,
 };
 use crate::core::atomic::atomic_write;
-use crate::core::{CfmsError, ConfigDocument, Result, WorkspacePaths};
+use crate::core::{CfmsError, ConfigDocument, CoreConfigContract, Result, WorkspacePaths};
 use crate::db::schema::{
     AlembicRenderOptions, DiffOptions, ExtractionSource, ExtractorMode, HybridUpgradeOptions,
     HybridUpgradeOutcome, LATEST_SCHEMA_REVISION, RenameConfig, RiskAuditReport,
@@ -1147,8 +1147,8 @@ async fn handle_migrate(ctx: &AppContext, args: DatabaseMigrateArgs) -> Result<(
     let target_endpoint = target_cfg.display_endpoint(&paths);
 
     if args.activate {
-        let schema_path = paths.discover_config_schema_path(None)?;
-        source_doc.replace_database_section(&target_doc, schema_path.as_deref())?;
+        let contract = CoreConfigContract::from_workspace(&paths, None)?;
+        source_doc.replace_database_section(&target_doc, contract.as_ref().map(|(c, _)| c))?;
     }
 
     let mut transfer_schema_args = args.schema.clone();

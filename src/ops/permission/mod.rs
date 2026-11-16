@@ -783,7 +783,7 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::All,
                 batch_size: Some(250),
-                schema: None,
+                contract: None,
                 dry_run: false,
             },
         )
@@ -799,7 +799,7 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::All,
                 batch_size: Some(250),
-                schema: None,
+                contract: None,
                 dry_run: true,
             },
         )
@@ -820,7 +820,7 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::User,
                 batch_size: Some(2),
-                schema: None,
+                contract: None,
                 dry_run: false,
             },
         )
@@ -858,7 +858,7 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::Group,
                 batch_size: Some(250),
-                schema: None,
+                contract: None,
                 dry_run: false,
             },
         )
@@ -880,7 +880,7 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::Group,
                 batch_size: Some(250),
-                schema: None,
+                contract: None,
                 dry_run: false,
             },
         )
@@ -903,7 +903,7 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::All,
                 batch_size: Some(250),
-                schema: None,
+                contract: None,
                 dry_run: false,
             },
         )
@@ -1085,7 +1085,7 @@ mod tests {
             retention_days: None,
             scope: PermissionScope::User,
             batch_size: Some(7),
-            schema: None,
+            contract: None,
             dry_run: false,
         };
         let ctx_p1 = ctx_for(&env.root, OutputFormat::Json, true);

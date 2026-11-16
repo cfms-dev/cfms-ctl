@@ -1,18 +1,15 @@
 //! Generic JSON Schema (Draft 2020-12) validation, declarative normalization (`x-normalize`),
 //! and cross-field invariant evaluation (`x-invariants`) for `config.toml` and database `options`.
 //!
-//! Designed so CFMS server releases and extensions can ship standard JSON Schema files
-//! without hardcoding business configuration definitions into the `cfms-ctl` binary.
+//! Designed to evaluate rules from the CFMS server's `core_config_contract` without hardcoding
+//! business configuration schemas into `cfms-ctl`.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::path::Path;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use crate::core::error::{CfmsError, Result};
-
-const MAX_SCHEMA_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Severity level for a declarative `x-invariants` rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -191,34 +188,6 @@ fn has_balanced_regex_delimiters(pattern: &str) -> bool {
         }
     }
     !escaped && !in_char_class && depth == 0
-}
-
-/// Load and parse a JSON Schema file from disk with size bounds check.
-pub fn load_json_schema_file(path: &Path) -> Result<Value> {
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        CfmsError::Config(format!(
-            "Unable to stat schema file '{}': {e}",
-            path.display()
-        ))
-    })?;
-    if metadata.len() > MAX_SCHEMA_BYTES {
-        return Err(CfmsError::Config(format!(
-            "Schema file '{}' exceeds the 16 MiB limit",
-            path.display()
-        )));
-    }
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        CfmsError::Config(format!(
-            "Unable to read schema file '{}': {e}",
-            path.display()
-        ))
-    })?;
-    serde_json::from_str::<Value>(&raw).map_err(|e| {
-        CfmsError::Config(format!(
-            "Invalid JSON syntax in schema file '{}': {e}",
-            path.display()
-        ))
-    })
 }
 
 /// Apply declarative normalizations (`x-normalize`, `x-normalize-keys`) and strict scalar/format

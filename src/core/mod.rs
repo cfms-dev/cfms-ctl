@@ -3,9 +3,9 @@
 
 pub mod atomic;
 pub mod config;
+pub mod contract;
 pub mod error;
 pub mod lock;
-pub mod migration;
 pub mod paths;
 pub mod schema;
 
@@ -14,18 +14,18 @@ pub use atomic::{
     is_symlink_or_reparse_point, is_windows_reserved_name, retry_fs_op,
     write_with_timestamped_backup,
 };
-pub use config::{ConfigDocument, DatabaseSectionConfig, ServerConfigSummary, TemplateSyncPlan};
+pub use config::{
+    ConfigDocument, DatabaseSectionConfig, RenamedPathRecord, ServerConfigSummary, TemplateSyncPlan,
+};
+pub use contract::{
+    CORE_CONFIG_CONTRACT_VERSION, CoreConfigContract, DRAFT_2020_12_DIALECT, TomlLeafSpec,
+};
 pub use error::{CfmsError, ErrorCode, Result};
 pub use lock::{RuntimeLock, ServerLockGuard};
-pub use migration::{
-    ConfigMigrationsManifest, MigrationOp, ObsoletePathRule, OptionMigrationGroup,
-    TomlMigrationOutcome, TomlMigrationRule, apply_toml_migrations,
-    find_present_obsolete_paths, find_present_option_migration_paths, load_config_migrations,
-};
 pub use paths::WorkspacePaths;
 pub use schema::{
     InvariantRule, InvariantSeverity, cmp_numeric_values, evaluate_invariants,
     evaluate_schema_invariants, format_canonical_float, is_canonical_int_str,
-    load_json_schema_file, normalize_and_precheck_value, validate_config_against_schema,
+    normalize_and_precheck_value, validate_config_against_schema,
     validate_instance_against_schema,
 };

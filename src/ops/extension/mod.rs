@@ -15,7 +15,7 @@ use crate::cli::extension::{
     ExtensionPackageArgs, ExtensionPurgeDataArgs, ExtensionUninstallArgs,
 };
 use crate::core::atomic::atomic_write;
-use crate::core::{CfmsError, Result, RuntimeLock, WorkspacePaths};
+use crate::core::{CfmsError, CoreConfigContract, Result, RuntimeLock, WorkspacePaths};
 use crate::ops::AppContext;
 use crate::ui::{CommandReport, KeyValueTable, OutputFormat, UiConsole, confirm_or_abort, styled_table};
 use catalog::{
@@ -746,7 +746,7 @@ fn handle_info(ctx: &AppContext, args: ExtensionIdentifierArgs) -> Result<()> {
 
 fn handle_enable(ctx: &AppContext, args: ExtensionEnableArgs) -> Result<()> {
     let paths = ctx.resolve_paths()?;
-    let schema_path = paths.discover_config_schema_path(args.schema.as_deref())?;
+    let contract = CoreConfigContract::from_workspace(&paths, args.contract.as_deref())?;
     let config_doc = ctx.load_config(&paths)?;
     let catalog = discover_catalog(&paths.extensions_root)?;
     let plan = plan_enable(
@@ -754,14 +754,14 @@ fn handle_enable(ctx: &AppContext, args: ExtensionEnableArgs) -> Result<()> {
         &config_doc,
         &paths,
         &args.identifiers,
-        schema_path.as_deref(),
+        contract.as_ref().map(|(c, _)| c),
     )?;
     execute_toggle_plan(ctx, &paths, plan, args.dry_run)
 }
 
 fn handle_disable(ctx: &AppContext, args: ExtensionDisableArgs) -> Result<()> {
     let paths = ctx.resolve_paths()?;
-    let schema_path = paths.discover_config_schema_path(args.schema.as_deref())?;
+    let contract = CoreConfigContract::from_workspace(&paths, args.contract.as_deref())?;
     let config_doc = ctx.load_config(&paths)?;
     let catalog = discover_catalog(&paths.extensions_root)?;
     let plan = plan_disable(
@@ -769,7 +769,7 @@ fn handle_disable(ctx: &AppContext, args: ExtensionDisableArgs) -> Result<()> {
         &config_doc,
         &paths,
         &args.identifiers,
-        schema_path.as_deref(),
+        contract.as_ref().map(|(c, _)| c),
     )?;
     execute_toggle_plan(ctx, &paths, plan, args.dry_run)
 }
@@ -897,7 +897,7 @@ fn handle_upgrade(ctx: &AppContext, args: ExtensionPackageArgs) -> Result<()> {
     let config_doc = ctx.load_config(&paths)?;
     let catalog = discover_catalog(&paths.extensions_root)?;
     let managed = read_managed_extensions(&paths)?;
-    let schema_path = paths.discover_config_schema_path(None)?;
+    let contract = CoreConfigContract::from_workspace(&paths, None)?;
 
     let mut opened = OpenedExtensionPackage::open_and_verify(&args.package, args.sha256.as_deref())?;
     let plan = plan_upgrade(
@@ -906,7 +906,7 @@ fn handle_upgrade(ctx: &AppContext, args: ExtensionPackageArgs) -> Result<()> {
         &config_doc,
         &paths,
         &managed,
-        schema_path.as_deref(),
+        contract.as_ref().map(|(c, _)| c),
     )?;
 
     let mut report = ExtensionUpgradeReport {
@@ -966,7 +966,7 @@ async fn handle_uninstall(ctx: &AppContext, args: ExtensionUninstallArgs) -> Res
     let config_doc = ctx.load_config(&paths)?;
     let catalog = discover_catalog(&paths.extensions_root)?;
     let managed = read_managed_extensions(&paths)?;
-    let schema_path = paths.discover_config_schema_path(None)?;
+    let contract = CoreConfigContract::from_workspace(&paths, None)?;
 
     let plan = plan_uninstall(
         &args.identifier,
@@ -974,7 +974,7 @@ async fn handle_uninstall(ctx: &AppContext, args: ExtensionUninstallArgs) -> Res
         &catalog,
         &config_doc,
         &managed,
-        schema_path.as_deref(),
+        contract.as_ref().map(|(c, _)| c),
     )?;
 
     let mut warnings = plan.warnings.clone();
@@ -1429,7 +1429,7 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: true,
-                schema: None,
+                contract: None,
             }),
         )
         .await
@@ -1445,7 +1445,7 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: false,
-                schema: None,
+                contract: None,
             }),
         )
         .await
@@ -1465,7 +1465,7 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: false,
-                schema: None,
+                contract: None,
             }),
         )
         .await
@@ -1492,7 +1492,7 @@ mod tests {
             ExtensionCommand::Disable(ExtensionDisableArgs {
                 identifiers: vec!["oidc_sso".to_string()],
                 dry_run: false,
-                schema: None,
+                contract: None,
             }),
         )
         .await
@@ -1589,7 +1589,7 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["oidc_sso".to_string()],
                 dry_run: false,
-                schema: None,
+                contract: None,
             }),
         )
         .await
@@ -1601,7 +1601,7 @@ mod tests {
             ExtensionCommand::Disable(ExtensionDisableArgs {
                 identifiers: vec!["typo_extension".to_string()],
                 dry_run: false,
-                schema: None,
+                contract: None,
             }),
         )
         .await
@@ -1627,19 +1627,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enable_validates_external_config_schema_before_writing() {
+    async fn enable_validates_core_config_contract_before_writing() {
+        use crate::core::{CORE_CONFIG_CONTRACT_VERSION, DRAFT_2020_12_DIALECT};
+
         let dir = setup_workspace(
             "[security]\npepper = \"abc\"\n[database]\ntype = \"sqlite\"\nfile = \"app.db\"\n[extensions]\nenabled = []\n",
         );
-        let schema_path = dir.path().join("src").join("config.schema.json");
-        std::fs::write(
-            &schema_path,
-            r#"{
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
+        let contract_path = dir.path().join("contract.json");
+        let contract = CoreConfigContract {
+            contract_version: CORE_CONFIG_CONTRACT_VERSION.to_string(),
+            core_version: "0.14.0".to_string(),
+            schema_dialect: DRAFT_2020_12_DIALECT.to_string(),
+            toml: serde_json::json!({
+                "$schema": DRAFT_2020_12_DIALECT,
                 "type": "object",
                 "properties": {
                     "extensions": {
                         "type": "object",
+                        "x-unmanaged-subtables": true,
+                        "additionalProperties": { "type": "object" },
                         "properties": {
                             "enabled": {
                                 "type": "array",
@@ -1648,9 +1654,19 @@ mod tests {
                         }
                     }
                 }
-            }"#,
+            }),
+            options: serde_json::json!({
+                "$schema": DRAFT_2020_12_DIALECT,
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {}
+            }),
+        };
+        std::fs::write(
+            &contract_path,
+            serde_json::to_vec_pretty(&contract).expect("serialize contract"),
         )
-        .expect("write schema");
+        .expect("write contract");
 
         let cfg_path = dir.path().join("src").join("config.toml");
         let original = std::fs::read_to_string(&cfg_path).expect("read");
@@ -1662,11 +1678,11 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: false,
-                schema: Some(schema_path),
+                contract: Some(contract_path),
             }),
         )
         .await
-        .expect_err("schema validation failure aborts before write");
+        .expect_err("contract validation failure aborts before write");
         let msg = err.to_string();
         assert!(msg.contains("Schema validation failed"), "unexpected error: {msg}");
         assert!(msg.contains("extensions.enabled"), "unexpected error: {msg}");
@@ -1807,7 +1823,7 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["consumer_ext".to_string()],
                 dry_run: false,
-                schema: None,
+                contract: None,
             }),
         )
         .await
@@ -2096,7 +2112,7 @@ mod tests {
             ExtensionCommand::Disable(ExtensionDisableArgs {
                 identifiers: vec!["oidc_sso".to_string()],
                 dry_run: false,
-                schema: None,
+                contract: None,
             }),
         )
         .await
