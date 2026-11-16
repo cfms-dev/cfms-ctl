@@ -15,7 +15,8 @@ pub use atomic::{
     write_with_timestamped_backup,
 };
 pub use config::{
-    ConfigDocument, DatabaseSectionConfig, RenamedPathRecord, ServerConfigSummary, TemplateSyncPlan,
+    ConfigDocument, DatabaseSectionConfig, RedactedSecret, RenamedPathRecord, S3AddressingStyle,
+    S3SectionConfig, S3SectionSummary, ServerConfigSummary, StorageProviderKind, TemplateSyncPlan,
 };
 pub use contract::{
     CORE_CONFIG_CONTRACT_VERSION, CoreConfigContract, DRAFT_2020_12_DIALECT, TomlLeafSpec,

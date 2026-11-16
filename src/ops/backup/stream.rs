@@ -15,7 +15,7 @@ use crate::ops::backup::format::{
 };
 
 pub const MANIFEST_CONTENT_TYPE: &str = "cfms-manifest";
-const SUPPORTED_MANIFEST_STORAGE_PROVIDER: &str = "local";
+const SUPPORTED_MANIFEST_STORAGE_PROVIDERS: &[&str] = &["local", "s3"];
 
 const MANDATORY_MANIFEST_FIELDS: &[&str] = &[
     "content_type",
@@ -596,10 +596,11 @@ pub fn validate_manifest_header(
             manifest.schema_ir.ir_version
         )));
     }
-    if manifest.storage_provider != SUPPORTED_MANIFEST_STORAGE_PROVIDER {
+    if !SUPPORTED_MANIFEST_STORAGE_PROVIDERS.contains(&manifest.storage_provider.as_str()) {
         return Err(CfmsError::ArchiveIntegrity(format!(
-            "Unsupported manifest storage_provider '{}' (expected '{}')",
-            manifest.storage_provider, SUPPORTED_MANIFEST_STORAGE_PROVIDER
+            "Unsupported manifest storage_provider '{}' (expected one of: {})",
+            manifest.storage_provider,
+            SUPPORTED_MANIFEST_STORAGE_PROVIDERS.join(", ")
         )));
     }
     if !envelope.storage_provider.is_empty()

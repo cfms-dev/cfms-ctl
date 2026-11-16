@@ -40,7 +40,12 @@ const AES_GCM_TAG_LEN: usize = 16;
 const HKDF_INFO_PREFIX: &[u8] = b"cfms-ctl-backup-v2:";
 const BASE31_ALPHABET: &[u8; 31] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const ENCODED_BASE31_CHARS: usize = 52;
-const SUPPORTED_STORAGE_PROVIDER: &str = "local";
+const SUPPORTED_STORAGE_PROVIDERS: &[&str] = &["local", "s3"];
+
+#[must_use]
+pub(crate) fn is_supported_storage_provider(provider: &str) -> bool {
+    SUPPORTED_STORAGE_PROVIDERS.contains(&provider)
+}
 
 const MANDATORY_ENVELOPE_FIELDS: &[&str] = &[
     "content_type",
@@ -857,11 +862,12 @@ fn validate_envelope_semantics(
     }
     parse_and_validate_manifest_components(&header.components)?;
 
-    if crit_set.contains("storage_provider") && header.storage_provider != SUPPORTED_STORAGE_PROVIDER
+    if crit_set.contains("storage_provider") && !is_supported_storage_provider(&header.storage_provider)
     {
         return Err(CfmsError::Backup(format!(
-            "Unsupported CRITICAL backup storage_provider '{}' (expected '{SUPPORTED_STORAGE_PROVIDER}')",
-            header.storage_provider
+            "Unsupported CRITICAL backup storage_provider '{}' (expected one of: {})",
+            header.storage_provider,
+            SUPPORTED_STORAGE_PROVIDERS.join(", ")
         )));
     }
     if crit_set.contains("created_at") && DateTime::parse_from_rfc3339(&header.created_at).is_err() {
@@ -1506,7 +1512,18 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("missing from header"));
 
-        // 4. Known CRITICAL field with unsupported value (`storage_provider = "s3"`, `created_at` bad timestamp) is rejected
+        // 4. Known CRITICAL field with valid `"s3"` provider succeeds, while unsupported provider or bad timestamp fails
+        let mut s3_provider = base_envelope_json_value();
+        s3_provider
+            .as_object_mut()
+            .unwrap()
+            .insert("storage_provider".to_string(), serde_json::json!("s3"));
+        let wire = envelope_wire_from_json_bytes(&serde_json::to_vec(&s3_provider).unwrap());
+        let (parsed_s3, _) =
+            read_envelope_and_hash(&mut Cursor::new(&wire), "s3.confbak", wire.len() as u64)
+                .unwrap();
+        assert_eq!(parsed_s3.storage_provider, "s3");
+
         let mut bad_provider = base_envelope_json_value();
         bad_provider.as_object_mut().unwrap().insert(
             "storage_provider".to_string(),
@@ -1514,7 +1531,7 @@ mod tests {
         );
         let wire = envelope_wire_from_json_bytes(&serde_json::to_vec(&bad_provider).unwrap());
         assert!(
-            read_envelope_and_hash(&mut Cursor::new(&wire), "s3.confbak", wire.len() as u64)
+            read_envelope_and_hash(&mut Cursor::new(&wire), "bad_provider.confbak", wire.len() as u64)
                 .is_err()
         );
 

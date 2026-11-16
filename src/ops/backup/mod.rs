@@ -69,7 +69,7 @@ mod tests {
         set_alembic_version,
     };
     use crate::db::{DatabaseKind, DbPool};
-    use crate::storage::{LocalFsStorage, StorageBackend};
+    use crate::storage::LocalFsStorage;
     use crate::ui::UiConsole;
 
     fn test_ctx(root: &Path) -> AppContext {
@@ -293,9 +293,9 @@ secret_key = "{secret_key}"
         let paths = WorkspacePaths::discover(Some(ws), None).unwrap();
         let storage = LocalFsStorage::new(paths.server_root);
         let big_blob: Vec<u8> = (0..1_300_000usize).map(|i| ((i * 31 + 7) % 251) as u8).collect();
-        storage.write_bytes("content/files/ab/big.bin", &big_blob).unwrap();
+        storage.write_bytes_sync("content/files/ab/big.bin", &big_blob).unwrap();
         storage
-            .write_bytes("content/files/ef/avatar.png", b"AVATAR")
+            .write_bytes_sync("content/files/ef/avatar.png", b"AVATAR")
             .unwrap();
 
         pool.close().await;
@@ -455,14 +455,14 @@ secret_key = "{secret_key}"
         let dst_paths = WorkspacePaths::discover(Some(&dst_ws), None).unwrap();
         let dst_storage = LocalFsStorage::new(dst_paths.server_root.clone());
         assert_eq!(
-            dst_storage.read_bytes("content/files/ab/big.bin").unwrap(),
+            dst_storage.read_bytes_sync("content/files/ab/big.bin").unwrap(),
             expected_big_blob
         );
         assert_eq!(
-            dst_storage.read_bytes("content/files/ef/avatar.png").unwrap(),
+            dst_storage.read_bytes_sync("content/files/ef/avatar.png").unwrap(),
             b"AVATAR"
         );
-        assert!(!dst_storage.exists("content/files/cd/gone.bin").unwrap());
+        assert!(!dst_storage.exists_sync("content/files/cd/gone.bin").unwrap());
 
         let dst_cfg = fs::read_to_string(&dst_paths.config_path).unwrap();
         assert!(dst_cfg.contains("# preserved comment header"));
@@ -705,7 +705,7 @@ secret_key = "{secret_key}"
     }
 
     #[tokio::test]
-    async fn s3_storage_and_existing_key_out_are_rejected_without_orphans() {
+    async fn invalid_s3_config_and_existing_key_out_are_rejected_without_orphans() {
         let tmp = TempDir::new().unwrap();
         let s3_ws = create_test_workspace(
             &tmp.path().join("s3_ws"),
@@ -731,6 +731,35 @@ secret_key = "{secret_key}"
         .await
         .unwrap_err();
         assert!(matches!(err, CfmsError::Config(_)));
+        assert!(!out.exists());
+
+        // Missing s3.bucket or unpaired credentials must fail cleanly before creating archives
+        fs::write(
+            s3_ws.join("src").join("config.toml"),
+            r#"
+[database]
+type = "sqlite"
+file = "app.db"
+[provider]
+storage = "s3"
+[s3]
+bucket = "test-bucket"
+access_key_id = "ONLY_ACCESS_KEY"
+"#,
+        )
+        .unwrap();
+        let pair_err = export::run_export(
+            &test_ctx(&s3_ws),
+            BackupExportArgs {
+                output_path: Some(out.clone()),
+                key_out: None,
+                components: vec![],
+                interactive: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(pair_err, CfmsError::Config(_)));
         assert!(!out.exists());
 
         // Existing `--key-out` file must fail preflight cleanly

@@ -4,9 +4,12 @@
 //! server versions are preserved verbatim without failing validation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Key, Table, TableLike, Value};
+use zeroize::Zeroizing;
 use crate::core::atomic::write_with_timestamped_backup;
 use crate::core::contract::CoreConfigContract;
 use crate::core::error::{CfmsError, Result};
@@ -14,6 +17,143 @@ use crate::core::paths::WorkspacePaths;
 use crate::db::DatabaseKind;
 
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_S3_MAX_POOL_CONNECTIONS: usize = 64;
+
+/// Zeroizing secret wrapper whose [`fmt::Debug`] and [`fmt::Display`] implementations never leak
+/// credential material.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedactedSecret(Zeroizing<String>);
+
+impl RedactedSecret {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(Zeroizing::new(value.into()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Deref for RedactedSecret {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            f.write_str("\"[empty]\"")
+        } else {
+            f.write_str("\"[REDACTED]\"")
+        }
+    }
+}
+
+impl fmt::Display for RedactedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+/// Active storage backend configured under `[provider].storage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageProviderKind {
+    #[default]
+    Local,
+    S3,
+}
+
+impl StorageProviderKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::S3 => "s3",
+        }
+    }
+}
+
+impl fmt::Display for StorageProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// S3 bucket addressing mode matching `botocore` & CFMS server `[s3].addressing_style`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum S3AddressingStyle {
+    #[default]
+    Auto,
+    Virtual,
+    Path,
+}
+
+impl S3AddressingStyle {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Virtual => "virtual",
+            Self::Path => "path",
+        }
+    }
+}
+
+impl fmt::Display for S3AddressingStyle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Validated runtime `[s3]` configuration extracted from `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3SectionConfig {
+    pub bucket: String,
+    pub endpoint_url: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<RedactedSecret>,
+    pub session_token: Option<RedactedSecret>,
+    pub region_name: Option<String>,
+    pub addressing_style: S3AddressingStyle,
+    pub max_pool_connections: usize,
+}
+
+impl S3SectionConfig {
+    /// Non-sensitive summary safe for JSON serialization and terminal diagnostics.
+    #[must_use]
+    pub fn summary(&self) -> S3SectionSummary {
+        S3SectionSummary {
+            bucket: self.bucket.clone(),
+            endpoint_url: self.endpoint_url.clone(),
+            region_name: self.region_name.clone(),
+            addressing_style: self.addressing_style,
+            max_pool_connections: self.max_pool_connections,
+            has_explicit_credentials: self.access_key_id.is_some(),
+            has_session_token: self.session_token.is_some(),
+        }
+    }
+}
+
+/// Redacted `[s3]` configuration metadata safe to embed in diagnostic JSON/human reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct S3SectionSummary {
+    pub bucket: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_name: Option<String>,
+    pub addressing_style: S3AddressingStyle,
+    pub max_pool_connections: usize,
+    pub has_explicit_credentials: bool,
+    pub has_session_token: bool,
+}
 
 /// Minimal typed `[database]` section extracted from `config.toml`.
 /// Unknown fields in `[database]` are tolerated and ignored during extraction.
@@ -192,6 +332,9 @@ pub struct ServerConfigSummary {
     pub has_pepper: bool,
     pub enabled_extensions: Vec<String>,
     pub database: DatabaseSectionConfig,
+    pub storage_provider: StorageProviderKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3: Option<S3SectionSummary>,
 }
 
 /// Core TOML path renamed cleanly via `x-renamed-from` in `core_config_contract`.
@@ -280,9 +423,171 @@ impl ConfigDocument {
         })
     }
 
+    /// Extract the active `[provider].storage` kind (defaults to `local` when omitted).
+    pub fn storage_provider(&self) -> Result<StorageProviderKind> {
+        let Some(provider_item) = self.doc.get("provider") else {
+            return Ok(StorageProviderKind::Local);
+        };
+        let Some(provider_tbl) = provider_item.as_table_like() else {
+            return Err(CfmsError::Config(
+                "Configuration section 'provider' must be a table".to_string(),
+            ));
+        };
+        let Some(storage_item) = provider_tbl.get("storage") else {
+            return Ok(StorageProviderKind::Local);
+        };
+        let Some(storage_kind) = storage_item.as_str() else {
+            return Err(CfmsError::Config(
+                "Configuration key 'provider.storage' must be a string".to_string(),
+            ));
+        };
+        match storage_kind {
+            "local" => Ok(StorageProviderKind::Local),
+            "s3" => Ok(StorageProviderKind::S3),
+            other => Err(CfmsError::Config(format!(
+                "Unsupported storage provider '{other}' in 'provider.storage' (expected 'local' or 's3')"
+            ))),
+        }
+    }
+
+    /// Extract and validate `[s3]` if the section is present in `config.toml`.
+    /// Allows empty `s3.bucket` when `[provider].storage` is `local` (matching `config.toml.sample`),
+    /// while strictly validating types, endpoint URL syntax, addressing style, pool size, and
+    /// credential pairing.
+    pub fn s3_config_optional(&self) -> Result<Option<S3SectionConfig>> {
+        let Some(s3_item) = self.doc.get("s3") else {
+            return Ok(None);
+        };
+        let Some(s3_tbl) = s3_item.as_table_like() else {
+            return Err(CfmsError::Config(
+                "Configuration section 's3' must be a table".to_string(),
+            ));
+        };
+
+        let bucket = optional_table_string(s3_tbl, "s3", "bucket")?
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        let endpoint_url = match optional_table_string(s3_tbl, "s3", "endpoint_url")? {
+            Some(raw) if !raw.trim().is_empty() => {
+                let trimmed = raw.trim().to_string();
+                validate_s3_endpoint_url(&trimmed)?;
+                Some(trimmed)
+            }
+            _ => None,
+        };
+
+        let access_key_id = optional_table_string(s3_tbl, "s3", "access_key_id")?
+            .filter(|s| !s.is_empty());
+        let secret_access_key = optional_table_string(s3_tbl, "s3", "secret_access_key")?
+            .filter(|s| !s.is_empty())
+            .map(RedactedSecret::new);
+        let session_token = optional_table_string(s3_tbl, "s3", "session_token")?
+            .filter(|s| !s.is_empty())
+            .map(RedactedSecret::new);
+
+        if access_key_id.is_some() != secret_access_key.is_some() {
+            return Err(CfmsError::Config(
+                "s3.access_key_id and s3.secret_access_key must be configured together"
+                    .to_string(),
+            ));
+        }
+        if session_token.is_some() && access_key_id.is_none() {
+            return Err(CfmsError::Config(
+                "s3.session_token requires explicit access key credentials".to_string(),
+            ));
+        }
+
+        let region_name = optional_table_string(s3_tbl, "s3", "region_name")?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let addressing_style = match optional_table_string(s3_tbl, "s3", "addressing_style")? {
+            None => S3AddressingStyle::Auto,
+            Some(raw) => match raw.as_str() {
+                "auto" => S3AddressingStyle::Auto,
+                "virtual" => S3AddressingStyle::Virtual,
+                "path" => S3AddressingStyle::Path,
+                other => {
+                    return Err(CfmsError::Config(format!(
+                        "Unsupported s3.addressing_style '{other}' (expected 'auto', 'virtual', or 'path')"
+                    )));
+                }
+            },
+        };
+
+        let max_pool_connections = match s3_tbl.get("max_pool_connections") {
+            Some(item) => {
+                let Some(val) = item.as_integer() else {
+                    return Err(CfmsError::Config(
+                        "Configuration key 's3.max_pool_connections' must be a positive integer"
+                            .to_string(),
+                    ));
+                };
+                if val < 1 {
+                    return Err(CfmsError::Config(
+                        "Configuration key 's3.max_pool_connections' must be >= 1".to_string(),
+                    ));
+                }
+                usize::try_from(val).map_err(|_| {
+                    CfmsError::Config(
+                        "Configuration key 's3.max_pool_connections' exceeds platform range"
+                            .to_string(),
+                    )
+                })?
+            }
+            None => self.default_s3_pool_connections(),
+        };
+
+        Ok(Some(S3SectionConfig {
+            bucket,
+            endpoint_url,
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region_name,
+            addressing_style,
+            max_pool_connections,
+        }))
+    }
+
+    fn default_s3_pool_connections(&self) -> usize {
+        self.doc
+            .get("server")
+            .and_then(|v| v.as_table_like())
+            .and_then(|srv| srv.get("admission_control"))
+            .and_then(|v| v.as_table_like())
+            .and_then(|ac| ac.get("max_connections"))
+            .and_then(|v| v.as_integer())
+            .and_then(|n| if n > 0 { usize::try_from(n).ok() } else { None })
+            .unwrap_or(DEFAULT_S3_MAX_POOL_CONNECTIONS)
+    }
+
+    /// Extract and strictly validate `[s3]` settings required when `[provider].storage = "s3"`.
+    pub fn s3_config(&self) -> Result<S3SectionConfig> {
+        let Some(cfg) = self.s3_config_optional()? else {
+            return Err(CfmsError::Config(
+                "Configuration is missing required [s3] table when provider.storage = 's3'"
+                    .to_string(),
+            ));
+        };
+        if cfg.bucket.trim().is_empty() {
+            return Err(CfmsError::Config(
+                "Configuration key 's3.bucket' must not be empty when provider.storage = 's3'"
+                    .to_string(),
+            ));
+        }
+        Ok(cfg)
+    }
+
     /// Extract a diagnostic summary from `config.toml` using open-world parsing.
     pub fn summary(&self) -> Result<ServerConfigSummary> {
         let database = self.database_config()?;
+        let storage_provider = self.storage_provider()?;
+        let s3 = match storage_provider {
+            StorageProviderKind::S3 => Some(self.s3_config()?.summary()),
+            StorageProviderKind::Local => self.s3_config_optional()?.map(|c| c.summary()),
+        };
         let debug = self
             .doc
             .get("debug")
@@ -333,6 +638,8 @@ impl ConfigDocument {
             has_pepper,
             enabled_extensions,
             database,
+            storage_provider,
+            s3,
         })
     }
 
@@ -631,6 +938,16 @@ impl ConfigDocument {
 
         // Verify that the minimal [database] connection table required by cfms-ctl is well-formed.
         let _ = self.database_config()?;
+
+        // Align [provider] / [s3] structural invariants with server deployment rules.
+        match self.storage_provider()? {
+            StorageProviderKind::S3 => {
+                let _ = self.s3_config()?;
+            }
+            StorageProviderKind::Local => {
+                let _ = self.s3_config_optional()?;
+            }
+        }
         Ok(())
     }
 
@@ -678,6 +995,50 @@ impl ConfigDocument {
             Some(issuer.to_string())
         }
     }
+}
+
+fn optional_table_string(
+    table: &dyn TableLike,
+    section: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    let Some(item) = table.get(key) else {
+        return Ok(None);
+    };
+    let Some(value) = item.as_str() else {
+        return Err(CfmsError::Config(format!(
+            "Configuration key '{section}.{key}' must be a string"
+        )));
+    };
+    Ok(Some(value.to_string()))
+}
+
+fn validate_s3_endpoint_url(endpoint: &str) -> Result<()> {
+    let parsed = url::Url::parse(endpoint).map_err(|e| {
+        CfmsError::Config(format!("Invalid s3.endpoint_url '{endpoint}': {e}"))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(CfmsError::Config(format!(
+            "Invalid s3.endpoint_url '{endpoint}': scheme must be http or https"
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(CfmsError::Config(format!(
+            "Invalid s3.endpoint_url '{endpoint}': URL must include a host"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(CfmsError::Config(
+            "s3.endpoint_url must not embed credentials; configure s3.access_key_id and s3.secret_access_key instead"
+                .to_string(),
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(CfmsError::Config(format!(
+            "Invalid s3.endpoint_url '{endpoint}': query parameters and fragments are not supported"
+        )));
+    }
+    Ok(())
 }
 
 fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
@@ -1640,5 +2001,134 @@ enabled = []
         std::fs::write(&empty_path, "[extensions.oidc_sso]\nissuer = \"   \"\n").expect("write");
         let empty = ConfigDocument::load(&empty_path).expect("load empty");
         assert_eq!(empty.oidc_sso_issuer(), None);
+    }
+
+    #[test]
+    fn s3_config_parsing_redaction_and_validation_parity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // 1. Valid S3 config with inherited max_pool_connections from server.admission_control
+        let valid_path = dir.path().join("valid_s3.toml");
+        std::fs::write(
+            &valid_path,
+            r#"
+[server.admission_control]
+max_connections = 96
+
+[database]
+type = "sqlite"
+file = "app.db"
+
+[provider]
+storage = "s3"
+
+[s3]
+bucket = "cfms-assets"
+endpoint_url = "https://acct.r2.cloudflarestorage.com"
+access_key_id = "AKIA_TEST"
+secret_access_key = "TOP_SECRET_VALUE"
+session_token = "SESSION_SECRET"
+region_name = ""
+addressing_style = "auto"
+"#,
+        )
+        .unwrap();
+        let doc = ConfigDocument::load(&valid_path).unwrap();
+        assert_eq!(doc.storage_provider().unwrap(), StorageProviderKind::S3);
+        let cfg = doc.s3_config().unwrap();
+        assert_eq!(cfg.bucket, "cfms-assets");
+        assert_eq!(
+            cfg.endpoint_url.as_deref(),
+            Some("https://acct.r2.cloudflarestorage.com")
+        );
+        assert_eq!(cfg.region_name, None);
+        assert_eq!(cfg.addressing_style, S3AddressingStyle::Auto);
+        assert_eq!(cfg.max_pool_connections, 96);
+
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("TOP_SECRET_VALUE"));
+        assert!(!dbg.contains("SESSION_SECRET"));
+        assert!(dbg.contains("[REDACTED]"));
+
+        let summary = doc.summary().unwrap();
+        assert_eq!(summary.storage_provider, StorageProviderKind::S3);
+        let s3_sum = summary.s3.unwrap();
+        assert!(s3_sum.has_explicit_credentials);
+        assert!(s3_sum.has_session_token);
+        let summary_json = serde_json::to_string(&s3_sum).unwrap();
+        assert!(!summary_json.contains("TOP_SECRET_VALUE"));
+        assert!(!summary_json.contains("SESSION_SECRET"));
+
+        // 2. local storage allows empty s3.bucket (matching config.toml.sample)
+        let local_sample = dir.path().join("local_sample.toml");
+        std::fs::write(
+            &local_sample,
+            r#"
+[database]
+type = "sqlite"
+file = "app.db"
+
+[provider]
+storage = "local"
+
+[s3]
+bucket = ""
+addressing_style = "path"
+"#,
+        )
+        .unwrap();
+        let local_doc = ConfigDocument::load(&local_sample).unwrap();
+        assert!(local_doc.validate_with_contract(None).is_ok());
+
+        // 3. s3 storage without bucket fails
+        let missing_bucket = dir.path().join("missing_bucket.toml");
+        std::fs::write(
+            &missing_bucket,
+            "[database]\ntype=\"sqlite\"\nfile=\"a.db\"\n[provider]\nstorage=\"s3\"\n[s3]\nbucket=\"  \"\n",
+        )
+        .unwrap();
+        assert!(ConfigDocument::load(&missing_bucket).unwrap().s3_config().is_err());
+
+        // 4. Unpaired credentials or session_token without access keys fail
+        let unpaired = dir.path().join("unpaired.toml");
+        std::fs::write(
+            &unpaired,
+            "[database]\ntype=\"sqlite\"\nfile=\"a.db\"\n[provider]\nstorage=\"s3\"\n[s3]\nbucket=\"b\"\naccess_key_id=\"k\"\n",
+        )
+        .unwrap();
+        assert!(ConfigDocument::load(&unpaired).unwrap().s3_config().is_err());
+
+        let token_only = dir.path().join("token_only.toml");
+        std::fs::write(
+            &token_only,
+            "[database]\ntype=\"sqlite\"\nfile=\"a.db\"\n[provider]\nstorage=\"s3\"\n[s3]\nbucket=\"b\"\nsession_token=\"tok\"\n",
+        )
+        .unwrap();
+        assert!(ConfigDocument::load(&token_only).unwrap().s3_config().is_err());
+
+        // 5. Invalid endpoint_url or addressing_style or pool count fail
+        let bad_endpoint = dir.path().join("bad_endpoint.toml");
+        std::fs::write(
+            &bad_endpoint,
+            "[database]\ntype=\"sqlite\"\nfile=\"a.db\"\n[provider]\nstorage=\"s3\"\n[s3]\nbucket=\"b\"\nendpoint_url=\"ftp://s3.local\"\n",
+        )
+        .unwrap();
+        assert!(ConfigDocument::load(&bad_endpoint).unwrap().s3_config().is_err());
+
+        let bad_style = dir.path().join("bad_style.toml");
+        std::fs::write(
+            &bad_style,
+            "[database]\ntype=\"sqlite\"\nfile=\"a.db\"\n[provider]\nstorage=\"s3\"\n[s3]\nbucket=\"b\"\naddressing_style=\"dns\"\n",
+        )
+        .unwrap();
+        assert!(ConfigDocument::load(&bad_style).unwrap().s3_config().is_err());
+
+        let zero_pool = dir.path().join("zero_pool.toml");
+        std::fs::write(
+            &zero_pool,
+            "[database]\ntype=\"sqlite\"\nfile=\"a.db\"\n[provider]\nstorage=\"s3\"\n[s3]\nbucket=\"b\"\nmax_pool_connections=0\n",
+        )
+        .unwrap();
+        assert!(ConfigDocument::load(&zero_pool).unwrap().s3_config().is_err());
     }
 }

@@ -5,11 +5,14 @@
 //! directly through `.cfms-import-part-*` staged writes, and performs multi-resource rollback
 //! across database schema, storage files, `config.toml`, and `init` marker on any failure.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
+use bytes::Bytes;
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::json;
+use tokio::task::JoinSet;
 use crate::cli::backup::BackupImportArgs;
 use crate::core::atomic::atomic_write;
 use crate::core::config::ConfigDocument;
@@ -29,7 +32,10 @@ use crate::db::transfer::{
     sync_target_sequences,
 };
 use crate::ops::AppContext;
-use crate::storage::{LocalFsStorage, StagedStorageFile, StorageBackend, resolve_local_storage};
+use crate::storage::{
+    RollbackTracker, StagedStorageWriter, StorageBackend, resolve_storage,
+    validate_storage_relative_path,
+};
 use crate::ui::{CommandReport, KeyValueTable, OutputFormat, UiConsole, confirm_or_abort};
 use super::format::read_key_from_args;
 use super::stream::{
@@ -48,6 +54,10 @@ pub struct BackupImportReport {
     pub archive_path: String,
     pub target_endpoint: String,
     pub target_dialect: String,
+    pub source_storage_provider: String,
+    pub target_storage_provider: String,
+    pub target_storage_location: String,
+    pub cross_storage_restore: bool,
     pub format_version: u32,
     pub schema_revision: String,
     pub components: Vec<String>,
@@ -76,6 +86,22 @@ impl CommandReport for BackupImportReport {
             .row(
                 "Target Database",
                 format!("{} ({})", self.target_endpoint, self.target_dialect),
+            )
+            .row(
+                "Storage Target",
+                if self.cross_storage_restore {
+                    format!(
+                        "{} ({}) [cross-storage from '{}']",
+                        self.target_storage_provider,
+                        self.target_storage_location,
+                        self.source_storage_provider
+                    )
+                } else {
+                    format!(
+                        "{} ({})",
+                        self.target_storage_provider, self.target_storage_location
+                    )
+                },
             )
             .row("Format Version", self.format_version.to_string())
             .row("Schema Revision", self.schema_revision.clone())
@@ -110,7 +136,7 @@ impl CommandReport for BackupImportReport {
 
 struct RollbackGuard {
     created_schema_tables: Vec<String>,
-    written_storage_paths: Vec<String>,
+    storage_tracker: Arc<RollbackTracker>,
     config_path: std::path::PathBuf,
     config_snapshot: Option<Vec<u8>>,
     config_backup_path: Option<std::path::PathBuf>,
@@ -123,7 +149,7 @@ impl RollbackGuard {
     fn new(config_path: std::path::PathBuf, init_path: std::path::PathBuf) -> Self {
         Self {
             created_schema_tables: Vec::new(),
-            written_storage_paths: Vec::new(),
+            storage_tracker: RollbackTracker::new(),
             config_path,
             config_snapshot: None,
             config_backup_path: None,
@@ -137,7 +163,7 @@ impl RollbackGuard {
         self.armed = false;
     }
 
-    async fn rollback(mut self, pool: &DbPool, storage: &LocalFsStorage) {
+    async fn rollback(mut self, pool: &DbPool, storage: &Arc<dyn StorageBackend>) {
         if !self.armed {
             return;
         }
@@ -161,8 +187,9 @@ impl RollbackGuard {
             let _ = atomic_write(&self.config_path, &prev_cfg);
         }
 
-        for path in self.written_storage_paths.iter().rev() {
-            let _ = storage.remove_file(path);
+        let rb = storage.rollback_written(&self.storage_tracker).await;
+        for err in rb.errors {
+            tracing::warn!(error = %err, "Storage rollback cleanup error");
         }
 
         if !self.created_schema_tables.is_empty() {
@@ -179,44 +206,69 @@ pub async fn run_import(ctx: &AppContext, args: BackupImportArgs) -> Result<()> 
     let mut config = ctx.load_config(&paths)?;
     let db_cfg = config.database_config()?;
     let target_endpoint = db_cfg.display_endpoint(&paths);
-    let storage = resolve_local_storage(&paths, &config)?;
+    let storage = resolve_storage(&paths, &config).await?;
+    let target_storage_location = storage.target_description();
 
     let (envelope, manifest, archive) =
         VerifiedArchiveReader::open_file(&args.backup_path, &master_key)?;
 
-    if manifest.storage_provider != storage.kind() {
-        return Err(CfmsError::Config(format!(
-            "Backup storage provider '{}' is incompatible with active storage provider '{}'",
-            manifest.storage_provider,
-            storage.kind()
-        )));
-    }
+    let cross_storage_restore = manifest.storage_provider != storage.kind();
 
     if ctx.ui.format() == OutputFormat::Human && !ctx.global.yes {
         let mut preview = KeyValueTable::new("Backup Import Plan");
         preview
             .row("Archive Path", envelope.path.clone())
             .row("Target Database", format!("{target_endpoint} ({})", db_cfg.kind))
+            .row("Archive Storage", manifest.storage_provider.clone())
+            .row(
+                "Target Storage",
+                format!("{} ({target_storage_location})", storage.kind()),
+            )
+            .row(
+                "Cross-Storage Restore",
+                if cross_storage_restore {
+                    format!(
+                        "YES ({} -> {}; objects will be written into active {} storage)",
+                        manifest.storage_provider,
+                        storage.kind(),
+                        storage.kind()
+                    )
+                } else {
+                    "no".to_string()
+                },
+            )
             .row("Schema Revision", manifest.schema_revision.clone())
             .row("Components", manifest.components.join(", "))
             .row("Tables in Archive", manifest.table_order.len().to_string());
         preview.print();
     }
 
-    confirm_or_abort(
-        &format!(
+    let confirm_prompt = if cross_storage_restore {
+        format!(
+            "Restore backup '{}' ({}) across storage backends ({} -> {}) into target {} ({})?",
+            envelope.path,
+            manifest.components.join(", "),
+            manifest.storage_provider,
+            storage.kind(),
+            target_endpoint,
+            db_cfg.kind
+        )
+    } else {
+        format!(
             "Restore backup '{}' ({}) into target {} ({})?",
             envelope.path,
             manifest.components.join(", "),
             target_endpoint,
             db_cfg.kind
-        ),
-        ctx.global.yes,
-    )?;
+        )
+    };
+    confirm_or_abort(&confirm_prompt, ctx.global.yes)?;
 
     if manifest.components.iter().any(|c| c == "configuration") {
         validate_config_sections_mutable(&config, &manifest.configuration)?;
     }
+
+    storage.preflight().await?;
 
     if db_cfg.kind == crate::db::DatabaseKind::Sqlite {
         let sqlite_path = paths.resolve_sqlite_path(&db_cfg.file);
@@ -253,13 +305,29 @@ pub async fn run_import(ctx: &AppContext, args: BackupImportArgs) -> Result<()> 
     pb.finish_and_clear();
 
     match import_res {
-        Ok(stats) => {
+        Ok(mut stats) => {
             guard.disarm();
             pool.close().await;
+            if cross_storage_restore {
+                stats.warnings.push(format!(
+                    "Cross-storage restore completed: archive recorded provider '{}', restored objects into active '{}' backend ({target_storage_location}).",
+                    manifest.storage_provider,
+                    storage.kind()
+                ));
+            }
+            for w in storage.collected_warnings() {
+                if !stats.warnings.iter().any(|existing| existing == &w) {
+                    stats.warnings.push(w);
+                }
+            }
             let report = BackupImportReport {
                 archive_path: envelope.path,
                 target_endpoint,
                 target_dialect: pool.kind().to_string(),
+                source_storage_provider: manifest.storage_provider,
+                target_storage_provider: storage.kind().to_string(),
+                target_storage_location,
+                cross_storage_restore,
                 format_version: manifest.version,
                 schema_revision: manifest.schema_revision,
                 components: manifest.components,
@@ -299,10 +367,33 @@ struct ImportStats {
 
 type DeferredPairMap = BTreeMap<(String, String), Vec<(SqlValue, SqlValue)>>;
 
+fn propagate_commit_task(res: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
+    match res {
+        Ok(inner) => inner,
+        Err(join_err) => Err(CfmsError::Backup(format!(
+            "Storage upload worker panicked: {join_err}"
+        ))),
+    }
+}
+
+fn poll_finished_commit_tasks(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+    while let Some(res) = tasks.try_join_next() {
+        propagate_commit_task(res)?;
+    }
+    Ok(())
+}
+
+async fn drain_commit_tasks(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+    while let Some(res) = tasks.join_next().await {
+        propagate_commit_task(res)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_transactional_import<R: std::io::Read>(
     pool: &DbPool,
-    storage: &LocalFsStorage,
+    storage: &Arc<dyn StorageBackend>,
     config: &mut ConfigDocument,
     target_ir: &SchemaIr,
     manifest: &ManifestHeader,
@@ -311,6 +402,9 @@ async fn execute_transactional_import<R: std::io::Read>(
     pb: &indicatif::ProgressBar,
 ) -> Result<ImportStats> {
     let mut tx = TargetTx::begin(pool).await?;
+    let mut active_staged_blob: Option<(u64, String, Box<dyn StagedStorageWriter>)> = None;
+    let mut commit_tasks: JoinSet<Result<()>> = JoinSet::new();
+
     let outcome: Result<ImportStats> = async {
         let coupled = is_coupled_node_group(manifest);
         let import_subset_ir = build_import_subset_ir(target_ir, manifest)?;
@@ -321,7 +415,9 @@ async fn execute_transactional_import<R: std::io::Read>(
         let mut deferred_pairs: DeferredPairMap = BTreeMap::new();
         let mut saw_server_name_option = false;
 
-        let mut active_staged_blob: Option<(u64, String, Box<dyn StagedStorageFile>)> = None;
+        let commit_concurrency = storage.recommended_concurrency().max(1);
+        let mut checked_absent_paths: HashSet<String> = HashSet::new();
+        let mut seen_blob_paths: HashSet<String> = HashSet::new();
         let mut completed_blob_paths: HashMap<u64, String> = HashMap::new();
         let mut restored_files_count = 0usize;
         let mut blob_bytes = 0u64;
@@ -329,6 +425,7 @@ async fn execute_transactional_import<R: std::io::Read>(
         let mut footer_opt: Option<IntegrityFooter> = None;
 
         while let Some(event) = archive.next_event()? {
+            poll_finished_commit_tasks(&mut commit_tasks)?;
             match event {
                 VerifiedArchiveEvent::TableStart { table_name } => {
                     pb.set_message(format!("Importing table '{table_name}'"));
@@ -339,7 +436,9 @@ async fn execute_transactional_import<R: std::io::Read>(
                             storage,
                             manifest.tables.get("files"),
                             &rows,
-                        )?;
+                            &mut checked_absent_paths,
+                        )
+                        .await?;
                     }
                     if table_name == "options" && !saw_server_name_option {
                         saw_server_name_option =
@@ -368,8 +467,19 @@ async fn execute_transactional_import<R: std::io::Read>(
                     blob_id,
                     storage_path,
                 } => {
+                    if !seen_blob_paths.insert(storage_path.clone()) {
+                        return Err(CfmsError::ArchiveIntegrity(format!(
+                            "Duplicate blob target path '{storage_path}' in archive"
+                        )));
+                    }
                     pb.set_message(format!("Restoring blob '{storage_path}'"));
-                    let staged = storage.begin_staged_write(&storage_path)?;
+                    let staged = storage
+                        .begin_staged_write(
+                            &storage_path,
+                            None,
+                            Arc::clone(&guard.storage_tracker),
+                        )
+                        .await?;
                     active_staged_blob = Some((blob_id, storage_path, staged));
                 }
                 VerifiedArchiveEvent::BlobChunk { blob_id, data } => {
@@ -383,7 +493,7 @@ async fn execute_transactional_import<R: std::io::Read>(
                             "Staged blob_id mismatch".to_string(),
                         ));
                     }
-                    staged.write_all(&data)?;
+                    staged.write_chunk(Bytes::from(data)).await?;
                 }
                 VerifiedArchiveEvent::BlobEnd {
                     blob_id,
@@ -397,12 +507,22 @@ async fn execute_transactional_import<R: std::io::Read>(
                         ));
                     };
                     if active_id != blob_id || active_path != storage_path {
+                        let _ = staged.abort().await;
                         return Err(CfmsError::ArchiveIntegrity(
                             "BlobEnd identity mismatch".to_string(),
                         ));
                     }
-                    staged.finish()?;
-                    guard.written_storage_paths.push(storage_path.clone());
+                    if commit_concurrency <= 1 {
+                        staged.finish().await?;
+                    } else {
+                        poll_finished_commit_tasks(&mut commit_tasks)?;
+                        while commit_tasks.len() >= commit_concurrency {
+                            if let Some(res) = commit_tasks.join_next().await {
+                                propagate_commit_task(res)?;
+                            }
+                        }
+                        commit_tasks.spawn(staged.finish());
+                    }
                     completed_blob_paths.insert(blob_id, storage_path);
                     blob_bytes += size;
                 }
@@ -415,8 +535,14 @@ async fn execute_transactional_import<R: std::io::Read>(
                         ))
                     })?;
                     if src_path != &entry.storage_path {
-                        storage.copy_within(src_path, &entry.storage_path)?;
-                        guard.written_storage_paths.push(entry.storage_path);
+                        drain_commit_tasks(&mut commit_tasks).await?;
+                        storage
+                            .copy_within(
+                                src_path,
+                                &entry.storage_path,
+                                &guard.storage_tracker,
+                            )
+                            .await?;
                     }
                     restored_files_count += 1;
                 }
@@ -425,6 +551,9 @@ async fn execute_transactional_import<R: std::io::Read>(
                 }
             }
         }
+
+        pb.set_message("Finalizing storage uploads");
+        drain_commit_tasks(&mut commit_tasks).await?;
 
         let footer = footer_opt.ok_or_else(|| {
             CfmsError::ArchiveIntegrity("Backup stream ended without IntegrityFooter".to_string())
@@ -469,6 +598,14 @@ async fn execute_transactional_import<R: std::io::Read>(
         })
     }
     .await;
+
+    if outcome.is_err() {
+        if let Some((_, _, staged)) = active_staged_blob.take() {
+            let _ = staged.abort().await;
+        }
+        commit_tasks.abort_all();
+        while commit_tasks.join_next().await.is_some() {}
+    }
 
     match outcome {
         Ok(stats) => {
@@ -814,10 +951,11 @@ async fn apply_single_deferred_column(
     Ok(())
 }
 
-fn ensure_storage_paths_available(
-    storage: &LocalFsStorage,
+async fn ensure_storage_paths_available(
+    storage: &Arc<dyn StorageBackend>,
     files_spec: Option<&TableSchemaSpec>,
     rows: &[Vec<SqlValue>],
+    checked_paths: &mut HashSet<String>,
 ) -> Result<()> {
     let Some(spec) = files_spec else {
         return Ok(());
@@ -828,13 +966,16 @@ fn ensure_storage_paths_available(
         .position(|c| c.name == "path")
         .ok_or_else(|| CfmsError::ArchiveIntegrity("Missing files.path column".to_string()))?;
 
+    let mut to_check = Vec::with_capacity(rows.len());
     for row in rows {
         let storage_path = sql_val_to_id(&row[path_idx], "files.path")?;
-        if storage.exists(&storage_path)? {
-            return Err(CfmsError::ArchiveIntegrity(format!(
-                "Refusing to overwrite pre-existing storage object '{storage_path}'"
-            )));
+        validate_storage_relative_path(&storage_path)?;
+        if checked_paths.insert(storage_path.clone()) {
+            to_check.push(storage_path);
         }
+    }
+    if !to_check.is_empty() {
+        storage.check_paths_absent(&to_check).await?;
     }
     Ok(())
 }

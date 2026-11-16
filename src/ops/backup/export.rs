@@ -5,15 +5,18 @@
 //! sibling ciphertext temporary file before `persist_noclobber`, never writing plaintext
 //! archives or extracted files to disk.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufWriter, Read, Write};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use bytes::Bytes;
 use chrono::Utc;
 use dialoguer::{Confirm, Input, MultiSelect};
 use futures_util::StreamExt;
 use indicatif::ProgressBar;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 use crate::cli::backup::BackupExportArgs;
 use crate::core::config::ConfigDocument;
@@ -28,7 +31,7 @@ use crate::db::transfer::{
 };
 use crate::ops::AppContext;
 use crate::ops::extension::version::discover_server_version;
-use crate::storage::{StorageBackend, resolve_local_storage, validate_storage_relative_path};
+use crate::storage::{StorageBackend, resolve_storage, validate_storage_relative_path};
 use crate::ui::{CommandReport, KeyValueTable, OutputFormat, UiConsole};
 use super::backup_progress_bar;
 use super::format::{
@@ -56,6 +59,8 @@ pub struct BackupExportReport {
     pub created_at: String,
     pub server_version: String,
     pub schema_revision: String,
+    pub storage_provider: String,
+    pub storage_target: String,
     pub components: Vec<String>,
     pub auto_added_components: Vec<String>,
     pub table_count: usize,
@@ -84,6 +89,10 @@ impl CommandReport for BackupExportReport {
             .row("Format Version", self.format_version.to_string())
             .row("Server Version", self.server_version.clone())
             .row("Schema Revision", self.schema_revision.clone())
+            .row(
+                "Storage Backend",
+                format!("{} ({})", self.storage_provider, self.storage_target),
+            )
             .row("Components", self.components.join(", "));
         if !self.auto_added_components.is_empty() {
             table.row("Auto-Added Dependencies", self.auto_added_components.join(", "));
@@ -169,7 +178,8 @@ async fn execute_export_locked(
 ) -> Result<BackupExportReport> {
     let server_version = discover_server_version(paths)?.version.to_string();
     let config = ctx.load_config(paths)?;
-    let storage = resolve_local_storage(paths, &config)?;
+    let storage = resolve_storage(paths, &config).await?;
+    storage.preflight().await?;
     let configuration = extract_configuration_payload(
         &config,
         options.selection.contains(BackupComponent::Configuration),
@@ -224,7 +234,12 @@ async fn execute_export_locked(
     pb.finish_and_clear();
     pool.close().await;
 
-    let (temp_file, stats) = write_res?;
+    let (temp_file, mut stats) = write_res?;
+    for w in storage.collected_warnings() {
+        if !stats.warnings.iter().any(|existing| existing == &w) {
+            stats.warnings.push(w);
+        }
+    }
     temp_file.persist_noclobber(&options.output_path).map_err(|e| {
         CfmsError::Backup(format!(
             "Unable to persist backup archive '{}': {}",
@@ -246,6 +261,8 @@ async fn execute_export_locked(
         &plan,
         &created_at,
         &server_version,
+        storage.kind(),
+        storage.target_description(),
         file_size,
         stats,
         encoded_key,
@@ -262,10 +279,14 @@ struct ExportFinishStats {
     warnings: Vec<String>,
 }
 
+type ExportRecordWriter = StreamRecordWriter<
+    zstd::stream::write::Encoder<'static, ChunkedEncryptWriter<BufWriter<tempfile::NamedTempFile>>>,
+>;
+
 #[allow(clippy::too_many_arguments)]
 async fn stream_archive_payload(
     pool: &DbPool,
-    storage: &crate::storage::LocalFsStorage,
+    storage: &Arc<dyn StorageBackend>,
     plan: &SourceExportPlan,
     selection: &ComponentSelection,
     active_rule_set_ids: &HashSet<String>,
@@ -292,7 +313,7 @@ async fn stream_archive_payload(
         ChunkedEncryptWriter::new(out_writer, master_key, &envelope, header_sha256)?;
     let zstd_writer = zstd::stream::write::Encoder::new(enc_writer, 3)
         .map_err(|e| CfmsError::Backup(format!("Failed to initialize Zstd encoder: {e}")))?;
-    let mut record_writer = StreamRecordWriter::new(zstd_writer);
+    let mut record_writer: ExportRecordWriter = StreamRecordWriter::new(zstd_writer);
 
     let manifest = ManifestHeader::new(
         created_at.to_string(),
@@ -344,8 +365,14 @@ async fn stream_archive_payload(
         pb.inc(1);
     }
 
-    pb.set_message("Streaming storage file blobs");
-    let file_stats = stream_storage_files(storage, &state.files_meta, &mut record_writer)?;
+    pb.set_message(format!(
+        "Streaming {} storage file reference(s) from {}",
+        state.files_meta.len(),
+        storage.kind()
+    ));
+    let (mut record_writer, file_stats) =
+        stream_storage_files(storage, &state.files_meta, record_writer).await?;
+    pb.inc(1);
 
     let footer = IntegrityFooter {
         tables: state.table_digests.clone(),
@@ -635,19 +662,94 @@ struct FileExportStreamStats {
     blob_bytes: u64,
 }
 
-fn stream_storage_files<W: Write>(
-    storage: &crate::storage::LocalFsStorage,
+enum UniqueBlobMsg {
+    Missing,
+    Begin,
+    Chunk(Bytes),
+    End,
+}
+
+fn spawn_storage_prefetch_slot(
+    storage: Arc<dyn StorageBackend>,
+    path: String,
+) -> mpsc::Receiver<Result<UniqueBlobMsg>> {
+    let (tx, rx) = mpsc::channel::<Result<UniqueBlobMsg>>(4);
+    tokio::spawn(async move {
+        match storage.open_read_optional(&path).await {
+            Ok(None) => {
+                let _ = tx.send(Ok(UniqueBlobMsg::Missing)).await;
+            }
+            Ok(Some(mut stream)) => {
+                if tx.send(Ok(UniqueBlobMsg::Begin)).await.is_err() {
+                    return;
+                }
+                while let Some(chunk_res) = stream.next().await {
+                    match chunk_res {
+                        Ok(bytes) => {
+                            let mut offset = 0usize;
+                            while offset < bytes.len() {
+                                let end = (offset + MAX_BLOB_CHUNK_BYTES).min(bytes.len());
+                                let slice = bytes.slice(offset..end);
+                                if tx.send(Ok(UniqueBlobMsg::Chunk(slice))).await.is_err() {
+                                    return;
+                                }
+                                offset = end;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    }
+                }
+                let _ = tx.send(Ok(UniqueBlobMsg::End)).await;
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+            }
+        }
+    });
+    rx
+}
+
+fn handle_missing_file_meta(
+    meta: &ExportedFileMeta,
+    writer: &mut ExportRecordWriter,
+    warnings: &mut Vec<String>,
+    missing_inactive_files: &mut Vec<MissingInactiveFilePayload>,
+) -> Result<()> {
+    if !meta.active {
+        let missing = MissingInactiveFilePayload {
+            file_id: meta.id.clone(),
+            storage_path: meta.storage_path.clone(),
+        };
+        warnings.push(format!(
+            "Inactive file '{}' missing from storage path '{}'; omitted from archive.",
+            meta.id, meta.storage_path
+        ));
+        writer.write_missing_inactive_file(&missing)?;
+        missing_inactive_files.push(missing);
+        return Ok(());
+    }
+    Err(CfmsError::ArchiveIntegrity(format!(
+        "Active storage file '{}' is missing at '{}'",
+        meta.id, meta.storage_path
+    )))
+}
+
+fn consume_storage_blobs_blocking(
     files_meta: &[ExportedFileMeta],
-    writer: &mut StreamRecordWriter<W>,
-) -> Result<FileExportStreamStats> {
+    mut writer: ExportRecordWriter,
+    mut rx: mpsc::Receiver<UniqueBlobMsg>,
+) -> Result<(ExportRecordWriter, FileExportStreamStats)> {
     let mut path_to_blob: HashMap<String, BlobEndPayload> = HashMap::new();
+    let mut missing_paths: HashSet<String> = HashSet::new();
     let mut blobs = Vec::new();
     let mut files = Vec::new();
     let mut missing_inactive_files = Vec::new();
     let mut warnings = Vec::new();
     let mut next_blob_id = 0u64;
     let mut total_blob_bytes = 0u64;
-    let mut read_buf = vec![0u8; MAX_BLOB_CHUNK_BYTES];
 
     for meta in files_meta {
         if let Some(existing_blob) = path_to_blob.get(&meta.storage_path) {
@@ -663,76 +765,180 @@ fn stream_storage_files<W: Write>(
             continue;
         }
 
-        if !storage.exists(&meta.storage_path)? {
-            if !meta.active {
-                let missing = MissingInactiveFilePayload {
+        if missing_paths.contains(&meta.storage_path) {
+            handle_missing_file_meta(
+                meta,
+                &mut writer,
+                &mut warnings,
+                &mut missing_inactive_files,
+            )?;
+            continue;
+        }
+
+        match rx.blocking_recv() {
+            Some(UniqueBlobMsg::Missing) => {
+                missing_paths.insert(meta.storage_path.clone());
+                handle_missing_file_meta(
+                    meta,
+                    &mut writer,
+                    &mut warnings,
+                    &mut missing_inactive_files,
+                )?;
+            }
+            Some(UniqueBlobMsg::Begin) => {
+                let blob_id = next_blob_id;
+                next_blob_id += 1;
+
+                writer.write_blob_start(&BlobStartPayload {
+                    blob_id,
+                    storage_path: meta.storage_path.clone(),
+                })?;
+
+                let mut hasher = Sha256::new();
+                let mut size = 0u64;
+                loop {
+                    match rx.blocking_recv() {
+                        Some(UniqueBlobMsg::Chunk(bytes)) => {
+                            hasher.update(&bytes);
+                            size += bytes.len() as u64;
+                            writer.write_blob_chunk(blob_id, &bytes)?;
+                        }
+                        Some(UniqueBlobMsg::End) => break,
+                        Some(other) => {
+                            let label = match other {
+                                UniqueBlobMsg::Missing => "Missing",
+                                UniqueBlobMsg::Begin => "Begin",
+                                _ => "Unknown",
+                            };
+                            return Err(CfmsError::ArchiveIntegrity(format!(
+                                "Unexpected prefetch state '{label}' while streaming '{}'",
+                                meta.storage_path
+                            )));
+                        }
+                        None => {
+                            return Err(CfmsError::Backup(format!(
+                                "Storage stream terminated prematurely while reading '{}'",
+                                meta.storage_path
+                            )));
+                        }
+                    }
+                }
+
+                let blob_end = BlobEndPayload {
+                    blob_id,
+                    size,
+                    sha256: hex::encode(hasher.finalize()),
+                };
+                writer.write_blob_end(&blob_end)?;
+
+                total_blob_bytes += size;
+                path_to_blob.insert(meta.storage_path.clone(), blob_end.clone());
+                blobs.push(blob_end.clone());
+
+                let entry = FileEntryPayload {
                     file_id: meta.id.clone(),
                     storage_path: meta.storage_path.clone(),
+                    blob_id,
+                    size: blob_end.size,
+                    sha256: blob_end.sha256,
                 };
-                warnings.push(format!(
-                    "Inactive file '{}' missing from storage path '{}'; omitted from archive.",
-                    meta.id, meta.storage_path
-                ));
-                writer.write_missing_inactive_file(&missing)?;
-                missing_inactive_files.push(missing);
-                continue;
+                writer.write_file_entry(&entry)?;
+                files.push(entry);
             }
-            return Err(CfmsError::ArchiveIntegrity(format!(
-                "Active storage file '{}' is missing at '{}'",
-                meta.id, meta.storage_path
-            )));
-        }
-
-        let blob_id = next_blob_id;
-        next_blob_id += 1;
-
-        writer.write_blob_start(&BlobStartPayload {
-            blob_id,
-            storage_path: meta.storage_path.clone(),
-        })?;
-
-        let mut reader = storage.open_read(&meta.storage_path)?;
-        let mut hasher = Sha256::new();
-        let mut size = 0u64;
-        loop {
-            let n = reader.read(&mut read_buf)?;
-            if n == 0 {
-                break;
+            Some(UniqueBlobMsg::Chunk(_)) | Some(UniqueBlobMsg::End) | None => {
+                return Err(CfmsError::Backup(format!(
+                    "Storage prefetch stream closed before delivering '{}'",
+                    meta.storage_path
+                )));
             }
-            hasher.update(&read_buf[..n]);
-            size += n as u64;
-            writer.write_blob_chunk(blob_id, &read_buf[..n])?;
         }
-
-        let blob_end = BlobEndPayload {
-            blob_id,
-            size,
-            sha256: hex::encode(hasher.finalize()),
-        };
-        writer.write_blob_end(&blob_end)?;
-
-        total_blob_bytes += size;
-        path_to_blob.insert(meta.storage_path.clone(), blob_end.clone());
-        blobs.push(blob_end.clone());
-
-        let entry = FileEntryPayload {
-            file_id: meta.id.clone(),
-            storage_path: meta.storage_path.clone(),
-            blob_id,
-            size: blob_end.size,
-            sha256: blob_end.sha256,
-        };
-        writer.write_file_entry(&entry)?;
-        files.push(entry);
     }
 
-    Ok(FileExportStreamStats {
-        blobs,
-        files,
-        missing_inactive_files,
-        warnings,
-        blob_bytes: total_blob_bytes,
-    })
+    Ok((
+        writer,
+        FileExportStreamStats {
+            blobs,
+            files,
+            missing_inactive_files,
+            warnings,
+            blob_bytes: total_blob_bytes,
+        },
+    ))
+}
+
+async fn stream_storage_files(
+    storage: &Arc<dyn StorageBackend>,
+    files_meta: &[ExportedFileMeta],
+    writer: ExportRecordWriter,
+) -> Result<(ExportRecordWriter, FileExportStreamStats)> {
+    let mut seen_unique = HashSet::with_capacity(files_meta.len());
+    let mut unique_paths = Vec::with_capacity(files_meta.len());
+    for meta in files_meta {
+        if seen_unique.insert(meta.storage_path.clone()) {
+            unique_paths.push(meta.storage_path.clone());
+        }
+    }
+
+    let (event_tx, event_rx) = mpsc::channel::<UniqueBlobMsg>(8);
+    let files_meta_owned = files_meta.to_vec();
+    let consumer_handle = tokio::task::spawn_blocking(move || {
+        consume_storage_blobs_blocking(&files_meta_owned, writer, event_rx)
+    });
+
+    let concurrency = storage.recommended_concurrency().max(1);
+    let mut next_to_spawn = 0usize;
+    let mut window: VecDeque<mpsc::Receiver<Result<UniqueBlobMsg>>> =
+        VecDeque::with_capacity(concurrency);
+
+    while next_to_spawn < unique_paths.len() && window.len() < concurrency {
+        window.push_back(spawn_storage_prefetch_slot(
+            Arc::clone(storage),
+            unique_paths[next_to_spawn].clone(),
+        ));
+        next_to_spawn += 1;
+    }
+
+    let mut producer_err: Option<CfmsError> = None;
+    while let Some(mut slot_rx) = window.pop_front() {
+        while next_to_spawn < unique_paths.len() && window.len() < concurrency {
+            window.push_back(spawn_storage_prefetch_slot(
+                Arc::clone(storage),
+                unique_paths[next_to_spawn].clone(),
+            ));
+            next_to_spawn += 1;
+        }
+
+        while let Some(item_res) = slot_rx.recv().await {
+            match item_res {
+                Ok(msg) => {
+                    if event_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    producer_err = Some(e);
+                    break;
+                }
+            }
+        }
+        if producer_err.is_some() {
+            break;
+        }
+    }
+
+    // Cancel all remaining prefetch slots and close consumer channel.
+    drop(window);
+    drop(event_tx);
+
+    let consumer_res = consumer_handle
+        .await
+        .map_err(|e| CfmsError::Io(std::io::Error::other(e.to_string())))?;
+
+    if let Some(err) = producer_err {
+        return Err(err);
+    }
+
+    consumer_res
 }
 
 fn record_exported_file_meta(
@@ -991,11 +1197,14 @@ fn col_index(cols: &[TransferColumn], name: &str, table: &str) -> Result<usize> 
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_export_report(
     options: &ResolvedExportOptions,
     plan: &SourceExportPlan,
     created_at: &str,
     server_version: &str,
+    storage_provider: &str,
+    storage_target: String,
     file_size: u64,
     stats: ExportFinishStats,
     encoded_key: Zeroizing<String>,
@@ -1017,6 +1226,8 @@ fn build_export_report(
         created_at: created_at.to_string(),
         server_version: server_version.to_string(),
         schema_revision: plan.schema_revision.clone(),
+        storage_provider: storage_provider.to_string(),
+        storage_target,
         components: options.selection.component_names(),
         auto_added_components,
         table_count: stats.table_count,
