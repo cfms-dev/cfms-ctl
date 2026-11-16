@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- git-cliff: end of header -->
 
+## [0.4.0] - 2026-11-16
+
+### Added
+
+- Implement auto configuration file migration
+- Implement core configuration contract handling and validation
+- Refactor the storage backend to be asynchronous; add support for S3 storage
+
+### Fixed
+
+- Add named schema candidates resolution and enhance config schema path handling
+
+### Documentation
+
+- Add README.md
+
+**Full Changelog**: https://github.com/cfms-dev/cfms-ctl/compare/v0.3.0..v0.4.0
+
 ## [0.3.0] - 2026-11-15
 
 ### Added
