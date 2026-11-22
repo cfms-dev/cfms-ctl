@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::path::PathBuf;
 use serde::Serialize;
-use crate::core::{CfmsError, ConfigDocument, CoreConfigContract, Result, WorkspacePaths};
+use crate::core::{CfmsError, ConfigDocument, Result, WorkspacePaths};
 use crate::ops::extension::catalog::{
     BUILTIN_EXTENSION_ID, CatalogDiagnostic, ExtensionCatalog, InstalledExtension,
     MAX_EXTENSION_SCAN_ENTRIES, RETIRED_EXTENSION_IDS, RESERVED_EXTENSION_IDS, StagingMarker,
@@ -62,7 +62,6 @@ pub fn plan_enable(
     config_doc: &ConfigDocument,
     paths: &WorkspacePaths,
     raw_targets: &[String],
-    contract: Option<&CoreConfigContract>,
 ) -> Result<ExtensionTogglePlan> {
     let targets = normalize_targets(raw_targets)?;
     for id in &targets {
@@ -170,11 +169,7 @@ pub fn plan_enable(
 
     let mut candidate_doc = config_doc.clone();
     if changed {
-        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, contract)?;
-        warnings.extend(schema_warnings);
-    } else if contract.is_some() {
-        let schema_warnings = candidate_doc.validate_with_contract(contract)?;
-        warnings.extend(schema_warnings);
+        candidate_doc.set_extensions_enabled(&next_enabled)?;
     }
 
     Ok(ExtensionTogglePlan {
@@ -205,7 +200,6 @@ pub fn plan_disable(
     config_doc: &ConfigDocument,
     paths: &WorkspacePaths,
     raw_targets: &[String],
-    contract: Option<&CoreConfigContract>,
 ) -> Result<ExtensionTogglePlan> {
     let targets = normalize_targets(raw_targets)?;
     for id in &targets {
@@ -258,11 +252,7 @@ pub fn plan_disable(
     let changed = next_enabled != previous_enabled;
     let mut candidate_doc = config_doc.clone();
     if changed {
-        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, contract)?;
-        warnings.extend(schema_warnings);
-    } else if contract.is_some() {
-        let schema_warnings = candidate_doc.validate_with_contract(contract)?;
-        warnings.extend(schema_warnings);
+        candidate_doc.set_extensions_enabled(&next_enabled)?;
     }
 
     let detected_server = discover_server_version(paths)?;
@@ -477,7 +467,6 @@ pub fn plan_upgrade(
     config_doc: &ConfigDocument,
     paths: &WorkspacePaths,
     managed_extensions: &BTreeSet<String>,
-    contract: Option<&CoreConfigContract>,
 ) -> Result<ExtensionUpgradePlan> {
     let new_manifest = &package.manifest;
     let id = &new_manifest.identifier;
@@ -644,8 +633,7 @@ pub fn plan_upgrade(
     let config_changed = next_enabled != previous_enabled;
     let mut candidate_doc = config_doc.clone();
     if config_changed {
-        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, contract)?;
-        warnings.extend(schema_warnings);
+        candidate_doc.set_extensions_enabled(&next_enabled)?;
     }
 
     Ok(ExtensionUpgradePlan {
@@ -672,7 +660,6 @@ pub fn plan_uninstall(
     catalog: &ExtensionCatalog,
     config_doc: &ConfigDocument,
     managed_extensions: &BTreeSet<String>,
-    contract: Option<&CoreConfigContract>,
 ) -> Result<ExtensionUninstallPlan> {
     validate_extension_identifier(identifier)?;
 
@@ -754,8 +741,7 @@ pub fn plan_uninstall(
     let config_changed = next_enabled != previous_enabled;
     let mut candidate_doc = config_doc.clone();
     if config_changed {
-        let schema_warnings = candidate_doc.set_extensions_enabled(&next_enabled, contract)?;
-        warnings.extend(schema_warnings);
+        candidate_doc.set_extensions_enabled(&next_enabled)?;
     }
 
     Ok(ExtensionUninstallPlan {
@@ -1421,7 +1407,7 @@ mod tests {
         let catalog = discover_catalog(ext_root).expect("catalog");
         let doc = ConfigDocument::load(&paths.config_path).expect("config");
 
-        let plan = plan_enable(&catalog, &doc, &paths, &["http_api".to_string()], None)
+        let plan = plan_enable(&catalog, &doc, &paths, &["http_api".to_string()])
             .expect("plan");
         assert!(plan.changed);
         assert_eq!(plan.next_enabled, vec!["base_auth", "http_api"]);
@@ -1455,7 +1441,7 @@ mod tests {
         let catalog = discover_catalog(ext_root).expect("catalog");
         let doc = ConfigDocument::load(&paths.config_path).expect("config");
 
-        let plan = plan_enable(&catalog, &doc, &paths, &["core_dep".to_string()], None)
+        let plan = plan_enable(&catalog, &doc, &paths, &["core_dep".to_string()])
             .expect("plan");
         assert_eq!(plan.next_enabled, vec!["other_ext", "core_dep", "consumer"]);
     }
@@ -1489,11 +1475,11 @@ mod tests {
         let catalog = discover_catalog(ext_root).expect("catalog");
         let doc = ConfigDocument::load(&paths.config_path).expect("config");
 
-        let cycle_err = plan_enable(&catalog, &doc, &paths, &["ext_a".to_string()], None)
+        let cycle_err = plan_enable(&catalog, &doc, &paths, &["ext_a".to_string()])
             .expect_err("cycle rejected");
         assert!(cycle_err.to_string().contains("ext_a -> ext_b -> ext_a"));
 
-        let min_err = plan_enable(&catalog, &doc, &paths, &["too_new".to_string()], None)
+        let min_err = plan_enable(&catalog, &doc, &paths, &["too_new".to_string()])
             .expect_err("min server version rejected");
         assert!(min_err.to_string().contains("0.14.0 or newer"));
 
@@ -1502,7 +1488,6 @@ mod tests {
             &doc,
             &paths,
             &["too_old_server".to_string()],
-            None,
         )
         .expect_err("max server version rejected");
         assert!(max_err.to_string().contains("up to 0.9.0"));
@@ -1511,7 +1496,7 @@ mod tests {
         std::fs::remove_file(dir.path().join("src/include/config/constants.py"))
             .expect("rm constants");
         let unknown_ver_err =
-            plan_enable(&catalog, &doc, &paths, &["too_new".to_string()], None)
+            plan_enable(&catalog, &doc, &paths, &["too_new".to_string()])
                 .expect_err("unknown server version fails safe");
         let err_msg = unknown_ver_err.to_string();
         assert!(err_msg.contains("Unable to determine target CFMS server version"));
@@ -1562,7 +1547,6 @@ mod tests {
                 "deleted_ext".to_string(),
                 "scheduling".to_string(),
             ],
-            None,
         )
         .expect("resilient disable");
 
@@ -1610,7 +1594,6 @@ mod tests {
             &doc,
             &paths,
             &["consumer_ext".to_string()],
-            None,
         )
         .expect_err("dep version mismatch");
         assert!(ver_err.to_string().contains(">=1.0.0"));
@@ -1621,14 +1604,13 @@ mod tests {
             &doc,
             &paths,
             &["clean_ext".to_string()],
-            None,
         )
         .expect_err("scoped staging blocks target");
         assert!(stage_err.to_string().contains("Unfinished extension transaction"));
 
         // ...but does NOT block enabling an unrelated healthy extension `dep_ext`.
         let unrelated_plan =
-            plan_enable(&catalog, &doc, &paths, &["dep_ext".to_string()], None)
+            plan_enable(&catalog, &doc, &paths, &["dep_ext".to_string()])
                 .expect("unrelated enable succeeds with warning");
         assert!(
             unrelated_plan
@@ -1673,7 +1655,7 @@ mod tests {
             declared_uncompressed_bytes: 64,
         };
 
-        let break_err = plan_upgrade(&dep_v2_pkg, &catalog, &doc, &paths, &managed, None)
+        let break_err = plan_upgrade(&dep_v2_pkg, &catalog, &doc, &paths, &managed)
             .expect_err("upgrading dep_ext to 2.0.0 breaks enabled app_ext");
         assert!(break_err.to_string().contains("app_ext"));
 
@@ -1692,7 +1674,7 @@ mod tests {
             declared_uncompressed_bytes: 64,
         };
 
-        let compat_err = plan_upgrade(&max_ver_pkg, &catalog, &doc, &paths, &managed, None)
+        let compat_err = plan_upgrade(&max_ver_pkg, &catalog, &doc, &paths, &managed)
             .expect_err("server 0.15.0 exceeds maximum_server_version 0.14.9");
         assert!(compat_err.to_string().contains("0.14.9"));
     }
@@ -1726,11 +1708,11 @@ mod tests {
         let managed = crate::ops::extension::catalog::read_managed_extensions(&paths).expect("managed");
         assert!(managed.contains("oidc_sso"));
 
-        let managed_err = plan_uninstall("oidc_sso", false, &catalog, &doc, &managed, None)
+        let managed_err = plan_uninstall("oidc_sso", false, &catalog, &doc, &managed)
             .expect_err("managed extension cannot be uninstalled");
         assert!(managed_err.to_string().contains("managed"));
 
-        let uninstall_plan = plan_uninstall("broken_ext", false, &catalog, &doc, &managed, None)
+        let uninstall_plan = plan_uninstall("broken_ext", false, &catalog, &doc, &managed)
             .expect("broken target uninstall planned");
         assert!(uninstall_plan.broken_target);
         assert_eq!(uninstall_plan.target_directory, broken_dir);
@@ -1934,7 +1916,7 @@ mod tests {
             .expect("rm constants");
 
         assert!(plan_install(&fresh_pkg, &catalog, &doc, &paths, &managed).is_err());
-        assert!(plan_upgrade(&upgrade_pkg, &catalog, &doc, &paths, &managed, None).is_err());
-        assert!(plan_disable(&catalog, &doc, &paths, &["app_ext".to_string()], None).is_err());
+        assert!(plan_upgrade(&upgrade_pkg, &catalog, &doc, &paths, &managed).is_err());
+        assert!(plan_disable(&catalog, &doc, &paths, &["app_ext".to_string()]).is_err());
     }
 }

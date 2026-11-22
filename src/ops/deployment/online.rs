@@ -250,17 +250,13 @@ pub async fn check_github_release_with_config(
         Some(cur_raw) => {
             let cur = CfmsServerVersion::parse(cur_raw)?;
             let tgt = CfmsServerVersion::parse(&resolved.version)?;
-            if online.version.is_some() {
-                tgt != cur
-            } else {
-                if tgt < cur {
-                    return Err(CfmsError::Deployment(format!(
-                        "Published GitHub release {} is older than active release {}; use `downgrade` for rollbacks",
-                        resolved.version, cur_raw
-                    )));
-                }
-                tgt > cur
+            if tgt < cur {
+                return Err(CfmsError::Deployment(format!(
+                    "Target GitHub release {} is older than active release {}; downgrading a completed deployment is not supported",
+                    resolved.version, cur_raw
+                )));
             }
+            tgt > cur
         }
     };
 

@@ -275,7 +275,7 @@ fn confirm_destructive(ui: &UiConsole, prompt: &str, yes: bool) -> Result<()> {
 }
 
 pub async fn reset_password_with_context(
-    paths: &WorkspacePaths,
+    _paths: &WorkspacePaths,
     config: &ConfigDocument,
     pool: &DbPool,
     args: UserResetPasswordArgs,
@@ -284,7 +284,7 @@ pub async fn reset_password_with_context(
     validate_username(&args.username)?;
     let preflight = preflight_user_schema(pool).await?;
     let active_oidc_issuer = config.oidc_sso_issuer();
-    let policy_cfg = PasswordPolicyConfig::load(pool, paths).await?;
+    let policy_cfg = PasswordPolicyConfig::load(pool).await?;
     policy_cfg.ensure_consistent()?;
 
     let explicit_password = read_explicit_password_input(&args, ui).await?;

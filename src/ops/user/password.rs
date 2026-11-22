@@ -11,9 +11,8 @@ use regex::Regex;
 use zeroize::Zeroizing;
 use crate::cli::user::UserResetPasswordArgs;
 use crate::core::error::{CfmsError, Result};
-use crate::core::paths::WorkspacePaths;
 use crate::db::DbPool;
-use crate::db::options::{OptionsSchemaRegistry, list_options};
+use crate::db::options::list_options;
 use crate::ui::UiConsole;
 
 /// `argon2-cffi` 25.1.0 `PasswordHasher()` default memory cost in KiB (64 MiB).
@@ -59,11 +58,9 @@ impl Default for PasswordPolicyConfig {
 }
 
 impl PasswordPolicyConfig {
-    /// Load `security.password` options from database, workspace `core_config_contract` (when present),
-    /// and built-in CFMS server defaults.
-    pub async fn load(pool: &DbPool, paths: &WorkspacePaths) -> Result<Self> {
-        let registry = OptionsSchemaRegistry::from_workspace(paths, None)?;
-        let records = list_options(pool, &registry, Some("security.password")).await?;
+    /// Load `security.password` options from database overlaid onto built-in CFMS server defaults.
+    pub async fn load(pool: &DbPool) -> Result<Self> {
+        let records = list_options(pool, Some("security.password")).await?;
 
         let mut cfg = Self::default();
         for rec in records {

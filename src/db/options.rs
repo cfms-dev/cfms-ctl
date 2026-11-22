@@ -1,25 +1,70 @@
 //! Database-backed `options` CRUD with two-level optimistic concurrency (`options.revision`
 //! and `system_states` namespace write-skew guard), canonical tagged scalar/JSON encoding,
-//! `core_config_contract.options` (`Draft 2020-12` + `x-invariants`) validation, and transactional
-//! `audit_entries` logging.
+//! and transactional `audit_entries` logging.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sqlx::{MySql, Postgres, Row, Sqlite, Transaction};
-use crate::core::contract::CoreConfigContract;
 use crate::core::error::{CfmsError, Result};
-use crate::core::paths::WorkspacePaths;
-use crate::core::schema::{
-    evaluate_schema_invariants, format_canonical_float, is_canonical_int_str,
-    normalize_and_precheck_value, validate_instance_against_schema,
-};
 use crate::db::backend::DbPool;
+
+/// Check whether a raw token string is a canonical base-10 integer (supports arbitrary precision).
+#[must_use]
+pub fn is_canonical_int_str(raw: &str) -> bool {
+    if raw == "0" {
+        return true;
+    }
+    let digits = raw.strip_prefix('-').unwrap_or(raw);
+    let mut chars = digits.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !('1'..='9').contains(&first) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_digit())
+}
+
+/// Format a finite `f64` into CFMS's canonical float representation.
+pub fn format_canonical_float(f: f64) -> Result<String> {
+    if !f.is_finite() {
+        return Err(CfmsError::Config(
+            "Option float value must be finite".to_string(),
+        ));
+    }
+    if f == 0.0 {
+        return Ok(if f.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "0.0".to_string()
+        });
+    }
+    let abs = f.abs();
+    if (1e-4..1e16).contains(&abs) {
+        let mut s = f.to_string();
+        if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+            s.push_str(".0");
+        }
+        Ok(s)
+    } else {
+        let sci = format!("{f:e}");
+        let Some((mantissa, exp_str)) = sci.split_once('e') else {
+            return Ok(sci);
+        };
+        let exp: i32 = exp_str.parse().unwrap_or(0);
+        if exp >= 0 {
+            Ok(format!("{mantissa}e+{exp:02}"))
+        } else {
+            let abs_exp = exp.unsigned_abs();
+            Ok(format!("{mantissa}e-{abs_exp:02}"))
+        }
+    }
+}
 
 const OPTIONS_REVISION_PREFIX: &str = "options_revision.";
 
@@ -251,236 +296,6 @@ pub fn decode_option_value(value_type: &str, option_value: &str) -> Result<Value
     }
 }
 
-/// Property-level metadata extracted from `core_config_contract.options`.
-#[derive(Debug, Clone)]
-pub struct OptionPropertySpec {
-    pub option_key: String,
-    pub schema_version: i32,
-    pub default_value: Option<Value>,
-    pub renamed_from: Vec<String>,
-    pub raw_property_schema: Value,
-}
-
-/// Core namespace specification loaded from `core_config_contract.options`.
-#[derive(Debug, Clone)]
-pub struct NamespaceSchemaSpec {
-    pub namespace: String,
-    pub owner: String,
-    pub raw_schema: Value,
-    pub properties: BTreeMap<String, OptionPropertySpec>,
-}
-
-/// Registry of core database option schemas loaded from `core_config_contract.options`.
-///
-/// Extension options are intentionally excluded; reads (`list` / `get`) return stored database
-/// rows across all owners while validated writes (`set` / `set-many` / `reset`) are restricted to
-/// declared core namespaces when a contract is active.
-#[derive(Debug, Clone, Default)]
-pub struct OptionsSchemaRegistry {
-    has_core_contract: bool,
-    namespaces: BTreeMap<String, NamespaceSchemaSpec>,
-}
-
-impl OptionsSchemaRegistry {
-    /// Create an empty registry (schema-less fallback mode for pre-contract workspaces).
-    #[must_use]
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Build a registry directly from a [`CoreConfigContract`].
-    pub fn from_contract(contract: &CoreConfigContract) -> Result<Self> {
-        let mut registry = Self {
-            has_core_contract: true,
-            namespaces: BTreeMap::new(),
-        };
-        let Some(ns_map) = contract
-            .options
-            .as_object()
-            .and_then(|o| o.get("properties"))
-            .and_then(Value::as_object)
-        else {
-            return Err(CfmsError::Config(
-                "Invalid core_config_contract.options: missing top-level 'properties' object"
-                    .to_string(),
-            ));
-        };
-
-        for (ns_name, ns_val) in ns_map {
-            let Some(ns_obj) = ns_val.as_object() else {
-                return Err(CfmsError::Config(format!(
-                    "Namespace schema for '{ns_name}' in core_config_contract.options must be a JSON object"
-                )));
-            };
-            let spec = parse_namespace_schema_object(ns_name, ns_obj)?;
-            registry.namespaces.insert(spec.namespace.clone(), spec);
-        }
-
-        Ok(registry)
-    }
-
-    /// Discover and load core option schemas from the workspace `core_config_contract`
-    /// (explicit `--contract` override, `release-manifest.json`, or source Python reflection).
-    pub fn from_workspace(
-        paths: &WorkspacePaths,
-        explicit_contract: Option<&Path>,
-    ) -> Result<Self> {
-        let Some((contract, _source)) =
-            CoreConfigContract::from_workspace(paths, explicit_contract)?
-        else {
-            return Ok(Self::empty());
-        };
-        Self::from_contract(&contract)
-    }
-
-    /// Whether an active `core_config_contract` was loaded.
-    #[must_use]
-    pub const fn has_core_contract(&self) -> bool {
-        self.has_core_contract
-    }
-
-    /// Look up a core namespace schema specification by name.
-    #[must_use]
-    pub fn get_namespace(&self, namespace: &str) -> Option<&NamespaceSchemaSpec> {
-        self.namespaces.get(namespace)
-    }
-
-    /// Iterate over all loaded core namespace specifications.
-    pub fn namespaces(&self) -> impl Iterator<Item = (&String, &NamespaceSchemaSpec)> {
-        self.namespaces.iter()
-    }
-}
-
-fn parse_namespace_schema_object(
-    namespace: &str,
-    ns_obj: &Map<String, Value>,
-) -> Result<NamespaceSchemaSpec> {
-    validate_option_namespace(namespace)?;
-    let owner = ns_obj
-        .get("x-owner")
-        .and_then(Value::as_str)
-        .unwrap_or("core")
-        .to_string();
-    validate_option_owner(&owner)?;
-    if owner != "core" {
-        return Err(CfmsError::Config(format!(
-            "Namespace '{namespace}' in core_config_contract.options has non-core owner '{owner}'"
-        )));
-    }
-
-    let mut properties = BTreeMap::new();
-    if let Some(props_obj) = ns_obj.get("properties").and_then(Value::as_object) {
-        for (opt_key, prop_val) in props_obj {
-            validate_option_key(opt_key)?;
-            let Some(prop_obj) = prop_val.as_object() else {
-                return Err(CfmsError::Config(format!(
-                    "Option schema for '{namespace}/{opt_key}' must be a JSON object"
-                )));
-            };
-            let schema_version = prop_obj
-                .get("x-schema-version")
-                .and_then(Value::as_i64)
-                .and_then(|v| i32::try_from(v).ok())
-                .unwrap_or(1);
-            if schema_version <= 0 {
-                return Err(CfmsError::Config(format!(
-                    "Invalid x-schema-version {schema_version} for '{namespace}/{opt_key}'"
-                )));
-            }
-            let default_value = prop_obj.get("default").cloned();
-            if let Some(ref def_val) = default_value {
-                let _ = encode_option_value(def_val)?;
-            }
-            let renamed_from = prop_obj
-                .get("x-renamed-from")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .map(ToString::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            properties.insert(
-                opt_key.clone(),
-                OptionPropertySpec {
-                    option_key: opt_key.clone(),
-                    schema_version,
-                    default_value,
-                    renamed_from,
-                    raw_property_schema: prop_val.clone(),
-                },
-            );
-        }
-    }
-
-    let mut raw_schema_map = ns_obj.clone();
-    raw_schema_map
-        .entry("type".to_string())
-        .or_insert_with(|| Value::String("object".to_string()));
-    raw_schema_map
-        .entry("additionalProperties".to_string())
-        .or_insert_with(|| Value::Bool(false));
-
-    Ok(NamespaceSchemaSpec {
-        namespace: namespace.to_string(),
-        owner,
-        raw_schema: Value::Object(raw_schema_map),
-        properties,
-    })
-}
-
-/// Validate all individual fields and aggregate cross-field `x-invariants` rules for a schema-backed namespace.
-pub fn validate_namespace_values_with_schema(
-    spec: &NamespaceSchemaSpec,
-    candidate_values: &BTreeMap<String, Value>,
-) -> Result<BTreeMap<String, Value>> {
-    let allow_additional = spec
-        .raw_schema
-        .get("additionalProperties")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    if !allow_additional {
-        for key in candidate_values.keys() {
-            if !spec.properties.contains_key(key) {
-                return Err(CfmsError::Config(format!(
-                    "No option definition for {}/{key}",
-                    spec.namespace
-                )));
-            }
-        }
-    }
-
-    let mut normalized_obj = Map::new();
-    for (key, prop_spec) in &spec.properties {
-        if let Some(raw_val) = candidate_values
-            .get(key)
-            .or(prop_spec.default_value.as_ref())
-        {
-            let norm_val =
-                normalize_and_precheck_value(key, &prop_spec.raw_property_schema, raw_val)?;
-            let _ = encode_option_value(&norm_val)?;
-            normalized_obj.insert(key.clone(), norm_val);
-        }
-    }
-
-    if allow_additional {
-        for (key, val) in candidate_values {
-            if !normalized_obj.contains_key(key) {
-                let _ = encode_option_value(val)?;
-                normalized_obj.insert(key.clone(), val.clone());
-            }
-        }
-    }
-
-    let instance = Value::Object(normalized_obj.clone());
-    validate_instance_against_schema(&spec.raw_schema, &instance, &spec.namespace)?;
-    let _warnings = evaluate_schema_invariants(&spec.raw_schema, &instance)?;
-
-    Ok(normalized_obj.into_iter().collect())
-}
-
 #[derive(Debug, Clone)]
 struct RawOptionRow {
     namespace: String,
@@ -529,10 +344,9 @@ impl RawOptionRow {
     }
 }
 
-/// List stored database options merged with any defaults declared in the external `OptionsSchemaRegistry`.
+/// List stored database options (optionally filtered by `namespace`).
 pub async fn list_options(
     pool: &DbPool,
-    registry: &OptionsSchemaRegistry,
     namespace: Option<&str>,
 ) -> Result<Vec<ResolvedOptionRecord>> {
     if let Some(ns) = namespace {
@@ -541,35 +355,9 @@ pub async fn list_options(
 
     let raw_rows = fetch_option_rows(pool, namespace).await?;
     let mut records = Vec::with_capacity(raw_rows.len());
-    let mut stored_keys = BTreeSet::new();
 
     for row in raw_rows {
-        stored_keys.insert((row.namespace.clone(), row.option_key.clone()));
         records.push(row.into_resolved()?);
-    }
-
-    for (ns_name, spec) in registry.namespaces() {
-        if let Some(filter) = namespace
-            && filter != ns_name
-        {
-            continue;
-        }
-
-        for prop in spec.properties.values() {
-            if let Some(ref def_val) = prop.default_value
-                && !stored_keys.contains(&(ns_name.clone(), prop.option_key.clone()))
-            {
-                records.push(ResolvedOptionRecord {
-                    namespace: ns_name.clone(),
-                    owner: spec.owner.clone(),
-                    option_key: prop.option_key.clone(),
-                    schema_version: prop.schema_version,
-                    revision: 0,
-                    value: def_val.clone(),
-                    updated_at: None,
-                });
-            }
-        }
     }
 
     records.sort_by(|a, b| {
@@ -580,10 +368,9 @@ pub async fn list_options(
     Ok(records)
 }
 
-/// Read a single option by `(namespace, option_key)` using database state and optional core contract defaults.
+/// Read a single stored option by `(namespace, option_key)`.
 pub async fn get_option(
     pool: &DbPool,
-    registry: &OptionsSchemaRegistry,
     namespace: &str,
     option_key: &str,
 ) -> Result<ResolvedOptionRecord> {
@@ -594,179 +381,15 @@ pub async fn get_option(
         return row.into_resolved();
     }
 
-    if let Some(spec) = registry.get_namespace(namespace) {
-        if let Some(prop) = spec.properties.get(option_key)
-            && let Some(ref def_val) = prop.default_value
-        {
-            return Ok(ResolvedOptionRecord {
-                namespace: namespace.to_string(),
-                owner: spec.owner.clone(),
-                option_key: option_key.to_string(),
-                schema_version: prop.schema_version,
-                revision: 0,
-                value: def_val.clone(),
-                updated_at: None,
-            });
-        }
-        return Err(CfmsError::Config(format!(
-            "No option definition for {namespace}/{option_key}"
-        )));
-    }
-
     Err(CfmsError::Config(format!(
         "No stored option {namespace}/{option_key}"
     )))
 }
 
-/// Reset a single core option in `namespace` to its contract default using optimistic concurrency.
-pub async fn reset_option(
-    pool: &DbPool,
-    registry: &OptionsSchemaRegistry,
-    namespace: &str,
-    option_key: &str,
-    expected_revision: u64,
-) -> Result<ResolvedOptionRecord> {
-    validate_option_namespace(namespace)?;
-    validate_option_key(option_key)?;
-
-    let Some(spec) = registry.get_namespace(namespace) else {
-        if registry.has_core_contract() {
-            return Err(CfmsError::Config(format!(
-                "Option namespace '{namespace}' is not part of core_config_contract; extension/custom options must be managed via the CFMS server or Python maintenance CLI"
-            )));
-        }
-        return Err(CfmsError::Config(format!(
-            "No schema default definition for {namespace}/{option_key}"
-        )));
-    };
-    let Some(prop) = spec.properties.get(option_key) else {
-        return Err(CfmsError::Config(format!(
-            "No option definition for {namespace}/{option_key}"
-        )));
-    };
-    let Some(ref def_val) = prop.default_value else {
-        return Err(CfmsError::Config(format!(
-            "Option schema for {namespace}/{option_key} does not define a default value"
-        )));
-    };
-
-    let mut updates = BTreeMap::new();
-    updates.insert(
-        option_key.to_string(),
-        OptionUpdateInput {
-            value: def_val.clone(),
-            expected_revision,
-        },
-    );
-
-    let mut updated = write_options_batch(pool, registry, namespace, updates).await?;
-    updated.remove(option_key).ok_or_else(|| {
-        CfmsError::Database(format!(
-            "Failed to read back reset option {namespace}/{option_key}"
-        ))
-    })
-}
-
-/// Fetch only persisted rows from the `options` table keyed by `(namespace, option_key)`.
-pub async fn fetch_stored_options(
-    pool: &DbPool,
-    namespace: Option<&str>,
-) -> Result<BTreeMap<(String, String), ResolvedOptionRecord>> {
-    if let Some(ns) = namespace {
-        validate_option_namespace(ns)?;
-    }
-    let raw_rows = fetch_option_rows(pool, namespace).await?;
-    let mut map = BTreeMap::new();
-    for row in raw_rows {
-        let resolved = row.into_resolved()?;
-        map.insert(
-            (resolved.namespace.clone(), resolved.option_key.clone()),
-            resolved,
-        );
-    }
-    Ok(map)
-}
-
-/// Specification for renaming a core database option row (`WHERE owner = 'core'`).
-#[derive(Debug, Clone)]
-pub struct CoreOptionRename {
-    pub old_namespace: String,
-    pub old_key: String,
-    pub new_namespace: String,
-    pub new_key: String,
-    pub schema_version: i32,
-}
-
-/// Rename core database option keys in a single SQL transaction (`WHERE owner = 'core'`).
-pub async fn rename_core_option_keys(
-    pool: &DbPool,
-    renames: &[CoreOptionRename],
-) -> Result<u64> {
-    if renames.is_empty() {
-        return Ok(0);
-    }
-    let mut moved = 0u64;
-    match pool {
-        DbPool::Sqlite(sqlite_pool) => {
-            let mut tx = sqlite_pool.begin().await?;
-            for r in renames {
-                let res = sqlx::query(
-                    "UPDATE options SET namespace = ?, option_key = ?, schema_version = ? WHERE owner = 'core' AND namespace = ? AND option_key = ?",
-                )
-                .bind(&r.new_namespace)
-                .bind(&r.new_key)
-                .bind(r.schema_version)
-                .bind(&r.old_namespace)
-                .bind(&r.old_key)
-                .execute(&mut *tx)
-                .await?;
-                moved += res.rows_affected();
-            }
-            tx.commit().await?;
-        }
-        DbPool::Mysql(mysql_pool) => {
-            let mut tx = mysql_pool.begin().await?;
-            for r in renames {
-                let res = sqlx::query(
-                    "UPDATE options SET namespace = ?, option_key = ?, schema_version = ? WHERE owner = 'core' AND namespace = ? AND option_key = ?",
-                )
-                .bind(&r.new_namespace)
-                .bind(&r.new_key)
-                .bind(r.schema_version)
-                .bind(&r.old_namespace)
-                .bind(&r.old_key)
-                .execute(&mut *tx)
-                .await?;
-                moved += res.rows_affected();
-            }
-            tx.commit().await?;
-        }
-        DbPool::Postgres(pg_pool) => {
-            let mut tx = pg_pool.begin().await?;
-            for r in renames {
-                let res = sqlx::query(
-                    "UPDATE options SET namespace = $1, option_key = $2, schema_version = $3 WHERE owner = 'core' AND namespace = $4 AND option_key = $5",
-                )
-                .bind(&r.new_namespace)
-                .bind(&r.new_key)
-                .bind(r.schema_version)
-                .bind(&r.old_namespace)
-                .bind(&r.old_key)
-                .execute(&mut *tx)
-                .await?;
-                moved += res.rows_affected();
-            }
-            tx.commit().await?;
-        }
-    }
-    Ok(moved)
-}
-
-fn validate_batch_target<'a>(
-    registry: &'a OptionsSchemaRegistry,
+fn validate_batch_target(
     namespace: &str,
     updates: &BTreeMap<String, OptionUpdateInput>,
-) -> Result<Option<&'a NamespaceSchemaSpec>> {
+) -> Result<()> {
     validate_option_namespace(namespace)?;
     if updates.is_empty() {
         return Err(CfmsError::InvalidArgument(
@@ -776,155 +399,36 @@ fn validate_batch_target<'a>(
     for key in updates.keys() {
         validate_option_key(key)?;
     }
-
-    let ns_spec = registry.get_namespace(namespace);
-    if ns_spec.is_none() && registry.has_core_contract() {
-        return Err(CfmsError::Config(format!(
-            "Option namespace '{namespace}' is not part of core_config_contract; extension/custom option writes must be managed via the CFMS server or Python maintenance CLI"
-        )));
-    }
-
-    if let Some(spec) = ns_spec {
-        let allow_additional = spec
-            .raw_schema
-            .get("additionalProperties")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !allow_additional {
-            for key in updates.keys() {
-                if !spec.properties.contains_key(key) {
-                    return Err(CfmsError::Config(format!(
-                        "No option definition for {namespace}/{key}"
-                    )));
-                }
-            }
-        }
-    }
-
-    Ok(ns_spec)
+    Ok(())
 }
 
-/// Atomically validate and write one or more options in `namespace` with optimistic concurrency
+/// Atomically write one or more options in `namespace` with optimistic concurrency
 /// (`options.revision` CAS + `system_states` namespace guard + `audit_entries` record).
 pub async fn write_options_batch(
     pool: &DbPool,
-    registry: &OptionsSchemaRegistry,
     namespace: &str,
     updates: BTreeMap<String, OptionUpdateInput>,
 ) -> Result<BTreeMap<String, ResolvedOptionRecord>> {
-    let ns_spec = validate_batch_target(registry, namespace, &updates)?;
+    validate_batch_target(namespace, &updates)?;
 
     match pool {
         DbPool::Sqlite(sqlite_pool) => {
             let mut tx = sqlite_pool.begin().await?;
-            let result = execute_write_tx_sqlite(
-                &mut tx,
-                namespace,
-                ns_spec,
-                &updates,
-                "maintenance_cli",
-            )
-            .await?;
+            let result = execute_write_tx_sqlite(&mut tx, namespace, &updates, "maintenance_cli").await?;
             tx.commit().await?;
             Ok(result)
         }
         DbPool::Mysql(mysql_pool) => {
             let mut tx = mysql_pool.begin().await?;
-            let result = execute_write_tx_mysql(
-                &mut tx,
-                namespace,
-                ns_spec,
-                &updates,
-                "maintenance_cli",
-            )
-            .await?;
+            let result = execute_write_tx_mysql(&mut tx, namespace, &updates, "maintenance_cli").await?;
             tx.commit().await?;
             Ok(result)
         }
         DbPool::Postgres(pg_pool) => {
             let mut tx = pg_pool.begin().await?;
-            let result = execute_write_tx_postgres(
-                &mut tx,
-                namespace,
-                ns_spec,
-                &updates,
-                "maintenance_cli",
-            )
-            .await?;
+            let result = execute_write_tx_postgres(&mut tx, namespace, &updates, "maintenance_cli").await?;
             tx.commit().await?;
             Ok(result)
-        }
-    }
-}
-
-/// Atomically validate and commit option batches across multiple namespaces in one SQL transaction.
-pub async fn write_options_batches(
-    pool: &DbPool,
-    registry: &OptionsSchemaRegistry,
-    batches: &[(String, BTreeMap<String, OptionUpdateInput>)],
-    audit_source: &str,
-) -> Result<Vec<(String, BTreeMap<String, ResolvedOptionRecord>)>> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut prepared = Vec::with_capacity(batches.len());
-    for (namespace, updates) in batches {
-        let ns_spec = validate_batch_target(registry, namespace, updates)?;
-        prepared.push((namespace.as_str(), ns_spec, updates));
-    }
-
-    match pool {
-        DbPool::Sqlite(sqlite_pool) => {
-            let mut tx = sqlite_pool.begin().await?;
-            let mut results = Vec::with_capacity(prepared.len());
-            for (namespace, ns_spec, updates) in prepared {
-                let res = execute_write_tx_sqlite(
-                    &mut tx,
-                    namespace,
-                    ns_spec,
-                    updates,
-                    audit_source,
-                )
-                .await?;
-                results.push((namespace.to_string(), res));
-            }
-            tx.commit().await?;
-            Ok(results)
-        }
-        DbPool::Mysql(mysql_pool) => {
-            let mut tx = mysql_pool.begin().await?;
-            let mut results = Vec::with_capacity(prepared.len());
-            for (namespace, ns_spec, updates) in prepared {
-                let res = execute_write_tx_mysql(
-                    &mut tx,
-                    namespace,
-                    ns_spec,
-                    updates,
-                    audit_source,
-                )
-                .await?;
-                results.push((namespace.to_string(), res));
-            }
-            tx.commit().await?;
-            Ok(results)
-        }
-        DbPool::Postgres(pg_pool) => {
-            let mut tx = pg_pool.begin().await?;
-            let mut results = Vec::with_capacity(prepared.len());
-            for (namespace, ns_spec, updates) in prepared {
-                let res = execute_write_tx_postgres(
-                    &mut tx,
-                    namespace,
-                    ns_spec,
-                    updates,
-                    audit_source,
-                )
-                .await?;
-                results.push((namespace.to_string(), res));
-            }
-            tx.commit().await?;
-            Ok(results)
         }
     }
 }
@@ -952,7 +456,6 @@ struct PreparedRowWrite {
 
 fn prepare_namespace_mutation(
     namespace: &str,
-    ns_spec: Option<&NamespaceSchemaSpec>,
     guard_revision: u64,
     stored_rows: Vec<RawOptionRow>,
     updates: &BTreeMap<String, OptionUpdateInput>,
@@ -963,74 +466,27 @@ fn prepare_namespace_mutation(
         stored_map.insert(resolved.option_key.clone(), resolved);
     }
 
-    let resolved_owner = if let Some(spec) = ns_spec {
-        spec.owner.clone()
-    } else if let Some(first_stored) = stored_map.values().next() {
-        first_stored.owner.clone()
-    } else {
-        "core".to_string()
-    };
+    let resolved_owner = stored_map
+        .values()
+        .next()
+        .map_or_else(|| "core".to_string(), |r| r.owner.clone());
 
-    let mut previous_resolved: BTreeMap<String, ResolvedOptionRecord> = BTreeMap::new();
-    if let Some(spec) = ns_spec {
-        for prop in spec.properties.values() {
-            if let Some(stored) = stored_map.get(&prop.option_key) {
-                if stored.schema_version != prop.schema_version {
-                    return Err(CfmsError::Config(format!(
-                        "Unsupported option schema for {namespace}/{}: {}; expected {}",
-                        prop.option_key, stored.schema_version, prop.schema_version
-                    )));
-                }
-                let validated_stored = normalize_and_precheck_value(
-                    &prop.option_key,
-                    &prop.raw_property_schema,
-                    &stored.value,
-                )?;
-                previous_resolved.insert(
-                    prop.option_key.clone(),
-                    ResolvedOptionRecord {
-                        value: validated_stored,
-                        ..stored.clone()
-                    },
-                );
-            } else if let Some(ref def_val) = prop.default_value {
-                previous_resolved.insert(
-                    prop.option_key.clone(),
-                    ResolvedOptionRecord {
-                        namespace: namespace.to_string(),
-                        owner: spec.owner.clone(),
-                        option_key: prop.option_key.clone(),
-                        schema_version: prop.schema_version,
-                        revision: 0,
-                        value: def_val.clone(),
-                        updated_at: None,
-                    },
-                );
-            }
-        }
-        for (k, v) in &stored_map {
-            previous_resolved.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-    } else {
-        for (k, v) in &stored_map {
-            previous_resolved.insert(k.clone(), v.clone());
-        }
-        for k in updates.keys() {
-            previous_resolved
-                .entry(k.clone())
-                .or_insert_with(|| ResolvedOptionRecord {
-                    namespace: namespace.to_string(),
-                    owner: resolved_owner.clone(),
-                    option_key: k.clone(),
-                    schema_version: 1,
-                    revision: 0,
-                    value: Value::Null,
-                    updated_at: None,
-                });
-        }
+    let mut previous_resolved: BTreeMap<String, ResolvedOptionRecord> = stored_map;
+    for k in updates.keys() {
+        previous_resolved
+            .entry(k.clone())
+            .or_insert_with(|| ResolvedOptionRecord {
+                namespace: namespace.to_string(),
+                owner: resolved_owner.clone(),
+                option_key: k.clone(),
+                schema_version: 1,
+                revision: 0,
+                value: Value::Null,
+                updated_at: None,
+            });
     }
 
-    // Check expected revisions for all target keys before validating/writing
+    // Check expected revisions for all target keys before writing
     for (key, update) in updates {
         let current_rev = previous_resolved.get(key).map_or(0, |r| r.revision);
         if current_rev != update.expected_revision {
@@ -1041,23 +497,6 @@ fn prepare_namespace_mutation(
         }
     }
 
-    let mut merged_values: BTreeMap<String, Value> = previous_resolved
-        .iter()
-        .map(|(k, r)| (k.clone(), r.value.clone()))
-        .collect();
-    for (key, update) in updates {
-        merged_values.insert(key.clone(), update.value.clone());
-    }
-
-    let normalized_map = if let Some(spec) = ns_spec {
-        validate_namespace_values_with_schema(spec, &merged_values)?
-    } else {
-        for val in merged_values.values() {
-            let _ = encode_option_value(val)?;
-        }
-        merged_values
-    };
-
     let mut rows_to_write = Vec::with_capacity(updates.len());
     let mut changed_keys = Vec::new();
     let mut previous_revisions = BTreeMap::new();
@@ -1065,20 +504,16 @@ fn prepare_namespace_mutation(
 
     for (key, update) in updates {
         let prev = previous_resolved.get(key);
-        let schema_version = prev
-            .map(|p| p.schema_version)
-            .or_else(|| {
-                ns_spec
-                    .and_then(|s| s.properties.get(key))
-                    .map(|p| p.schema_version)
-            })
-            .unwrap_or(1);
-        let norm_val = normalized_map[key].clone();
-        let (value_type, option_value) = encode_option_value(&norm_val)?;
+        let schema_version = prev.map_or(1, |p| p.schema_version);
+        let (value_type, option_value) = encode_option_value(&update.value)?;
         if let Some(p) = prev {
-            let prev_encoded = encode_option_value(&p.value)?;
-            if prev_encoded != (value_type, option_value.clone()) {
+            if p.revision == 0 {
                 changed_keys.push(key.clone());
+            } else {
+                let prev_encoded = encode_option_value(&p.value)?;
+                if prev_encoded != (value_type, option_value.clone()) {
+                    changed_keys.push(key.clone());
+                }
             }
         } else {
             changed_keys.push(key.clone());
@@ -1098,7 +533,7 @@ fn prepare_namespace_mutation(
             new_revision: new_rev,
             value_type,
             option_value,
-            normalized_value: norm_val,
+            normalized_value: update.value.clone(),
         });
     }
 
@@ -1162,7 +597,6 @@ fn validate_guard_row(
 async fn execute_write_tx_sqlite(
     tx: &mut Transaction<'_, Sqlite>,
     namespace: &str,
-    ns_spec: Option<&NamespaceSchemaSpec>,
     updates: &BTreeMap<String, OptionUpdateInput>,
     audit_source: &str,
 ) -> Result<BTreeMap<String, ResolvedOptionRecord>> {
@@ -1204,7 +638,7 @@ async fn execute_write_tx_sqlite(
     })
     .collect::<Vec<_>>();
 
-    let plan = prepare_namespace_mutation(namespace, ns_spec, guard_revision, existing_rows, updates)?;
+    let plan = prepare_namespace_mutation(namespace, guard_revision, existing_rows, updates)?;
 
     let now = unix_timestamp_secs();
     let guard_affected = if plan.guard_revision == 0 {
@@ -1319,7 +753,6 @@ async fn execute_write_tx_sqlite(
 async fn execute_write_tx_mysql(
     tx: &mut Transaction<'_, MySql>,
     namespace: &str,
-    ns_spec: Option<&NamespaceSchemaSpec>,
     updates: &BTreeMap<String, OptionUpdateInput>,
     audit_source: &str,
 ) -> Result<BTreeMap<String, ResolvedOptionRecord>> {
@@ -1361,7 +794,7 @@ async fn execute_write_tx_mysql(
     })
     .collect::<Vec<_>>();
 
-    let plan = prepare_namespace_mutation(namespace, ns_spec, guard_revision, existing_rows, updates)?;
+    let plan = prepare_namespace_mutation(namespace, guard_revision, existing_rows, updates)?;
 
     let now = unix_timestamp_secs();
     let guard_affected = if plan.guard_revision == 0 {
@@ -1476,7 +909,6 @@ async fn execute_write_tx_mysql(
 async fn execute_write_tx_postgres(
     tx: &mut Transaction<'_, Postgres>,
     namespace: &str,
-    ns_spec: Option<&NamespaceSchemaSpec>,
     updates: &BTreeMap<String, OptionUpdateInput>,
     audit_source: &str,
 ) -> Result<BTreeMap<String, ResolvedOptionRecord>> {
@@ -1518,7 +950,7 @@ async fn execute_write_tx_postgres(
     })
     .collect::<Vec<_>>();
 
-    let plan = prepare_namespace_mutation(namespace, ns_spec, guard_revision, existing_rows, updates)?;
+    let plan = prepare_namespace_mutation(namespace, guard_revision, existing_rows, updates)?;
 
     let now = unix_timestamp_secs();
     let guard_affected = if plan.guard_revision == 0 {
@@ -1830,7 +1262,6 @@ async fn fetch_single_option_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::contract::{CORE_CONFIG_CONTRACT_VERSION, DRAFT_2020_12_DIALECT};
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn setup_sqlite_pool() -> DbPool {
@@ -1893,103 +1324,6 @@ mod tests {
         DbPool::Sqlite(pool)
     }
 
-    fn sample_contract() -> CoreConfigContract {
-        CoreConfigContract {
-            contract_version: CORE_CONFIG_CONTRACT_VERSION.to_string(),
-            core_version: "0.14.0".to_string(),
-            schema_dialect: DRAFT_2020_12_DIALECT.to_string(),
-            toml: json!({
-                "$schema": DRAFT_2020_12_DIALECT,
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {}
-            }),
-            options: json!({
-                "$schema": DRAFT_2020_12_DIALECT,
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "security.password": {
-                        "type": "object",
-                        "x-owner": "core",
-                        "additionalProperties": false,
-                        "properties": {
-                            "passwd_min_length": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "default": 8,
-                                "x-schema-version": 1
-                            },
-                            "passwd_max_length": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "default": 32,
-                                "x-schema-version": 1
-                            },
-                            "passwd_rules": {
-                                "type": "array",
-                                "items": { "type": "string", "x-format": "regex" },
-                                "default": ["[A-Z]", "[a-z]", "[0-9]"],
-                                "x-schema-version": 1
-                            }
-                        },
-                        "x-invariants": [
-                            {
-                                "rule": "order",
-                                "lower": "passwd_min_length",
-                                "upper": "passwd_max_length",
-                                "allow_equal": true,
-                                "message": "Invalid options for security.password: Minimum password length exceeds maximum"
-                            }
-                        ]
-                    },
-                    "security.request_rate_control": {
-                        "type": "object",
-                        "x-owner": "core",
-                        "additionalProperties": false,
-                        "properties": {
-                            "account_capacity": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "default": 100,
-                                "x-schema-version": 1
-                            },
-                            "action_costs": {
-                                "type": "object",
-                                "additionalProperties": { "type": "integer", "minimum": 1 },
-                                "propertyNames": { "minLength": 1 },
-                                "x-normalize-keys": "trim",
-                                "default": { "download": 5 },
-                                "x-schema-version": 1
-                            }
-                        },
-                        "x-invariants": [
-                            {
-                                "rule": "map_values_lte",
-                                "map": "action_costs",
-                                "uppers": ["account_capacity"],
-                                "message": "action_costs exceed account_capacity"
-                            }
-                        ]
-                    },
-                    "server": {
-                        "type": "object",
-                        "x-owner": "core",
-                        "additionalProperties": false,
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "default": "CFMS Server",
-                                "x-schema-version": 1,
-                                "x-renamed-from": ["server/display_name"]
-                            }
-                        }
-                    }
-                }
-            }),
-        }
-    }
-
     #[test]
     fn test_option_value_codec_roundtrip_and_strict_rejection() {
         let big_int: Value =
@@ -2043,10 +1377,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_options_list_and_get_core_defaults_plus_stored_extension_rows() {
+    async fn test_options_schemaless_crud_concurrency_and_audit() {
         let pool = setup_sqlite_pool().await;
-        let registry =
-            OptionsSchemaRegistry::from_contract(&sample_contract()).expect("load contract");
 
         // Pre-populate one stored extension row owned by `oidc_sso`
         let DbPool::Sqlite(ref sqlite) = pool else {
@@ -2059,51 +1391,18 @@ mod tests {
         .await
         .expect("insert extension row");
 
-        let all = list_options(&pool, &registry, None)
+        // 1. List and get stored rows
+        let all = list_options(&pool, None).await.expect("list all");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner, "oidc_sso");
+
+        let ext_item = get_option(&pool, "identity.oidc", "issuer")
             .await
-            .expect("list all options");
-        // 6 core defaults + 1 stored extension row
-        assert_eq!(all.len(), 7);
-        assert!(all.iter().any(|r| {
-            r.namespace == "identity.oidc"
-                && r.owner == "oidc_sso"
-                && r.option_key == "issuer"
-                && r.value == json!("https://idp.example.com")
-        }));
+            .expect("get stored option");
+        assert_eq!(ext_item.value, json!("https://idp.example.com"));
+        assert!(get_option(&pool, "security.password", "passwd_min_length").await.is_err());
 
-        let filtered_ext = list_options(&pool, &registry, Some("identity.oidc"))
-            .await
-            .expect("list extension namespace");
-        assert_eq!(filtered_ext.len(), 1);
-        assert_eq!(filtered_ext[0].owner, "oidc_sso");
-
-        let ext_item = get_option(&pool, &registry, "identity.oidc", "issuer")
-            .await
-            .expect("get stored extension option");
-        assert_eq!(ext_item.owner, "oidc_sso");
-
-        let min_len = get_option(&pool, &registry, "security.password", "passwd_min_length")
-            .await
-            .expect("get passwd_min_length");
-        assert_eq!(min_len.owner, "core");
-        assert_eq!(min_len.schema_version, 1);
-        assert_eq!(min_len.revision, 0);
-        assert_eq!(min_len.value, json!(8));
-
-        let renamed_spec = registry
-            .get_namespace("server")
-            .and_then(|s| s.properties.get("name"))
-            .expect("server/name spec");
-        assert_eq!(renamed_spec.renamed_from, vec!["server/display_name"]);
-    }
-
-    #[tokio::test]
-    async fn test_options_set_reset_concurrency_audit_and_rejects_non_core_writes() {
-        let pool = setup_sqlite_pool().await;
-        let registry =
-            OptionsSchemaRegistry::from_contract(&sample_contract()).expect("load contract");
-
-        // 1. Set single core option (revision 0 -> 1)
+        // 2. Create core option (revision 0 -> 1)
         let mut updates = BTreeMap::new();
         updates.insert(
             "passwd_min_length".to_string(),
@@ -2112,75 +1411,77 @@ mod tests {
                 expected_revision: 0,
             },
         );
-        let written = write_options_batch(&pool, &registry, "security.password", updates.clone())
+        let written = write_options_batch(&pool, "security.password", updates.clone())
             .await
             .expect("write passwd_min_length");
         let rec = written
             .get("passwd_min_length")
             .expect("passwd_min_length record");
+        assert_eq!(rec.owner, "core");
         assert_eq!(rec.revision, 1);
         assert_eq!(rec.value, json!(12));
         assert!(rec.updated_at.is_some());
 
-        // 2. Stale expected_revision = 0 must fail with OptionConflict
-        let conflict_err = write_options_batch(&pool, &registry, "security.password", updates)
+        // 3. Stale expected_revision = 0 fails with OptionConflict
+        let conflict_err = write_options_batch(&pool, "security.password", updates)
             .await
             .expect_err("must fail with conflict");
         assert!(matches!(conflict_err, CfmsError::OptionConflict(_)));
 
-        // 3. Writes/resets to non-core/extension namespaces are rejected when contract is active
+        // 4. Multi-key atomic update increments existing key and inserts sibling
+        let mut batch = BTreeMap::new();
+        batch.insert(
+            "passwd_min_length".to_string(),
+            OptionUpdateInput {
+                value: json!(14),
+                expected_revision: 1,
+            },
+        );
+        batch.insert(
+            "passwd_max_length".to_string(),
+            OptionUpdateInput {
+                value: json!(64),
+                expected_revision: 0,
+            },
+        );
+        let batch_out = write_options_batch(&pool, "security.password", batch)
+            .await
+            .expect("batch write");
+        assert_eq!(batch_out["passwd_min_length"].revision, 2);
+        assert_eq!(batch_out["passwd_max_length"].revision, 1);
+
+        // 5. Updating an existing extension namespace preserves its owner (`oidc_sso`)
         let mut ext_updates = BTreeMap::new();
         ext_updates.insert(
             "issuer".to_string(),
             OptionUpdateInput {
-                value: json!("https://idp.example.com"),
-                expected_revision: 0,
+                value: json!("https://idp2.example.com"),
+                expected_revision: 1,
             },
         );
-        let ext_err = write_options_batch(&pool, &registry, "identity.oidc", ext_updates)
+        let ext_written = write_options_batch(&pool, "identity.oidc", ext_updates)
             .await
-            .expect_err("non-core namespace rejected on write");
-        assert!(ext_err.to_string().contains("core_config_contract"));
+            .expect("update extension option");
+        assert_eq!(ext_written["issuer"].owner, "oidc_sso");
+        assert_eq!(ext_written["issuer"].revision, 2);
 
-        let reset_ext_err = reset_option(&pool, &registry, "identity.oidc", "issuer", 0)
-            .await
-            .expect_err("non-core namespace rejected on reset");
-        assert!(reset_ext_err.to_string().contains("core_config_contract"));
-
-        // 4. Verify `system_states` namespace revision guard was incremented
-        let DbPool::Sqlite(ref sqlite) = pool else {
-            unreachable!()
-        };
+        // 6. Verify `system_states` namespace revision guard incremented twice for security.password
         let state_rev: i64 = sqlx::query_scalar(
             "SELECT revision FROM system_states WHERE owner = 'core' AND state_key = 'options_revision.security.password'",
         )
         .fetch_one(sqlite)
         .await
         .expect("fetch system_states revision");
-        assert_eq!(state_rev, 1);
+        assert_eq!(state_rev, 2);
 
-        // 5. Reset `security.password.passwd_min_length` with expected_revision = 1 -> writes default with revision = 2
-        let reset_rec = reset_option(
-            &pool,
-            &registry,
-            "security.password",
-            "passwd_min_length",
-            1,
-        )
-        .await
-        .expect("reset passwd_min_length");
-        assert_eq!(reset_rec.revision, 2);
-        assert_eq!(reset_rec.value, json!(8));
-        assert!(reset_rec.updated_at.is_some());
-
-        // 6. Verify audit_entries were recorded without leaking option values
+        // 7. Verify audit_entries recorded without leaking option values
         let audit_rows: Vec<(String, i64, String)> = sqlx::query_as(
             "SELECT action, result, data FROM audit_entries ORDER BY logged_time ASC",
         )
         .fetch_all(sqlite)
         .await
         .expect("fetch audit entries");
-        assert_eq!(audit_rows.len(), 2);
+        assert_eq!(audit_rows.len(), 3);
         for (action, result, data_str) in &audit_rows {
             assert_eq!(action, "update_options");
             assert_eq!(*result, 0);
@@ -2190,79 +1491,5 @@ mod tests {
             assert!(data.get("previous_revisions").is_some());
             assert!(data.get("revisions").is_some());
         }
-    }
-
-    #[tokio::test]
-    async fn test_core_contract_validation_and_schemaless_fallback() {
-        let pool = setup_sqlite_pool().await;
-        let registry =
-            OptionsSchemaRegistry::from_contract(&sample_contract()).expect("load contract");
-
-        // 1. Strict type check: integer field rejects string `"12"`, float `12.0`, and bool
-        for bad_val in [json!("12"), json!(12.0), json!(true)] {
-            let mut updates = BTreeMap::new();
-            updates.insert(
-                "passwd_min_length".to_string(),
-                OptionUpdateInput {
-                    value: bad_val,
-                    expected_revision: 0,
-                },
-            );
-            assert!(
-                write_options_batch(&pool, &registry, "security.password", updates)
-                    .await
-                    .is_err()
-            );
-        }
-
-        // 2. Cross-field validation via `x-invariants` + `x-normalize-keys: "trim"`
-        let mut rate_updates = BTreeMap::new();
-        rate_updates.insert(
-            "action_costs".to_string(),
-            OptionUpdateInput {
-                value: json!({ "  upload  ": 20 }),
-                expected_revision: 0,
-            },
-        );
-        let rate_written =
-            write_options_batch(&pool, &registry, "security.request_rate_control", rate_updates)
-                .await
-                .expect("write normalized action_costs");
-        assert_eq!(rate_written["action_costs"].value, json!({ "upload": 20 }));
-
-        let mut bad_rate = BTreeMap::new();
-        bad_rate.insert(
-            "action_costs".to_string(),
-            OptionUpdateInput {
-                value: json!({ "upload": 250 }),
-                expected_revision: 1,
-            },
-        );
-        let rate_err =
-            write_options_batch(&pool, &registry, "security.request_rate_control", bad_rate)
-                .await
-                .expect_err("map_values_lte invariant failure");
-        assert!(
-            rate_err
-                .to_string()
-                .contains("action_costs exceed account_capacity")
-        );
-
-        // 3. Pure schema-less workspace (OptionsSchemaRegistry::empty()) allows basic CRUD without any contract
-        let empty_registry = OptionsSchemaRegistry::empty();
-        let mut custom_updates = BTreeMap::new();
-        custom_updates.insert(
-            "custom_flag".to_string(),
-            OptionUpdateInput {
-                value: json!(true),
-                expected_revision: 0,
-            },
-        );
-        let custom_written =
-            write_options_batch(&pool, &empty_registry, "custom.feature", custom_updates)
-                .await
-                .expect("write in pure schema-less mode");
-        assert_eq!(custom_written["custom_flag"].value, json!(true));
-        assert_eq!(custom_written["custom_flag"].revision, 1);
     }
 }

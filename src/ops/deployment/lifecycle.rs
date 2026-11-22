@@ -1,5 +1,5 @@
 //! Orchestrators for deployment `status`, `verify`, `check`, `upgrade`, `update`,
-//! `downgrade`, `resume`, `prune`, `install`, and `adopt`.
+//! `resume`, `prune`, `install`, and `adopt`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -9,29 +9,28 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::cli::deployment::{
-    DeploymentAdoptArgs, DeploymentCheckArgs, DeploymentDowngradeArgs, DeploymentInstallArgs,
-    DeploymentPruneArgs, DeploymentResumeArgs, DeploymentStatusArgs, DeploymentUpdateArgs,
-    DeploymentUpgradeArgs, DeploymentVerifyArgs, LocalChecksumArgs,
+    DeploymentAdoptArgs, DeploymentCheckArgs, DeploymentInstallArgs, DeploymentPruneArgs,
+    DeploymentResumeArgs, DeploymentStatusArgs, DeploymentUpdateArgs, DeploymentUpgradeArgs,
+    DeploymentVerifyArgs, LocalChecksumArgs,
 };
 use crate::core::{
-    CfmsError, ConfigDocument, CoreConfigContract, Result, RuntimeLock, WorkspacePaths,
-    atomic_write, ensure_safe_directory_chain, retry_fs_op, write_with_timestamped_backup,
+    CfmsError, ConfigDocument, Result, RuntimeLock, WorkspacePaths, atomic_write,
+    ensure_safe_directory_chain, retry_fs_op,
 };
 use crate::db::schema::analyze_alembic_directory;
-use crate::db::{
-    CoreOptionRename, OptionsSchemaRegistry, fetch_stored_options, rename_core_option_keys,
-};
 use crate::ops::AppContext;
 use crate::ops::extension::catalog::discover_catalog;
-use crate::ops::extension::version::{CfmsServerVersion, check_server_compatibility, discover_server_version};
+use crate::ops::extension::version::{
+    CfmsServerVersion, check_server_compatibility, discover_server_version,
+};
 use crate::ui::{OutputFormat, confirm_or_abort};
 
 use super::archive::{stage_release_archive, verify_staged_release_tree};
 use super::database::{
-    ResumeDbClassification, analyze_release_alembic, diagnose_resume_database,
-    execute_deployment_db_downgrade, execute_deployment_db_upgrade, initialize_fresh_database,
-    inspect_status_database, maybe_create_safety_backup,
-    preflight_downgrade_database, preflight_upgrade_database,
+    ResumeDbClassification, analyze_release_alembic, capture_sqlite_upgrade_checkpoint,
+    diagnose_resume_database, execute_deployment_db_upgrade, initialize_fresh_database,
+    inspect_status_database, maybe_create_safety_backup, preflight_upgrade_database,
+    rollback_upgrade_database,
 };
 use super::environment::{
     check_target_python_compatibility, plan_environment_options, sync_python_environment,
@@ -39,7 +38,7 @@ use super::environment::{
 use super::manifest::{hash_file_sha256, load_manifest_file, validate_workspace_layout};
 use super::models::{
     DeploymentMutationReport, DeploymentPruneReport, DeploymentSettings, DeploymentStatusReport,
-    DeploymentTransaction, DeploymentVerifyReport, RELEASE_MANIFEST_FILENAME,
+    DeploymentTransaction, DeploymentVerifyReport, RELEASE_MANIFEST_FILENAME, RELEASE_SUBDIR,
     ReleaseIntegrityReport, ReleaseManifestSummary, TRANSACTION_FORMAT_VERSION,
     TransactionOperation, TransactionPhase,
 };
@@ -48,12 +47,13 @@ use super::online::{
     fetch_and_resolve_release, fetch_and_resolve_release_with_config, resolve_online_config,
 };
 use super::repository::{
-    PruneSelector, apply_swap_with_journal, clear_transaction_artifacts, compute_delta_counts,
-    copy_file_atomic_with_retry, execute_prune, handle_downgrade_extensions,
+    PruneSelector, apply_swap_with_journal, auto_prune_versions_keep_limit,
+    clear_transaction_artifacts, compute_delta_counts, copy_file_atomic_with_retry, execute_prune,
     inspect_active_release, list_stored_releases, load_settings, load_transaction, plan_prune,
-    requirements_lock_path, resolve_stored_release, restore_snapshot_config,
-    rollback_swap_journal, save_settings, save_transaction, snapshot_active_release,
-    snapshot_from_verified_tree, staging_dir, sync_persisted_requirements_lock, tx_root_dir,
+    remove_stored_release_dir, requirements_lock_path, resolve_stored_release,
+    restore_snapshot_config, rollback_swap_journal, save_settings, save_transaction,
+    snapshot_active_release, staging_dir, sync_persisted_requirements_lock, tx_root_dir,
+    versions_dir,
 };
 
 fn ensure_confirmed(ctx: &AppContext, prompt: &str, dry_run: bool) -> Result<()> {
@@ -69,122 +69,27 @@ fn ensure_confirmed(ctx: &AppContext, prompt: &str, dry_run: bool) -> Result<()>
     confirm_or_abort(prompt, ctx.global.yes)
 }
 
-fn preview_or_apply_config_sync(
+fn preview_or_apply_config_merge(
     paths: &WorkspacePaths,
-    template_path: &Path,
-    target_contract: Option<&CoreConfigContract>,
+    base_template_doc: Option<&ConfigDocument>,
+    new_template_path: &Path,
     write: bool,
 ) -> Result<(bool, Option<String>, Vec<String>)> {
-    if !paths.config_path.is_file() || !template_path.is_file() {
+    if !paths.config_path.is_file() || !new_template_path.is_file() {
         return Ok((false, None, Vec::new()));
     }
     let mut current = ConfigDocument::load(&paths.config_path)?;
-    let template = ConfigDocument::load(template_path)?;
-    let plan = current.sync_with_contract(&template, &[], false, target_contract)?;
+    let new_template = ConfigDocument::load(new_template_path)?;
+    let plan = match base_template_doc {
+        Some(base) => current.merge_three_way(base, &new_template, &[], false)?,
+        None => current.sync_with_template(&new_template, &[], false)?,
+    };
 
     if plan.changed && write {
         let bak = current.save_with_backup()?;
         return Ok((true, Some(bak.display().to_string()), plan.warnings));
     }
     Ok((plan.changed, None, plan.warnings))
-}
-
-async fn sync_core_options_with_contract(
-    ctx: &AppContext,
-    paths: &WorkspacePaths,
-    target_contract: Option<&CoreConfigContract>,
-    write: bool,
-) -> Result<Vec<String>> {
-    let Some(contract) = target_contract else {
-        return Ok(Vec::new());
-    };
-    if !paths.config_path.is_file() {
-        return Ok(Vec::new());
-    }
-
-    let pool = ctx.connect_db(paths).await?;
-    let tables = pool.list_tables().await?;
-    if !tables.iter().any(|t| t == "options") {
-        return Ok(Vec::new());
-    }
-
-    let registry = OptionsSchemaRegistry::from_contract(contract)?;
-    let stored_all = fetch_stored_options(&pool, None).await?;
-    let stored_core: std::collections::BTreeMap<(String, String), _> = stored_all
-        .into_iter()
-        .filter(|(_, rec)| rec.owner == "core")
-        .collect();
-    if stored_core.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut warnings = Vec::new();
-    let mut renames = Vec::new();
-    let mut consumed_old = BTreeSet::new();
-
-    for (target_ns, spec) in registry.namespaces() {
-        for (target_key, prop) in &spec.properties {
-            let target_id = (target_ns.clone(), target_key.clone());
-            for alias in &prop.renamed_from {
-                let (old_ns, old_key) = alias
-                    .split_once('/')
-                    .map_or((target_ns.as_str(), alias.as_str()), |(n, k)| (n, k));
-                let old_id = (old_ns.to_string(), old_key.to_string());
-                if old_id == target_id || !stored_core.contains_key(&old_id) {
-                    continue;
-                }
-                consumed_old.insert(old_id.clone());
-                if stored_core.contains_key(&target_id) {
-                    warnings.push(format!(
-                        "Both legacy core option '{old_ns}/{old_key}' and target '{target_ns}/{target_key}' exist in database; preserved both"
-                    ));
-                } else if write {
-                    renames.push(CoreOptionRename {
-                        old_namespace: old_ns.to_string(),
-                        old_key: old_key.to_string(),
-                        new_namespace: target_ns.clone(),
-                        new_key: target_key.clone(),
-                        schema_version: prop.schema_version,
-                    });
-                } else {
-                    warnings.push(format!(
-                        "Core database option '{old_ns}/{old_key}' will be renamed to '{target_ns}/{target_key}'"
-                    ));
-                }
-                break;
-            }
-
-            if let Some(existing) = stored_core.get(&target_id)
-                && existing.schema_version != prop.schema_version
-            {
-                warnings.push(format!(
-                    "Stored core database option '{target_ns}/{target_key}' has schema_version {} (target contract expects {})",
-                    existing.schema_version, prop.schema_version
-                ));
-            }
-        }
-    }
-
-    for (ns, key) in stored_core.keys() {
-        if consumed_old.contains(&(ns.clone(), key.clone())) {
-            continue;
-        }
-        let known = registry
-            .get_namespace(ns)
-            .is_some_and(|spec| spec.properties.contains_key(key));
-        if !known {
-            warnings.push(format!(
-                "Preserved removed core database option '{ns}/{key}' (not present in target core_config_contract v{})",
-                contract.core_version
-            ));
-        }
-    }
-
-    if write && !renames.is_empty() {
-        let _ = rename_core_option_keys(&pool, &renames).await?;
-    }
-
-    Ok(warnings)
 }
 
 fn check_extension_compat_warnings(
@@ -506,7 +411,6 @@ pub async fn run_update_with_config(
             db_revision_after: None,
             backup_archive_path: None,
             backup_generated_key: None,
-            quarantined_extensions: Vec::new(),
             warnings: check.warnings,
             next_steps: Vec::new(),
         };
@@ -602,7 +506,7 @@ async fn run_upgrade_flow(
     let tgt_ver = CfmsServerVersion::parse(&staged.manifest.manifest.version)?;
     if tgt_ver <= src_ver {
         return Err(CfmsError::Deployment(format!(
-            "Upgrade target version {} must be strictly newer than active version {}; use `downgrade` for rollbacks",
+            "Upgrade target version {} must be strictly newer than active version {}; downgrading a completed deployment is not supported",
             staged.manifest.manifest.version, source_manifest.manifest.version
         )));
     }
@@ -621,19 +525,15 @@ async fn run_upgrade_flow(
     warnings.extend(db_pre.warnings);
 
     let delta = compute_delta_counts(Some(&source_manifest.manifest), &staged.manifest.manifest);
+    let base_template_doc = paths
+        .config_template_path
+        .is_file()
+        .then(|| ConfigDocument::load(&paths.config_template_path))
+        .transpose()?;
     let staged_template = staged.extracted_dir.join("src").join("config.toml.sample");
-    let target_contract = staged.manifest.manifest.core_config_contract.as_ref();
     let (config_changed, _, cfg_warnings) =
-        preview_or_apply_config_sync(paths, &staged_template, target_contract, false)?;
+        preview_or_apply_config_merge(paths, base_template_doc.as_ref(), &staged_template, false)?;
     warnings.extend(cfg_warnings);
-
-    let opt_warnings =
-        sync_core_options_with_contract(ctx, paths, target_contract, false).await?;
-    for w in opt_warnings {
-        if !warnings.contains(&w) {
-            warnings.push(w);
-        }
-    }
 
     if dry_run {
         let report = DeploymentMutationReport {
@@ -655,7 +555,6 @@ async fn run_upgrade_flow(
             db_revision_after: Some(db_pre.target_head),
             backup_archive_path: None,
             backup_generated_key: None,
-            quarantined_extensions: Vec::new(),
             warnings,
             next_steps: vec![
                 "Re-run without `--dry-run` to execute the upgrade".to_string(),
@@ -703,6 +602,8 @@ async fn run_upgrade_flow(
         target_head: Some(db_pre.target_head.clone()),
         staging_dir: Some(staged.extracted_dir.display().to_string()),
         journal_dir: Some(journal_dir.display().to_string()),
+        db_checkpoint_path: None,
+        db_checkpoint_sha256: None,
         last_error: None,
         observed_db_revision: Some(db_pre.live_revision.clone()),
         step_history: vec!["snapshot-created".to_string()],
@@ -720,6 +621,7 @@ async fn run_upgrade_flow(
         Err(err) => {
             let _ = rollback_swap_journal(paths, &journal_dir);
             let _ = clear_transaction_artifacts(paths, Some(&tx));
+            let _ = remove_stored_release_dir(paths, &source_manifest.release_id);
             return Err(err);
         }
     };
@@ -733,29 +635,55 @@ async fn run_upgrade_flow(
     ) {
         let _ = rollback_swap_journal(paths, &journal_dir);
         let _ = clear_transaction_artifacts(paths, Some(&tx));
+        let _ = remove_stored_release_dir(paths, &source_manifest.release_id);
         return Err(err);
     }
 
     if let Err(err) = sync_python_environment(paths, &env_plan).await {
         let _ = rollback_swap_journal(paths, &journal_dir);
         let _ = clear_transaction_artifacts(paths, Some(&tx));
+        let _ = remove_stored_release_dir(paths, &source_manifest.release_id);
         return Err(err);
     }
 
-    let (applied_cfg_changed, cfg_bak_path, apply_cfg_warnings) = match preview_or_apply_config_sync(
-        paths,
-        &paths.config_template_path,
-        target_contract,
-        true,
-    ) {
-        Ok(v) => v,
-        Err(err) => {
-            let _ = rollback_swap_journal(paths, &journal_dir);
-            let _ = clear_transaction_artifacts(paths, Some(&tx));
-            return Err(err);
+    let (applied_cfg_changed, cfg_bak_path, apply_cfg_warnings) =
+        match preview_or_apply_config_merge(
+            paths,
+            base_template_doc.as_ref(),
+            &paths.config_template_path,
+            true,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = rollback_swap_journal(paths, &journal_dir);
+                let _ = clear_transaction_artifacts(paths, Some(&tx));
+                let _ = remove_stored_release_dir(paths, &source_manifest.release_id);
+                return Err(err);
+            }
+        };
+    for w in apply_cfg_warnings {
+        if !warnings.contains(&w) {
+            warnings.push(w);
         }
-    };
-    warnings.extend(apply_cfg_warnings);
+    }
+
+    if db_pre.source_head != db_pre.target_head {
+        let cp_dest = journal_dir.join("db_checkpoint.sqlite");
+        match capture_sqlite_upgrade_checkpoint(ctx, paths, &cp_dest).await {
+            Ok(Some((cp_path, cp_sha))) => {
+                tx.db_checkpoint_path = Some(cp_path.display().to_string());
+                tx.db_checkpoint_sha256 = Some(cp_sha);
+                tx.step_history.push("db-checkpoint-captured".to_string());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let _ = rollback_swap_journal(paths, &journal_dir);
+                let _ = clear_transaction_artifacts(paths, Some(&tx));
+                let _ = remove_stored_release_dir(paths, &source_manifest.release_id);
+                return Err(err);
+            }
+        }
+    }
 
     tx.phase = TransactionPhase::DatabaseMigration;
     tx.step_history.push("environment-and-config-synced".to_string());
@@ -771,36 +699,17 @@ async fn run_upgrade_flow(
     {
         Ok(rev) => rev,
         Err(err) => {
+            // Preserve intermediate DB recovery state; only undo in-flight DB changes when
+            // the operator explicitly aborts via `cfms-ctl deployment resume --rollback`.
             tx.phase = TransactionPhase::DatabaseRecoveryRequired;
             tx.last_error = Some(err.to_string());
             let _ = save_transaction(paths, &tx);
             return Err(CfmsError::Deployment(format!(
-                "Database migration failed during upgrade; recovery state recorded in '{}'. Inspect and run `cfms-ctl deployment resume`: {err}",
+                "Database migration failed during upgrade; intermediate recovery state recorded in '{}'. Fix the issue and run `cfms-ctl deployment resume --continue-forward`, or abort and undo all in-flight changes with `cfms-ctl deployment resume --rollback`: {err}",
                 paths.transaction_path().display()
             )));
         }
     };
-
-    let apply_opt_warnings = match sync_core_options_with_contract(
-        ctx,
-        paths,
-        target_contract,
-        true,
-    )
-    .await
-    {
-        Ok(w) => w,
-        Err(err) => {
-            tx.last_error = Some(err.to_string());
-            let _ = save_transaction(paths, &tx);
-            return Err(err);
-        }
-    };
-    for w in apply_opt_warnings {
-        if !warnings.contains(&w) {
-            warnings.push(w);
-        }
-    }
 
     save_settings(
         paths,
@@ -810,6 +719,12 @@ async fn run_upgrade_flow(
         },
     )?;
     clear_transaction_artifacts(paths, Some(&tx))?;
+    let _ = auto_prune_versions_keep_limit(
+        paths,
+        &tx.target_release_id,
+        Some(&tx.source_release_id),
+        1,
+    );
     let staged_checksum = staged.checksum.clone();
     drop(staged);
 
@@ -832,7 +747,6 @@ async fn run_upgrade_flow(
         db_revision_after: Some(db_rev_after),
         backup_archive_path: safety_bak.as_ref().map(|b| b.archive_path.clone()),
         backup_generated_key: safety_bak.and_then(|b| b.generated_key),
-        quarantined_extensions: Vec::new(),
         warnings,
         next_steps: Vec::new(),
     };
@@ -840,267 +754,10 @@ async fn run_upgrade_flow(
     Ok(())
 }
 
-/// Downgrade database via active Alembic scripts and restore a stored release snapshot.
-pub async fn handle_downgrade(ctx: &AppContext, args: DeploymentDowngradeArgs) -> Result<()> {
-    let paths = ctx.resolve_paths()?;
-    validate_workspace_layout(&paths, true)?;
-    let _lock = if args.dry_run {
-        None
-    } else {
-        Some(ctx.acquire_server_lock(&paths, false)?)
-    };
-
-    let source_manifest = load_manifest_file(&paths.release_manifest_path)?;
-    let target = resolve_stored_release(
-        &paths,
-        args.release_id.as_deref(),
-        args.version.as_deref(),
-        Some(&source_manifest.release_id),
-    )?;
-
-    if target.summary.release_id == source_manifest.release_id {
-        return Err(CfmsError::InvalidArgument(format!(
-            "Target snapshot '{}' is already the active release",
-            source_manifest.release_id
-        )));
-    }
-
-    let src_ver = CfmsServerVersion::parse(&source_manifest.manifest.version)?;
-    let tgt_ver = CfmsServerVersion::parse(&target.manifest.manifest.version)?;
-    if tgt_ver >= src_ver {
-        return Err(CfmsError::Deployment(format!(
-            "Downgrade target version {} must be older than active version {}",
-            target.manifest.manifest.version, source_manifest.manifest.version
-        )));
-    }
-
-    if !args.skip_env {
-        let _py = check_target_python_compatibility(
-            &paths,
-            &target.manifest.manifest.requires_python,
-        )
-        .await?;
-    }
-
-    let db_pre = preflight_downgrade_database(ctx, &paths, &target.release_dir).await?;
-    let mut warnings = db_pre.warnings;
-    warnings.extend(check_extension_compat_warnings(
-        &paths,
-        &target.manifest.manifest.version,
-    )?);
-
-    let delta = compute_delta_counts(Some(&source_manifest.manifest), &target.manifest.manifest);
-    let target_contract = target.manifest.manifest.core_config_contract.as_ref();
-    let (config_changed, _, cfg_warn) = if args.restore_snapshot_config {
-        (target.state_dir.join("config.toml").is_file(), None, Vec::new())
-    } else {
-        let (changed, bak, mut cfg_w) = preview_or_apply_config_sync(
-            &paths,
-            &target.release_dir.join("src").join("config.toml.sample"),
-            target_contract,
-            false,
-        )?;
-        cfg_w.extend(sync_core_options_with_contract(ctx, &paths, target_contract, false).await?);
-        (changed, bak, cfg_w)
-    };
-    warnings.extend(cfg_warn);
-
-    let saved_settings = load_settings(&paths)?;
-    let target_settings = if target.state_dir.join("settings.json").is_file() {
-        let raw = fs::read_to_string(target.state_dir.join("settings.json"))?;
-        serde_json::from_str::<DeploymentSettings>(&raw).unwrap_or(saved_settings.clone())
-    } else {
-        saved_settings.clone()
-    };
-
-    if args.dry_run {
-        let report = DeploymentMutationReport {
-            operation: "downgrade".to_string(),
-            dry_run: true,
-            outcome: "ready".to_string(),
-            source_release_id: Some(source_manifest.release_id),
-            source_version: Some(source_manifest.manifest.version),
-            target_release_id: Some(target.summary.release_id),
-            target_version: Some(target.manifest.manifest.version),
-            checksum: None,
-            files_added: delta.added,
-            files_updated: delta.updated,
-            files_removed: delta.removed,
-            extras: target_settings.extras,
-            config_changed,
-            config_backup_path: None,
-            db_revision_before: Some(db_pre.live_revision),
-            db_revision_after: Some(db_pre.target_head),
-            backup_archive_path: None,
-            backup_generated_key: None,
-            quarantined_extensions: Vec::new(),
-            warnings,
-            next_steps: vec![
-                "Re-run without `--dry-run` to execute downgrade".to_string(),
-            ],
-        };
-        ctx.ui.render(&report);
-        return Ok(());
-    }
-
-    ensure_confirmed(
-        ctx,
-        &format!(
-            "Downgrade CFMS deployment from v{} to v{} (DB {} -> {})?",
-            source_manifest.manifest.version,
-            target.manifest.manifest.version,
-            db_pre.live_revision,
-            db_pre.target_head
-        ),
-        false,
-    )?;
-
-    let safety_bak = maybe_create_safety_backup(
-        ctx,
-        &paths,
-        args.backup.backup,
-        args.backup.backup_key_out,
-    )
-    .await?;
-
-    snapshot_active_release(&paths, &source_manifest, &saved_settings)?;
-
-    let tx_id = Uuid::new_v4().simple().to_string();
-    let journal_dir = tx_root_dir(&paths).join(&tx_id);
-    let mut tx = DeploymentTransaction {
-        format_version: TRANSACTION_FORMAT_VERSION,
-        transaction_id: tx_id,
-        operation: TransactionOperation::Downgrade,
-        phase: TransactionPhase::DatabaseMigration,
-        started_at: Some(Utc::now().to_rfc3339()),
-        source_release_id: source_manifest.release_id.clone(),
-        target_release_id: target.summary.release_id.clone(),
-        source_version: source_manifest.manifest.version.clone(),
-        target_version: target.manifest.manifest.version.clone(),
-        source_head: Some(db_pre.source_head.clone()),
-        target_head: Some(db_pre.target_head.clone()),
-        staging_dir: None,
-        journal_dir: Some(journal_dir.display().to_string()),
-        last_error: None,
-        observed_db_revision: Some(db_pre.live_revision.clone()),
-        step_history: vec!["source-snapshotted".to_string()],
-    };
-    save_transaction(&paths, &tx)?;
-
-    let db_rev_after = match execute_deployment_db_downgrade(ctx, &paths, &db_pre.target_head).await {
-        Ok(rev) => rev,
-        Err(err) => {
-            tx.phase = TransactionPhase::DatabaseRecoveryRequired;
-            tx.last_error = Some(err.to_string());
-            let _ = save_transaction(&paths, &tx);
-            return Err(CfmsError::Deployment(format!(
-                "Database downgrade failed; transaction recorded at '{}'. Run `cfms-ctl deployment resume`: {err}",
-                paths.transaction_path().display()
-            )));
-        }
-    };
-
-    tx.phase = TransactionPhase::Activation;
-    tx.step_history.push("database-downgraded".to_string());
-    save_transaction(&paths, &tx)?;
-
-    let swap_counts = apply_swap_with_journal(
-        &paths,
-        Some(&source_manifest),
-        &target.release_dir,
-        &target.manifest,
-        &journal_dir,
-    )?;
-
-    let (applied_cfg_changed, cfg_bak_path) = if args.restore_snapshot_config {
-        if target.state_dir.join("config.toml").is_file() {
-            if paths.config_path.is_file() {
-                let current_src = fs::read_to_string(&paths.config_path)?;
-                let bak = write_with_timestamped_backup(
-                    &paths.config_path,
-                    &current_src,
-                    current_src.as_bytes(),
-                )?;
-                let restored = restore_snapshot_config(&target.state_dir, &paths.config_path)?;
-                (restored, Some(bak.display().to_string()))
-            } else {
-                (restore_snapshot_config(&target.state_dir, &paths.config_path)?, None)
-            }
-        } else {
-            warnings.push(
-                "Requested `--restore-snapshot-config`, but stored snapshot contains no saved `config.toml`; left live config untouched"
-                    .to_string(),
-            );
-            (false, None)
-        }
-    } else {
-        let (changed, bak, cfg_warn) = preview_or_apply_config_sync(
-            &paths,
-            &paths.config_template_path,
-            target_contract,
-            true,
-        )?;
-        warnings.extend(cfg_warn);
-        for w in sync_core_options_with_contract(ctx, &paths, target_contract, true).await? {
-            if !warnings.contains(&w) {
-                warnings.push(w);
-            }
-        }
-        (changed, bak)
-    };
-
-    let quarantined =
-        handle_downgrade_extensions(&paths, &tgt_ver, args.quarantine_extensions)?;
-
-    let lock_bak = target.state_dir.join("requirements.lock");
-    if lock_bak.is_file() {
-        sync_persisted_requirements_lock(&paths, Some(&lock_bak), false)?;
-    }
-
-    let env_plan = plan_environment_options(
-        &paths,
-        &target_settings,
-        &target_settings.extras,
-        false,
-        None,
-        false,
-        args.skip_env,
-    )?;
-    sync_python_environment(&paths, &env_plan).await?;
-    save_settings(&paths, &target_settings)?;
-    clear_transaction_artifacts(&paths, Some(&tx))?;
-
-    let report = DeploymentMutationReport {
-        operation: "downgrade".to_string(),
-        dry_run: false,
-        outcome: "downgraded".to_string(),
-        source_release_id: Some(source_manifest.release_id),
-        source_version: Some(source_manifest.manifest.version),
-        target_release_id: Some(target.summary.release_id),
-        target_version: Some(target.manifest.manifest.version),
-        checksum: None,
-        files_added: swap_counts.added,
-        files_updated: swap_counts.updated,
-        files_removed: swap_counts.removed,
-        extras: target_settings.extras,
-        config_changed: applied_cfg_changed,
-        config_backup_path: cfg_bak_path,
-        db_revision_before: Some(db_pre.live_revision),
-        db_revision_after: Some(db_rev_after),
-        backup_archive_path: safety_bak.as_ref().map(|b| b.archive_path.clone()),
-        backup_generated_key: safety_bak.and_then(|b| b.generated_key),
-        quarantined_extensions: quarantined,
-        warnings,
-        next_steps: Vec::new(),
-    };
-    ctx.ui.render(&report);
-    Ok(())
-}
-
-/// Inspect and finish or roll back an interrupted deployment transaction (`transaction.json`).
+/// Inspect, continue forward, or explicitly roll back an interrupted deployment transaction (`transaction.json`).
 pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Result<()> {
     let paths = ctx.resolve_paths()?;
-    let tx = load_transaction(&paths)?.ok_or_else(|| {
+    let mut tx = load_transaction(&paths)?.ok_or_else(|| {
         CfmsError::Deployment(format!(
             "No interrupted deployment transaction exists at '{}'",
             paths.transaction_path().display()
@@ -1151,7 +808,6 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
             db_revision_after: None,
             backup_archive_path: None,
             backup_generated_key: None,
-            quarantined_extensions: Vec::new(),
             warnings,
             next_steps: vec![guidance],
         };
@@ -1185,7 +841,6 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
             db_revision_after: None,
             backup_archive_path: None,
             backup_generated_key: None,
-            quarantined_extensions: Vec::new(),
             warnings,
             next_steps: Vec::new(),
         };
@@ -1212,6 +867,7 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                     .as_deref()
                     .map(PathBuf::from)
                     .unwrap_or_else(|| tx_root_dir(&paths).join(&tx.transaction_id));
+                let base_template_doc = load_resume_base_template(&paths, &tx, &journal_dir)?;
                 apply_swap_with_journal(
                     &paths,
                     active_manifest.as_ref(),
@@ -1230,31 +886,54 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                     args.skip_env,
                 )?;
                 sync_python_environment(&paths, &env_plan).await?;
-                let target_contract = staged_manifest.manifest.core_config_contract.as_ref();
-                let (cfg_changed, cfg_bak, cfg_warn) = preview_or_apply_config_sync(
+                let (cfg_changed, cfg_bak, cfg_warn) = preview_or_apply_config_merge(
                     &paths,
+                    base_template_doc.as_ref(),
                     &paths.config_template_path,
-                    target_contract,
                     true,
                 )?;
                 warnings.extend(cfg_warn);
                 let target_head = tx.target_head.clone().ok_or_else(|| {
                     CfmsError::Deployment("Missing target_head in transaction.json".to_string())
                 })?;
-                let db_after = execute_deployment_db_upgrade(
+                if tx.source_head.as_deref() != Some(target_head.as_str())
+                    && tx.db_checkpoint_path.is_none()
+                    && let Some((cp_path, cp_sha)) = capture_sqlite_upgrade_checkpoint(
+                        ctx,
+                        &paths,
+                        &journal_dir.join("db_checkpoint.sqlite"),
+                    )
+                    .await?
+                {
+                    tx.db_checkpoint_path = Some(cp_path.display().to_string());
+                    tx.db_checkpoint_sha256 = Some(cp_sha);
+                }
+                tx.phase = TransactionPhase::DatabaseMigration;
+                save_transaction(&paths, &tx)?;
+
+                let db_after = match execute_deployment_db_upgrade(
                     ctx,
                     &paths,
                     &target_head,
                     args.allow_destructive,
                 )
-                .await?;
-                for w in sync_core_options_with_contract(ctx, &paths, target_contract, true).await?
+                .await
                 {
-                    if !warnings.contains(&w) {
-                        warnings.push(w);
+                    Ok(rev) => rev,
+                    Err(err) => {
+                        tx.phase = TransactionPhase::DatabaseRecoveryRequired;
+                        tx.last_error = Some(err.to_string());
+                        let _ = save_transaction(&paths, &tx);
+                        return Err(err);
                     }
-                }
+                };
                 clear_transaction_artifacts(&paths, Some(&tx))?;
+                let _ = auto_prune_versions_keep_limit(
+                    &paths,
+                    &tx.target_release_id,
+                    Some(&tx.source_release_id),
+                    1,
+                );
                 emit_resume_done(
                     ctx,
                     &tx,
@@ -1267,9 +946,10 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                 );
                 return Ok(());
             }
-            // Safe default for interrupted activation: restore source via journal or snapshot.
+            // Safe default for interrupted activation: restore source via journal or `versions/` snapshot.
             restore_source_release_state(ctx, &paths, &tx, args.skip_env).await?;
             clear_transaction_artifacts(&paths, Some(&tx))?;
+            let _ = remove_stored_release_dir(&paths, &tx.source_release_id);
             emit_resume_done(
                 ctx,
                 &tx,
@@ -1282,27 +962,55 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
             );
             Ok(())
         }
-        (TransactionOperation::Upgrade, TransactionPhase::DatabaseMigration | TransactionPhase::DatabaseRecoveryRequired) => {
-            let active_manifest = paths
-                .release_manifest_path
-                .is_file()
-                .then(|| load_manifest_file(&paths.release_manifest_path))
-                .transpose()
-                .ok()
-                .flatten();
-            let active_contract = active_manifest
-                .as_ref()
-                .and_then(|m| m.manifest.core_config_contract.as_ref());
+        (
+            TransactionOperation::Upgrade,
+            TransactionPhase::DatabaseMigration | TransactionPhase::DatabaseRecoveryRequired,
+        ) => {
+            if args.rollback {
+                ensure_confirmed(
+                    ctx,
+                    &format!(
+                        "Abort interrupted upgrade (v{} -> v{}), undo in-flight database changes back to {:?}, and restore source release?",
+                        tx.source_version, tx.target_version, tx.source_head
+                    ),
+                    false,
+                )?;
+                let source_rel_dir = versions_dir(&paths)
+                    .join(&tx.source_release_id)
+                    .join(RELEASE_SUBDIR);
+                let source_rel_opt = source_rel_dir.is_dir().then_some(source_rel_dir);
+                let db_after = rollback_upgrade_database(
+                    ctx,
+                    &paths,
+                    &tx,
+                    source_rel_opt.as_deref(),
+                )
+                .await?;
+                restore_source_release_state(ctx, &paths, &tx, args.skip_env).await?;
+                clear_transaction_artifacts(&paths, Some(&tx))?;
+                let _ = remove_stored_release_dir(&paths, &tx.source_release_id);
+                emit_resume_done(
+                    ctx,
+                    &tx,
+                    "rolled-back-to-source",
+                    diagnosis.drift.current_revision,
+                    Some(db_after),
+                    false,
+                    None,
+                    warnings,
+                );
+                return Ok(());
+            }
+
             match &diagnosis.classification {
                 ResumeDbClassification::AtTarget => {
-                    for w in
-                        sync_core_options_with_contract(ctx, &paths, active_contract, true).await?
-                    {
-                        if !warnings.contains(&w) {
-                            warnings.push(w);
-                        }
-                    }
                     clear_transaction_artifacts(&paths, Some(&tx))?;
+                    let _ = auto_prune_versions_keep_limit(
+                        &paths,
+                        &tx.target_release_id,
+                        Some(&tx.source_release_id),
+                        1,
+                    );
                     emit_resume_done(
                         ctx,
                         &tx,
@@ -1316,27 +1024,6 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                     Ok(())
                 }
                 ResumeDbClassification::AtSource | ResumeDbClassification::Intermediate(_) => {
-                    if args.rollback {
-                        let source_head = tx.source_head.as_deref().ok_or_else(|| {
-                            CfmsError::Deployment("Missing source_head in transaction.json".to_string())
-                        })?;
-                        if matches!(diagnosis.classification, ResumeDbClassification::Intermediate(_)) {
-                            execute_deployment_db_downgrade(ctx, &paths, source_head).await?;
-                        }
-                        restore_source_release_state(ctx, &paths, &tx, args.skip_env).await?;
-                        clear_transaction_artifacts(&paths, Some(&tx))?;
-                        emit_resume_done(
-                            ctx,
-                            &tx,
-                            "rolled-back-to-source",
-                            diagnosis.drift.current_revision,
-                            Some(source_head.to_string()),
-                            false,
-                            None,
-                            warnings,
-                        );
-                        return Ok(());
-                    }
                     let target_head = tx.target_head.as_deref().ok_or_else(|| {
                         CfmsError::Deployment("Missing target_head in transaction.json".to_string())
                     })?;
@@ -1348,21 +1035,29 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                         ),
                         false,
                     )?;
-                    let db_after = execute_deployment_db_upgrade(
+                    let db_after = match execute_deployment_db_upgrade(
                         ctx,
                         &paths,
                         target_head,
                         args.allow_destructive,
                     )
-                    .await?;
-                    for w in
-                        sync_core_options_with_contract(ctx, &paths, active_contract, true).await?
+                    .await
                     {
-                        if !warnings.contains(&w) {
-                            warnings.push(w);
+                        Ok(rev) => rev,
+                        Err(err) => {
+                            tx.phase = TransactionPhase::DatabaseRecoveryRequired;
+                            tx.last_error = Some(err.to_string());
+                            let _ = save_transaction(&paths, &tx);
+                            return Err(err);
                         }
-                    }
+                    };
                     clear_transaction_artifacts(&paths, Some(&tx))?;
+                    let _ = auto_prune_versions_keep_limit(
+                        &paths,
+                        &tx.target_release_id,
+                        Some(&tx.source_release_id),
+                        1,
+                    );
                     emit_resume_done(
                         ctx,
                         &tx,
@@ -1375,100 +1070,60 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                     );
                     Ok(())
                 }
-                ResumeDbClassification::Unknown(rev) => Err(CfmsError::SchemaDrift(format!(
-                    "Cannot automatically resume upgrade: observed DB revision {:?} matches neither source ({:?}), target ({:?}), nor any intermediate step. Inspect live tables with `cfms-ctl database check`, restore backup, or run `resume --abort-clear` after manual repair.",
-                    rev, tx.source_head, tx.target_head
-                ))),
-            }
-        }
-        (TransactionOperation::Downgrade, TransactionPhase::DatabaseMigration | TransactionPhase::DatabaseRecoveryRequired) => {
-            match &diagnosis.classification {
-                ResumeDbClassification::AtTarget => {
-                    let target = resolve_stored_release(&paths, Some(&tx.target_release_id), None, None)?;
-                    let current_manifest = paths
-                        .release_manifest_path
-                        .is_file()
-                        .then(|| load_manifest_file(&paths.release_manifest_path))
-                        .transpose()
-                        .ok()
-                        .flatten();
-                    let j_dir = tx
-                        .journal_dir
-                        .as_deref()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| tx_root_dir(&paths).join(&tx.transaction_id));
-                    apply_swap_with_journal(
-                        &paths,
-                        current_manifest.as_ref(),
-                        &target.release_dir,
-                        &target.manifest,
-                        &j_dir,
-                    )?;
-                    let settings = load_settings(&paths)?;
-                    let env_plan = plan_environment_options(&paths, &settings, &[], false, None, false, args.skip_env)?;
-                    sync_python_environment(&paths, &env_plan).await?;
-                    clear_transaction_artifacts(&paths, Some(&tx))?;
-                    emit_resume_done(ctx, &tx, "completed-downgrade-activation", tx.target_head.clone(), tx.target_head.clone(), false, None, warnings);
-                    Ok(())
+                ResumeDbClassification::Unknown(rev) => {
+                    let hint = if tx.db_checkpoint_path.is_some() {
+                        "Run `cfms-ctl deployment resume --rollback` to restore the pre-upgrade SQLite checkpoint, or inspect live tables with `cfms-ctl database check` and run `resume --abort-clear` after manual repair."
+                    } else {
+                        "Inspect live tables with `cfms-ctl database check`, restore backup, or run `resume --abort-clear` after manual repair."
+                    };
+                    Err(CfmsError::SchemaDrift(format!(
+                        "Cannot automatically continue upgrade forward: observed DB revision {:?} matches neither source ({:?}), target ({:?}), nor any intermediate step. {hint}",
+                        rev, tx.source_head, tx.target_head
+                    )))
                 }
-                ResumeDbClassification::AtSource | ResumeDbClassification::Intermediate(_) => {
-                    if args.continue_forward {
-                        let target_head = tx.target_head.as_deref().ok_or_else(|| {
-                            CfmsError::Deployment("Missing target_head".to_string())
-                        })?;
-                        execute_deployment_db_downgrade(ctx, &paths, target_head).await?;
-                        let target = resolve_stored_release(&paths, Some(&tx.target_release_id), None, None)?;
-                        let current_manifest = paths
-                            .release_manifest_path
-                            .is_file()
-                            .then(|| load_manifest_file(&paths.release_manifest_path))
-                            .transpose()
-                            .ok()
-                            .flatten();
-                        let j_dir = tx_root_dir(&paths).join(&tx.transaction_id);
-                        apply_swap_with_journal(&paths, current_manifest.as_ref(), &target.release_dir, &target.manifest, &j_dir)?;
-                        clear_transaction_artifacts(&paths, Some(&tx))?;
-                        emit_resume_done(ctx, &tx, "continued-downgrade", diagnosis.drift.current_revision, Some(target_head.to_string()), false, None, warnings);
-                        return Ok(());
-                    }
-                    if matches!(diagnosis.classification, ResumeDbClassification::Intermediate(_)) {
-                        let source_head = tx.source_head.as_deref().unwrap_or("head");
-                        execute_deployment_db_upgrade(ctx, &paths, source_head, args.allow_destructive).await?;
-                    }
-                    clear_transaction_artifacts(&paths, Some(&tx))?;
-                    emit_resume_done(ctx, &tx, "aborted-downgrade-at-source", diagnosis.drift.current_revision, tx.source_head.clone(), false, None, warnings);
-                    Ok(())
-                }
-                ResumeDbClassification::Unknown(rev) => Err(CfmsError::SchemaDrift(format!(
-                    "Cannot automatically resume downgrade from unknown revision {:?}; recover DB manually then run `cfms-ctl deployment resume --abort-clear`",
-                    rev
-                ))),
             }
-        }
-        (TransactionOperation::Downgrade, TransactionPhase::Activation) => {
-            let target = resolve_stored_release(&paths, Some(&tx.target_release_id), None, None)?;
-            let current_manifest = paths
-                .release_manifest_path
-                .is_file()
-                .then(|| load_manifest_file(&paths.release_manifest_path))
-                .transpose()
-                .ok()
-                .flatten();
-            let j_dir = tx_root_dir(&paths).join(&tx.transaction_id);
-            apply_swap_with_journal(&paths, current_manifest.as_ref(), &target.release_dir, &target.manifest, &j_dir)?;
-            let settings = load_settings(&paths)?;
-            let env_plan = plan_environment_options(&paths, &settings, &[], false, None, false, args.skip_env)?;
-            sync_python_environment(&paths, &env_plan).await?;
-            clear_transaction_artifacts(&paths, Some(&tx))?;
-            emit_resume_done(ctx, &tx, "finished-downgrade-activation", diagnosis.drift.current_revision, tx.target_head.clone(), false, None, warnings);
-            Ok(())
         }
         (TransactionOperation::Install, _) => {
             clear_transaction_artifacts(&paths, Some(&tx))?;
-            emit_resume_done(ctx, &tx, "cleared-install-marker", diagnosis.drift.current_revision, None, false, None, warnings);
+            emit_resume_done(
+                ctx,
+                &tx,
+                "cleared-install-marker",
+                diagnosis.drift.current_revision,
+                None,
+                false,
+                None,
+                warnings,
+            );
             Ok(())
         }
     }
+}
+
+fn load_resume_base_template(
+    paths: &WorkspacePaths,
+    tx: &DeploymentTransaction,
+    journal_dir: &Path,
+) -> Result<Option<ConfigDocument>> {
+    let journal_base = journal_dir
+        .join("backup")
+        .join("src")
+        .join("config.toml.sample");
+    if journal_base.is_file() {
+        return Ok(Some(ConfigDocument::load(&journal_base)?));
+    }
+    let snapshot_base = versions_dir(paths)
+        .join(&tx.source_release_id)
+        .join(RELEASE_SUBDIR)
+        .join("src")
+        .join("config.toml.sample");
+    if snapshot_base.is_file() {
+        return Ok(Some(ConfigDocument::load(&snapshot_base)?));
+    }
+    if paths.config_template_path.is_file() {
+        return Ok(Some(ConfigDocument::load(&paths.config_template_path)?));
+    }
+    Ok(None)
 }
 
 fn recommend_resume_step(tx: &DeploymentTransaction, cls: &ResumeDbClassification) -> String {
@@ -1477,17 +1132,25 @@ fn recommend_resume_step(tx: &DeploymentTransaction, cls: &ResumeDbClassificatio
             "Run `cfms-ctl deployment resume` to safely roll back to the source release, or `--continue-forward` if staging remains valid".to_string()
         }
         (_, _, ResumeDbClassification::AtTarget) => {
-            "Database already matches target revision; run `cfms-ctl deployment resume` to finalize cleanup".to_string()
+            "Database already matches target revision; run `cfms-ctl deployment resume` to finalize cleanup (or `--rollback` to explicitly abort before completion)".to_string()
         }
         (_, _, ResumeDbClassification::Intermediate(mid)) => format!(
-            "Database stopped at intermediate revision {mid}; run `cfms-ctl deployment resume --continue-forward` or `--rollback`"
+            "Database stopped at intermediate revision {mid}; fix the issue and run `cfms-ctl deployment resume --continue-forward`, or abort and undo all in-flight changes with `--rollback`"
         ),
         (_, _, ResumeDbClassification::AtSource) => {
-            "Database is at source revision; run `cfms-ctl deployment resume --rollback` or `--continue-forward`".to_string()
+            "Database is at source revision; run `cfms-ctl deployment resume --continue-forward` to retry, or `--rollback` to abort and restore the source release".to_string()
         }
-        (_, _, ResumeDbClassification::Unknown(rev)) => format!(
-            "Unrecognized DB revision {rev:?}; run `cfms-ctl database check`, repair manually, then `cfms-ctl deployment resume --abort-clear`"
-        ),
+        (_, _, ResumeDbClassification::Unknown(rev)) => {
+            if tx.db_checkpoint_path.is_some() {
+                format!(
+                    "Unrecognized DB revision {rev:?}; run `cfms-ctl deployment resume --rollback` to restore the pre-upgrade SQLite checkpoint, or repair manually and run `--abort-clear`"
+                )
+            } else {
+                format!(
+                    "Unrecognized DB revision {rev:?}; run `cfms-ctl database check`, repair or restore backup manually, then `cfms-ctl deployment resume --abort-clear`"
+                )
+            }
+        }
     }
 }
 
@@ -1521,6 +1184,19 @@ async fn restore_source_release_state(
             &fallback_j,
         )?;
         let _ = fs::remove_dir_all(&fallback_j);
+
+        let _ = restore_snapshot_config(&source.state_dir, &paths.config_path)?;
+        let saved_settings_file = source.state_dir.join("settings.json");
+        if saved_settings_file.is_file()
+            && let Ok(raw) = fs::read_to_string(&saved_settings_file)
+            && let Ok(settings) = serde_json::from_str::<DeploymentSettings>(&raw)
+        {
+            let _ = save_settings(paths, &settings);
+        }
+        let saved_lock = source.state_dir.join("requirements.lock");
+        if saved_lock.is_file() {
+            sync_persisted_requirements_lock(paths, Some(&saved_lock), false)?;
+        }
     }
 
     let settings = load_settings(paths)?;
@@ -1559,7 +1235,6 @@ fn emit_resume_done(
         db_revision_after: db_after,
         backup_archive_path: None,
         backup_generated_key: None,
-        quarantined_extensions: Vec::new(),
         warnings,
         next_steps: Vec::new(),
     };
@@ -1704,7 +1379,6 @@ pub async fn handle_install(ctx: &AppContext, args: DeploymentInstallArgs) -> Re
             db_revision_after: (!args.skip_db_init).then_some(head_rev).flatten(),
             backup_archive_path: None,
             backup_generated_key: None,
-            quarantined_extensions: Vec::new(),
             warnings,
             next_steps: vec![format!(
                 "Re-run without `--dry-run` to install into '{}'",
@@ -1750,7 +1424,6 @@ pub async fn handle_install(ctx: &AppContext, args: DeploymentInstallArgs) -> Re
         extras: env_plan.extras.clone(),
     };
     save_settings(&paths, &settings)?;
-    snapshot_from_verified_tree(&paths, &staged.extracted_dir, &staged.manifest, &settings)?;
 
     let db_after = if args.skip_db_init {
         None
@@ -1779,7 +1452,6 @@ pub async fn handle_install(ctx: &AppContext, args: DeploymentInstallArgs) -> Re
         db_revision_after: db_after,
         backup_archive_path: None,
         backup_generated_key: None,
-        quarantined_extensions: Vec::new(),
         warnings,
         next_steps: vec![
             format!("Review generated configuration at '{}'", paths.config_path.display()),
@@ -1916,7 +1588,6 @@ pub async fn handle_adopt(ctx: &AppContext, args: DeploymentAdoptArgs) -> Result
         atomic_write(&paths.release_manifest_path, &staged.manifest.raw_bytes)?;
         sync_persisted_requirements_lock(&paths, args.requirements_lock.as_deref(), false)?;
         save_settings(&paths, &settings)?;
-        snapshot_active_release(&paths, &staged.manifest, &settings)?;
     }
 
     let report = DeploymentMutationReport {
@@ -1938,7 +1609,6 @@ pub async fn handle_adopt(ctx: &AppContext, args: DeploymentAdoptArgs) -> Result
         db_revision_after: None,
         backup_archive_path: None,
         backup_generated_key: None,
-        quarantined_extensions: Vec::new(),
         warnings,
         next_steps: Vec::new(),
     };
@@ -2062,7 +1732,6 @@ mod tests {
             requires_python: ">=3.12,<3.15".to_string(),
             managed_extensions: vec!["builtin".to_string()],
             files: manifest_files,
-            core_config_contract: None,
         };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
         (files_bytes, manifest_bytes)
@@ -2538,33 +2207,247 @@ mod tests {
             "0.14.1"
         );
 
-        // Snapshot of v0.13.9 recorded and clean status/verify pass.
+        // After upgrading 0.13.9 -> 0.14.0 -> 0.14.1, versions/ auto-prunes to at most 1 old version (0.14.0).
         let v1_valid = parse_and_validate_manifest_bytes(&v1_manifest_bytes, "v1").unwrap();
+        let v2_valid = parse_and_validate_manifest_bytes(&v2_manifest_bytes, "v2").unwrap();
         let snaps = list_stored_releases(&paths, None, true).unwrap();
-        assert!(snaps.iter().any(|s| s.release_id == v1_valid.release_id && s.healthy));
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].release_id, v2_valid.release_id);
+        assert!(snaps[0].healthy);
+        assert!(!snaps.iter().any(|s| s.release_id == v1_valid.release_id));
         handle_status(&ctx, DeploymentStatusArgs { verify: true })
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn downgrade_by_prefix_and_version_config_preservation_restore_snapshot_quarantine_and_options_guard() {
+    async fn upgrade_rejects_downgrade_and_same_version_after_completion() {
         let tmp = TempDir::new().unwrap();
-
-        // Part A: `options` table non-empty downgrade guard across `16c86712512a`.
-        let v_old_pkg = tmp.path().join("cfms-0.13.8.tar.gz");
-        let (v_old_files, v_old_mb) = build_release_bundle_map(
-            "0.13.8",
-            &[("03197fed3401", None)],
+        let v1_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
+        let (v1_files, v1_mb) = build_release_bundle_map(
+            "0.14.0",
+            &[("e952c02c1454", None)],
             &base_config_template(""),
             &[],
         );
-        write_release_targz(&v_old_pkg, "", &v_old_files, &v_old_mb);
-        let old_validated = parse_and_validate_manifest_bytes(&v_old_mb, "old").unwrap();
+        write_release_targz(&v1_pkg, "", &v1_files, &v1_mb);
 
-        // Install v0.14.0 (head e952c02c1454) + seed snapshot of v0.13.8 + non-empty `options` table.
-        let v14_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
-        let (v14_files, v14_mb) = build_release_bundle_map(
+        let v2_pkg = tmp.path().join("cfms-0.14.1.tar.gz");
+        let (v2_files, v2_mb) = build_release_bundle_map(
+            "0.14.1",
+            &[("e952c02c1454", None)],
+            &base_config_template(""),
+            &[("src/v141.py", b"V = 141\n")],
+        );
+        write_release_targz(&v2_pkg, "", &v2_files, &v2_mb);
+
+        let deploy = tmp.path().join("no-downgrade-deploy");
+        install_fixture_release(&deploy, &v1_pkg, false).await;
+        let ctx = test_ctx(&deploy);
+
+        // Complete upgrade 0.14.0 -> 0.14.1.
+        handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v2_pkg.clone(),
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Attempting to upgrade back to 0.14.0 is strictly prohibited.
+        let down_err = handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v1_pkg,
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: false,
+            },
+        )
+        .await
+        .expect_err("completed deployment must reject downgrade via upgrade");
+        assert!(
+            down_err.to_string().contains("strictly newer") || down_err.to_string().contains("downgrading"),
+            "unexpected error: {down_err}"
+        );
+
+        // Same version is also rejected.
+        let same_err = handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v2_pkg,
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: true,
+            },
+        )
+        .await
+        .expect_err("same-version upgrade must be rejected");
+        assert!(same_err.to_string().contains("strictly newer"));
+    }
+
+    #[tokio::test]
+    async fn upgrade_three_way_merges_config_and_preserves_extensions() {
+        let tmp = TempDir::new().unwrap();
+        let v1_template = base_config_template(
+            "port = 5104\ntimeout = 30\nlegacy_flag = false\ncustom_deleted = \"default\"\n\n[extensions]\nenabled = []\n",
+        );
+        let v1_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
+        let (v1_files, v1_mb) = build_release_bundle_map(
+            "0.14.0",
+            &[("e952c02c1454", None)],
+            &v1_template,
+            &[],
+        );
+        write_release_targz(&v1_pkg, "", &v1_files, &v1_mb);
+
+        let deploy = tmp.path().join("three-way-merge-deploy");
+        install_fixture_release(&deploy, &v1_pkg, false).await;
+        let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
+        let ctx = test_ctx(&deploy);
+
+        // Operator customizes port (conflict vs v2), custom_deleted (modify/delete conflict vs v2),
+        // keeps timeout & legacy_flag at v1 defaults, and adds an extension subtable + comments.
+        let operator_cfg = r#"# Operator deployment header
+[database]
+type = "sqlite"
+file = "cfms.db"
+
+[security]
+pepper = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[server]
+secret_key = "deploy-secret-key"
+port = 9000 # customized port
+timeout = 30 # keep inline comment on default
+legacy_flag = false
+custom_deleted = "keep-my-override"
+operator_only = "stays"
+
+[extensions]
+enabled = ["oidc_sso"]
+
+[extensions.oidc_sso]
+issuer = "https://sso.example.org"
+client_id = "cfms-web"
+"#;
+        fs::write(&paths.config_path, operator_cfg).unwrap();
+
+        // v2 template changes port default (5104 -> 8080), timeout default (30 -> 60),
+        // removes legacy_flag and custom_deleted, and adds [logging].
+        let v2_template = base_config_template(
+            "port = 8080\ntimeout = 60\n\n[logging]\nlevel = \"INFO\"\n\n[extensions]\nenabled = []\n",
+        );
+        let v2_pkg = tmp.path().join("cfms-0.15.0.zip");
+        let (v2_files, mut v2_mb) = build_release_bundle_map(
+            "0.15.0",
+            &[("e952c02c1454", None)],
+            &v2_template,
+            &[],
+        );
+        let mut parsed_manifest: ReleaseManifest = serde_json::from_slice(&v2_mb).unwrap();
+        parsed_manifest.managed_extensions.push("oidc_sso".to_string());
+        v2_mb = serde_json::to_vec_pretty(&parsed_manifest).unwrap();
+        write_release_zip(&v2_pkg, "cfms-0.15.0", &v2_files, &v2_mb);
+
+        // 1) Dry-run leaves live config untouched.
+        handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v2_pkg.clone(),
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read_to_string(&paths.config_path).unwrap(), operator_cfg);
+
+        // 2) Real upgrade performs non-destructive 3-way merge.
+        handle_upgrade(
+            &ctx,
+            DeploymentUpgradeArgs {
+                package: v2_pkg,
+                checksum: LocalChecksumArgs::default(),
+                env: DeploymentEnvArgs {
+                    skip_env: true,
+                    ..Default::default()
+                },
+                backup: SafetyBackupArgs::default(),
+                allow_destructive: false,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let merged_raw = fs::read_to_string(&paths.config_path).unwrap();
+        assert!(merged_raw.contains("# Operator deployment header"));
+        assert!(merged_raw.contains("# keep inline comment on default"));
+        assert!(!merged_raw.contains("legacy_flag"));
+
+        let merged: toml::Value = toml::from_str(&merged_raw).unwrap();
+        // Unmodified default updated automatically.
+        assert_eq!(merged["server"]["timeout"].as_integer(), Some(60));
+        // New template key added automatically.
+        assert_eq!(merged["logging"]["level"].as_str(), Some("INFO"));
+        // Conflicts keep operator values (ours-wins).
+        assert_eq!(merged["server"]["port"].as_integer(), Some(9000));
+        assert_eq!(
+            merged["server"]["custom_deleted"].as_str(),
+            Some("keep-my-override")
+        );
+        assert_eq!(merged["server"]["operator_only"].as_str(), Some("stays"));
+        // Extension subtables preserved verbatim.
+        assert_eq!(
+            merged["extensions"]["oidc_sso"]["issuer"].as_str(),
+            Some("https://sso.example.org")
+        );
+        assert_eq!(
+            merged["extensions"]["oidc_sso"]["client_id"].as_str(),
+            Some("cfms-web")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rollback_restores_sqlite_checkpoint_and_source_release_on_explicit_abort() {
+        let tmp = TempDir::new().unwrap();
+        let v1_pkg = tmp.path().join("cfms-0.13.0.tar.gz");
+        let (v1_files, v1_mb) = build_release_bundle_map(
+            "0.13.0",
+            &[("03197fed3401", None)],
+            &base_config_template(""),
+            &[("src/v1_only.py", b"V1 = True\n")],
+        );
+        write_release_targz(&v1_pkg, "", &v1_files, &v1_mb);
+        let v1_valid = parse_and_validate_manifest_bytes(&v1_mb, "v1").unwrap();
+
+        let (v2_files, v2_mb) = build_release_bundle_map(
             "0.14.0",
             &[
                 ("03197fed3401", None),
@@ -2572,167 +2455,209 @@ mod tests {
                 ("e952c02c1454", Some("16c86712512a")),
             ],
             &base_config_template("\n[logging]\nlevel = \"INFO\"\n"),
-            &[],
+            &[("src/v2_only.py", b"V2 = True\n")],
         );
-        write_release_targz(&v14_pkg, "", &v14_files, &v14_mb);
+        let v2_valid = parse_and_validate_manifest_bytes(&v2_mb, "v2").unwrap();
 
-        let deploy = tmp.path().join("downgrade-deploy");
-        install_fixture_release(&deploy, &v14_pkg, false).await;
+        let deploy = tmp.path().join("abort-rollback-deploy");
+        install_fixture_release(&deploy, &v1_pkg, true).await;
         let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
         let ctx = test_ctx(&deploy);
 
-        // Save snapshot for v0.13.8 (with pre-16c86712512a alembic head) and populate `options`.
-        let old_dir = deploy.join("staged-old");
-        write_unpacked_workspace(&old_dir, &v_old_files, Some(&v_old_mb));
-        snapshot_from_verified_tree(&paths, &old_dir, &old_validated, &DeploymentSettings::default())
-            .unwrap();
+        let v1_cfg = "[database]\ntype = \"sqlite\"\nfile = \"cfms.db\"\n\n[security]\npepper = \"v1-pepper\"\n\n[server]\nsecret_key = \"v1-secret\"\n";
+        fs::write(&paths.config_path, v1_cfg).unwrap();
 
+        // Seed pre-upgrade SQLite DB at source_head with a sentinel row.
         let db = ctx.connect_db(&paths).await.unwrap();
-        match &db {
-            DbPool::Sqlite(p) => {
-                sqlx::query(
-                    "INSERT INTO options (namespace, owner, option_key, schema_version, revision, value_type, option_value, updated_at) VALUES ('core', 'builtin', 'site_title', 1, 1, 'str', '\"CFMS\"', 1.0)",
-                )
-                .execute(p)
+        create_head_schema(&db, false).await.unwrap();
+        set_alembic_version(&db, "03197fed3401").await.unwrap();
+        if let DbPool::Sqlite(ref sq) = db {
+            sqlx::query("CREATE TABLE sentinel_state (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+                .execute(sq)
                 .await
                 .unwrap();
-            }
-            _ => unreachable!(),
+            sqlx::query("INSERT INTO sentinel_state (k, v) VALUES ('before', 'original')")
+                .execute(sq)
+                .await
+                .unwrap();
         }
         db.close().await;
 
-        let blocked_err = handle_downgrade(
+        // Snapshot source release into versions/ and capture SQLite checkpoint before swap.
+        snapshot_active_release(&paths, &v1_valid, &DeploymentSettings::default()).unwrap();
+        let stage_v2 = staging_dir(&paths).join("abort-stage-v2");
+        write_unpacked_workspace(&stage_v2, &v2_files, Some(&v2_mb));
+        let j_dir = paths.maintenance_root.join("tx").join("tx-abort-1");
+        let (ckpt_path, ckpt_sha) = capture_sqlite_upgrade_checkpoint(
             &ctx,
-            DeploymentDowngradeArgs {
-                release_id: None,
-                version: Some("0.13.8".to_string()),
-                restore_snapshot_config: false,
-                quarantine_extensions: false,
-                skip_env: true,
-                backup: SafetyBackupArgs::default(),
+            &paths,
+            &j_dir.join("db_checkpoint.sqlite"),
+        )
+        .await
+        .unwrap()
+        .expect("sqlite deployment must produce checkpoint");
+        apply_swap_with_journal(&paths, Some(&v1_valid), &stage_v2, &v2_valid, &j_dir).unwrap();
+
+        // Mutate live config as if 3-way merge ran, then simulate partial DB migration failure
+        // leaving DB at Intermediate revision with extra in-flight DDL and mutated data.
+        fs::write(
+            &paths.config_path,
+            format!("{v1_cfg}\n[logging]\nlevel = \"INFO\"\n"),
+        )
+        .unwrap();
+        let db = ctx.connect_db(&paths).await.unwrap();
+        set_alembic_version(&db, "16c86712512a").await.unwrap();
+        if let DbPool::Sqlite(ref sq) = db {
+            sqlx::query("CREATE TABLE inflight_partial_ddl (id INTEGER PRIMARY KEY)")
+                .execute(sq)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE sentinel_state SET v = 'mutated-mid-upgrade' WHERE k = 'before'")
+                .execute(sq)
+                .await
+                .unwrap();
+        }
+        db.close().await;
+
+        let tx = DeploymentTransaction {
+            format_version: TRANSACTION_FORMAT_VERSION,
+            transaction_id: "tx-abort-1".to_string(),
+            operation: TransactionOperation::Upgrade,
+            phase: TransactionPhase::DatabaseRecoveryRequired,
+            started_at: Some("2026-11-22T00:00:00Z".to_string()),
+            source_release_id: v1_valid.release_id.clone(),
+            target_release_id: v2_valid.release_id.clone(),
+            source_version: "0.13.0".to_string(),
+            target_version: "0.14.0".to_string(),
+            source_head: Some("03197fed3401".to_string()),
+            target_head: Some("e952c02c1454".to_string()),
+            staging_dir: Some(stage_v2.display().to_string()),
+            journal_dir: Some(j_dir.display().to_string()),
+            db_checkpoint_path: Some(ckpt_path.display().to_string()),
+            db_checkpoint_sha256: Some(ckpt_sha.clone()),
+            last_error: Some("simulated migration failure".to_string()),
+            observed_db_revision: Some("16c86712512a".to_string()),
+            step_history: vec!["files-swapped".to_string(), "db-migration-failed".to_string()],
+        };
+        save_transaction(&paths, &tx).unwrap();
+
+        // Dry-run preserves intermediate DB state so operator can still inspect/fix or decide.
+        handle_resume(
+            &ctx,
+            DeploymentResumeArgs {
+                rollback: true,
                 dry_run: true,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(blocked_err.to_string().contains("options"));
-
-        // Part B: 0.14.0 -> 0.14.1 patch upgrade & downgrade testing live config preservation,
-        // prefix lookup, `--restore-snapshot-config`, `--version`, and `--quarantine-extensions`.
-        let v14_valid = parse_and_validate_manifest_bytes(&v14_mb, "14").unwrap();
-        let v14_prefix = &v14_valid.release_id[..8];
-
-        let v141_pkg = tmp.path().join("cfms-0.14.1.tar.gz");
-        let (v141_files, v141_mb) = build_release_bundle_map(
-            "0.14.1",
-            &[
-                ("03197fed3401", None),
-                ("16c86712512a", Some("03197fed3401")),
-                ("e952c02c1454", Some("16c86712512a")),
-            ],
-            &base_config_template("\n[logging]\nlevel = \"INFO\"\n"),
-            &[("src/patch_marker.py", b"PATCH = 1\n")],
-        );
-        write_release_targz(&v141_pkg, "", &v141_files, &v141_mb);
-
-        handle_upgrade(
-            &ctx,
-            DeploymentUpgradeArgs {
-                package: v141_pkg.clone(),
-                checksum: LocalChecksumArgs::default(),
-                env: DeploymentEnvArgs {
-                    skip_env: true,
-                    ..Default::default()
-                },
-                backup: SafetyBackupArgs::default(),
-                allow_destructive: false,
-                dry_run: false,
+                ..Default::default()
             },
         )
         .await
         .unwrap();
-        assert!(deploy.join("src").join("patch_marker.py").is_file());
+        assert!(paths.transaction_path().is_file());
+        let db = ctx.connect_db(&paths).await.unwrap();
+        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("16c86712512a"));
+        db.close().await;
 
-        // Mutate live config after upgrade + install incompatible extension (>0.14.0).
-        let mut live_cfg = fs::read_to_string(&paths.config_path).unwrap();
-        live_cfg.push_str("\ncustom_live_key = \"keep-me\"\n");
-        fs::write(&paths.config_path, &live_cfg).unwrap();
-        install_dummy_third_party_extension(&deploy, "v141_only_ext", Some("0.14.1"), None);
-
-        // Downgrade by 8-char hex prefix WITHOUT --restore-snapshot-config or --quarantine-extensions.
-        handle_downgrade(
+        // Explicit operator abort (`resume --rollback`) reverts DB + files + config completely.
+        handle_resume(
             &ctx,
-            DeploymentDowngradeArgs {
-                release_id: Some(v14_prefix.to_string()),
-                version: None,
-                restore_snapshot_config: false,
-                quarantine_extensions: false,
+            DeploymentResumeArgs {
+                rollback: true,
                 skip_env: true,
-                backup: SafetyBackupArgs::default(),
-                dry_run: false,
+                ..Default::default()
             },
         )
         .await
         .unwrap();
 
+        assert!(!paths.transaction_path().exists());
+        assert!(!deploy.join("src").join("v2_only.py").exists());
+        assert!(deploy.join("src").join("v1_only.py").is_file());
         assert_eq!(
             load_manifest_file(&paths.release_manifest_path)
                 .unwrap()
                 .manifest
                 .version,
-            "0.14.0"
+            "0.13.0"
         );
-        assert!(!deploy.join("src").join("patch_marker.py").exists());
-        let cfg_after_default = fs::read_to_string(&paths.config_path).unwrap();
-        assert!(cfg_after_default.contains("keep-me"));
-        assert!(deploy.join("src/include/extensions/v141_only_ext/manifest.toml").is_file());
+        assert_eq!(fs::read_to_string(&paths.config_path).unwrap(), v1_cfg);
+        assert!(!versions_dir(&paths).join(&v1_valid.release_id).exists());
 
-        // Re-upgrade to 0.14.1, mutate live config again, and downgrade by `--version` WITH
-        // `--restore-snapshot-config` AND `--quarantine-extensions`.
-        handle_upgrade(
+        let db = ctx.connect_db(&paths).await.unwrap();
+        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("03197fed3401"));
+        if let DbPool::Sqlite(ref sq) = db {
+            let val: String = sqlx::query_scalar("SELECT v FROM sentinel_state WHERE k = 'before'")
+                .fetch_one(sq)
+                .await
+                .unwrap();
+            assert_eq!(val, "original");
+            let partial_exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'inflight_partial_ddl'",
+            )
+            .fetch_one(sq)
+            .await
+            .unwrap();
+            assert_eq!(partial_exists, 0);
+        }
+        db.close().await;
+
+        // Also test fallback rollback when swap journal is missing (uses versions/<source_id>/)
+        // and DB stopped at an Unknown revision with a valid checkpoint.
+        snapshot_active_release(&paths, &v1_valid, &DeploymentSettings::default()).unwrap();
+        write_unpacked_workspace(&stage_v2, &v2_files, Some(&v2_mb));
+        let j_dir_2 = paths.maintenance_root.join("tx").join("tx-abort-2");
+        let (ckpt_path_2, ckpt_sha_2) = capture_sqlite_upgrade_checkpoint(
             &ctx,
-            DeploymentUpgradeArgs {
-                package: v141_pkg,
-                checksum: LocalChecksumArgs::default(),
-                env: DeploymentEnvArgs {
-                    skip_env: true,
-                    ..Default::default()
-                },
-                backup: SafetyBackupArgs::default(),
-                allow_destructive: false,
-                dry_run: false,
-            },
+            &paths,
+            &j_dir_2.join("db_checkpoint.sqlite"),
         )
         .await
+        .unwrap()
         .unwrap();
-        let mut live_cfg_2 = fs::read_to_string(&paths.config_path).unwrap();
-        live_cfg_2.push_str("ephemeral_post_upgrade = \"discard-on-restore\"\n");
-        fs::write(&paths.config_path, &live_cfg_2).unwrap();
+        apply_swap_with_journal(&paths, Some(&v1_valid), &stage_v2, &v2_valid, &j_dir_2).unwrap();
+        // Delete journal.json to force fallback to versions/<source_release_id>/.
+        fs::remove_file(j_dir_2.join("journal.json")).unwrap();
+        fs::write(
+            &paths.config_path,
+            format!("{v1_cfg}\n[logging]\nlevel = \"DEBUG\"\n"),
+        )
+        .unwrap();
+        let db = ctx.connect_db(&paths).await.unwrap();
+        set_alembic_version(&db, "deadbeef0000").await.unwrap();
+        db.close().await;
 
-        handle_downgrade(
+        let tx2 = DeploymentTransaction {
+            transaction_id: "tx-abort-2".to_string(),
+            journal_dir: Some(j_dir_2.display().to_string()),
+            db_checkpoint_path: Some(ckpt_path_2.display().to_string()),
+            db_checkpoint_sha256: Some(ckpt_sha_2),
+            observed_db_revision: Some("deadbeef0000".to_string()),
+            ..tx
+        };
+        save_transaction(&paths, &tx2).unwrap();
+
+        handle_resume(
             &ctx,
-            DeploymentDowngradeArgs {
-                release_id: None,
-                version: Some("0.14.0".to_string()),
-                restore_snapshot_config: true,
-                quarantine_extensions: true,
+            DeploymentResumeArgs {
+                rollback: true,
                 skip_env: true,
-                backup: SafetyBackupArgs::default(),
-                dry_run: false,
+                ..Default::default()
             },
         )
         .await
         .unwrap();
 
-        let restored_cfg = fs::read_to_string(&paths.config_path).unwrap();
-        assert!(!restored_cfg.contains("discard-on-restore"));
-        assert!(!deploy.join("src/include/extensions/v141_only_ext").exists());
-        let quarantine_entries: Vec<_> = fs::read_dir(paths.maintenance_root.join("quarantine"))
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .collect();
-        assert_eq!(quarantine_entries.len(), 1);
-        assert!(quarantine_entries[0].path().join("v141_only_ext/manifest.toml").is_file());
+        assert!(!paths.transaction_path().exists());
+        assert_eq!(
+            load_manifest_file(&paths.release_manifest_path)
+                .unwrap()
+                .manifest
+                .version,
+            "0.13.0"
+        );
+        assert_eq!(fs::read_to_string(&paths.config_path).unwrap(), v1_cfg);
+        let db = ctx.connect_db(&paths).await.unwrap();
+        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("03197fed3401"));
+        db.close().await;
     }
 
     #[tokio::test]
@@ -2791,6 +2716,8 @@ mod tests {
             target_head: Some("e952c02c1454".to_string()),
             staging_dir: Some(stage_v2.display().to_string()),
             journal_dir: Some(j_dir.display().to_string()),
+            db_checkpoint_path: None,
+            db_checkpoint_sha256: None,
             last_error: Some("simulated crash".to_string()),
             observed_db_revision: Some("03197fed3401".to_string()),
             step_history: vec!["files-swapped".to_string()],
@@ -2937,6 +2864,10 @@ mod tests {
         }
         let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
 
+        // After upgrading 0.14.0 -> 0.14.1 -> 0.14.2, auto-prune keeps at most 1 old version (0.14.1).
+        assert!(!paths.maintenance_root.join("versions").join(&ids[0]).exists());
+        assert!(paths.maintenance_root.join("versions").join(&ids[1]).is_dir());
+
         // Tamper active tracked file -> handle_verify fails; restoring passes.
         let main_py = deploy.join("src").join("main.py");
         let orig_main = fs::read(&main_py).unwrap();
@@ -2995,11 +2926,10 @@ mod tests {
         .await
         .unwrap();
         assert!(!corrupt_dir.exists());
-        assert!(paths.maintenance_root.join("versions").join(&ids[0]).is_dir());
         assert!(paths.maintenance_root.join("versions").join(&ids[1]).is_dir());
 
         // Re-add a damaged sibling and verify `--keep 1` retains the newest healthy snapshot
-        // while pruning older healthy snapshots and damaged directories.
+        // while pruning damaged directories.
         fs::create_dir_all(&corrupt_dir).unwrap();
         fs::write(corrupt_dir.join("junk.txt"), b"x").unwrap();
 
@@ -3016,7 +2946,6 @@ mod tests {
         .await
         .unwrap();
         assert!(corrupt_dir.is_dir());
-        assert!(paths.maintenance_root.join("versions").join(&ids[0]).is_dir());
 
         handle_prune(
             &ctx,
@@ -3030,11 +2959,53 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!paths.maintenance_root.join("versions").join(&ids[0]).exists());
         assert!(!corrupt_dir.exists());
         assert!(paths.maintenance_root.join("versions").join(&ids[1]).exists());
 
-        // --all removes remaining inactive snapshot while never deleting active release or state.
+        // Active transaction protects its source_release_id from `--all` pruning.
+        let active_tx = DeploymentTransaction {
+            format_version: TRANSACTION_FORMAT_VERSION,
+            transaction_id: "tx-protect".to_string(),
+            operation: TransactionOperation::Upgrade,
+            phase: TransactionPhase::DatabaseRecoveryRequired,
+            started_at: Some("2026-11-22T00:00:00Z".to_string()),
+            source_release_id: ids[1].clone(),
+            target_release_id: ids[2].clone(),
+            source_version: "0.14.1".to_string(),
+            target_version: "0.14.2".to_string(),
+            source_head: Some("e952c02c1454".to_string()),
+            target_head: Some("e952c02c1454".to_string()),
+            staging_dir: None,
+            journal_dir: None,
+            db_checkpoint_path: None,
+            db_checkpoint_sha256: None,
+            last_error: Some("in-progress".to_string()),
+            observed_db_revision: None,
+            step_history: Vec::new(),
+        };
+        save_transaction(&paths, &active_tx).unwrap();
+        // Both CLI `handle_prune` (rejecting while transaction is active) and `plan_prune`
+        // (retaining `tx.source_release_id`) protect the active transaction's rollback snapshot.
+        let prune_during_tx_err = handle_prune(
+            &ctx,
+            DeploymentPruneArgs {
+                keep: None,
+                release: Vec::new(),
+                corrupt: false,
+                all: true,
+                dry_run: false,
+            },
+        )
+        .await
+        .expect_err("handle_prune must refuse to run during an active transaction");
+        assert!(matches!(prune_during_tx_err, CfmsError::UnfinishedTransaction(_)));
+        let protected_plan = plan_prune(&paths, &PruneSelector::AllInactive).unwrap();
+        assert!(protected_plan.keep_ids.contains(&ids[1]));
+        assert!(protected_plan.remove.is_empty());
+        assert!(paths.maintenance_root.join("versions").join(&ids[1]).exists());
+        clear_transaction_artifacts(&paths, Some(&active_tx)).unwrap();
+
+        // Once transaction is cleared, `--all` removes remaining inactive snapshot while never deleting active release or state.
         handle_prune(
             &ctx,
             DeploymentPruneArgs {
@@ -3080,7 +3051,7 @@ mod tests {
         write_release_targz(&v2_pkg, "cfms-0.15.0", &v2_files, &v2_mb);
         let v2_bytes = fs::read(&v2_pkg).unwrap();
         let v2_sha = sha256_hex(&v2_bytes);
-        let sums_body = format!("{v2_sha}  {v2_tar_name}\n");
+        let sums_body = format!("{v2_sha}  {v2_tar_name}\n{v2_sha}  cfms-on-websocket-0.14.0.tar.gz\n");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3112,6 +3083,29 @@ mod tests {
                                 "name": v2_tar_name,
                                 "size": v2_bytes.len(),
                                 "browser_download_url": format!("{base_clone}/dl/{v2_tar_name}"),
+                                "digest": serde_json::Value::Null
+                            },
+                            {
+                                "name": "SHA256SUMS.txt",
+                                "size": sums_body.len(),
+                                "browser_download_url": format!("{base_clone}/dl/SHA256SUMS.txt"),
+                                "digest": format!("sha256:{}", sha256_hex(sums_body.as_bytes()))
+                            }
+                        ]
+                    });
+                    ("200 OK", "application/json", serde_json::to_vec(&json).unwrap())
+                } else if path.contains("/releases/tags/v0.14.0") {
+                    let json = serde_json::json!({
+                        "tag_name": "v0.14.0",
+                        "draft": false,
+                        "prerelease": false,
+                        "html_url": format!("{base_clone}/rel/v0.14.0"),
+                        "published_at": "2026-11-01T00:00:00Z",
+                        "assets": [
+                            {
+                                "name": "cfms-on-websocket-0.14.0.tar.gz",
+                                "size": 100,
+                                "browser_download_url": format!("{base_clone}/dl/cfms-on-websocket-0.14.0.tar.gz"),
                                 "digest": serde_json::Value::Null
                             },
                             {
@@ -3216,6 +3210,22 @@ mod tests {
         .await
         .unwrap();
 
+        // Requesting an older version via `--version` is rejected (downgrades prohibited).
+        let down_err = run_check_with_config(
+            &ctx,
+            DeploymentCheckArgs {
+                online: OnlineReleaseArgs {
+                    version: Some("0.14.0".to_string()),
+                    format: ReleaseArchiveFormat::TarGz,
+                    ..Default::default()
+                },
+            },
+            &online_cfg,
+        )
+        .await
+        .expect_err("pinned older version must be rejected");
+        assert!(down_err.to_string().contains("older") || down_err.to_string().contains("downgrade"));
+
         server_task.abort();
     }
 
@@ -3248,361 +3258,4 @@ mod tests {
             .expect("diagnostic status must still succeed without detectable server version");
     }
 
-    fn build_contract_release_bundle_map(
-        version: &str,
-        alembic_chain: &[(&str, Option<&str>)],
-        config_sample: &[u8],
-        contract: Option<CoreConfigContract>,
-    ) -> (BTreeMap<String, Vec<u8>>, Vec<u8>) {
-        let (files_bytes, raw_manifest) =
-            build_release_bundle_map(version, alembic_chain, config_sample, &[]);
-        let mut manifest: ReleaseManifest = serde_json::from_slice(&raw_manifest).unwrap();
-        manifest.core_config_contract = contract;
-        (files_bytes, serde_json::to_vec_pretty(&manifest).unwrap())
-    }
-
-    fn make_contract(port_max: u64, include_renamed_core_opt: bool) -> CoreConfigContract {
-        use crate::core::{CORE_CONFIG_CONTRACT_VERSION, DRAFT_2020_12_DIALECT};
-        let mut opt_props = serde_json::Map::new();
-        let mut server_opts = serde_json::Map::new();
-        let mut name_schema = serde_json::json!({
-            "type": "string",
-            "default": "CFMS Server",
-            "x-schema-version": 1
-        });
-        if include_renamed_core_opt {
-            name_schema
-                .as_object_mut()
-                .unwrap()
-                .insert("x-renamed-from".to_string(), serde_json::json!(["server/display_name"]));
-        }
-        server_opts.insert("name".to_string(), name_schema);
-        opt_props.insert(
-            "server".to_string(),
-            serde_json::json!({
-                "type": "object",
-                "x-owner": "core",
-                "additionalProperties": false,
-                "properties": server_opts
-            }),
-        );
-
-        CoreConfigContract {
-            contract_version: CORE_CONFIG_CONTRACT_VERSION.to_string(),
-            core_version: "0.14.0".to_string(),
-            schema_dialect: DRAFT_2020_12_DIALECT.to_string(),
-            toml: serde_json::json!({
-                "$schema": DRAFT_2020_12_DIALECT,
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["database", "security", "server"],
-                "properties": {
-                    "server": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["secret_key"],
-                        "properties": {
-                            "port": { "type": "integer", "minimum": 1, "maximum": port_max },
-                            "secret_key": { "type": "string" }
-                        }
-                    },
-                    "security": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["pepper"],
-                        "properties": {
-                            "pepper": { "type": "string" }
-                        }
-                    },
-                    "database": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["type"],
-                        "properties": {
-                            "type": { "type": "string", "enum": ["sqlite", "mysql", "postgresql"] },
-                            "file": { "type": "string", "default": "app.db" },
-                            "name": {
-                                "type": "string",
-                                "default": "app_db",
-                                "x-renamed-from": ["database.db_name"]
-                            }
-                        }
-                    },
-                    "extensions": {
-                        "type": "object",
-                        "additionalProperties": { "type": "object" },
-                        "x-unmanaged-subtables": true,
-                        "properties": {
-                            "enabled": {
-                                "type": "array",
-                                "uniqueItems": true,
-                                "items": { "type": "string" }
-                            }
-                        }
-                    }
-                }
-            }),
-            options: serde_json::json!({
-                "$schema": DRAFT_2020_12_DIALECT,
-                "type": "object",
-                "additionalProperties": false,
-                "properties": opt_props
-            }),
-        }
-    }
-
-    #[tokio::test]
-    async fn upgrade_and_downgrade_dry_run_validate_against_embedded_core_contract() {
-        let tmp = TempDir::new().unwrap();
-        let tpl = base_config_template("port = 5104\n");
-
-        // 0.14.0 has permissive embedded contract (port <= 80000); 0.14.1 restricts port <= 65535.
-        let v140_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
-        let (v140_files, v140_mb) = build_contract_release_bundle_map(
-            "0.14.0",
-            &[("e952c02c1454", None)],
-            &tpl,
-            Some(make_contract(80000, false)),
-        );
-        write_release_targz(&v140_pkg, "", &v140_files, &v140_mb);
-
-        let deploy = tmp.path().join("contract-validate-deploy");
-        install_fixture_release(&deploy, &v140_pkg, false).await;
-        let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
-        let ctx = test_ctx(&deploy);
-
-        let mut live_cfg = fs::read_to_string(&paths.config_path).unwrap();
-        live_cfg = live_cfg.replace("port = 5104", "port = 70000");
-        fs::write(&paths.config_path, &live_cfg).unwrap();
-
-        let v141_pkg = tmp.path().join("cfms-0.14.1.tar.gz");
-        let (v141_files, v141_mb) = build_contract_release_bundle_map(
-            "0.14.1",
-            &[("e952c02c1454", None)],
-            &tpl,
-            Some(make_contract(65535, false)),
-        );
-        write_release_targz(&v141_pkg, "", &v141_files, &v141_mb);
-
-        let up_err = handle_upgrade(
-            &ctx,
-            DeploymentUpgradeArgs {
-                package: v141_pkg,
-                checksum: LocalChecksumArgs::default(),
-                env: DeploymentEnvArgs {
-                    skip_env: true,
-                    ..Default::default()
-                },
-                backup: SafetyBackupArgs::default(),
-                allow_destructive: false,
-                dry_run: true,
-            },
-        )
-        .await
-        .expect_err("dry-run upgrade must validate against staged core_config_contract");
-        assert!(
-            up_err.to_string().contains("Schema validation failed")
-                && up_err.to_string().contains("server.port"),
-            "unexpected error: {up_err}"
-        );
-
-        // Upgrade with stricter 0.14.0 strict -> 0.15.0 permissive snapshot, then test downgrade dry-run.
-        let deploy2 = tmp.path().join("downgrade-contract-check");
-        let v140_strict = tmp.path().join("cfms-0.14.0-strict.tar.gz");
-        let (v140s_f, v140s_mb) = build_contract_release_bundle_map(
-            "0.14.0",
-            &[("e952c02c1454", None)],
-            &tpl,
-            Some(make_contract(65535, false)),
-        );
-        write_release_targz(&v140_strict, "", &v140s_f, &v140s_mb);
-        install_fixture_release(&deploy2, &v140_strict, false).await;
-        let paths2 = WorkspacePaths::discover(Some(&deploy2), None).unwrap();
-        let ctx2 = test_ctx(&deploy2);
-
-        let v150_pkg = tmp.path().join("cfms-0.15.0.tar.gz");
-        let (v150_files, v150_mb) = build_contract_release_bundle_map(
-            "0.15.0",
-            &[("e952c02c1454", None)],
-            &tpl,
-            Some(make_contract(80000, false)),
-        );
-        write_release_targz(&v150_pkg, "", &v150_files, &v150_mb);
-
-        handle_upgrade(
-            &ctx2,
-            DeploymentUpgradeArgs {
-                package: v150_pkg,
-                checksum: LocalChecksumArgs::default(),
-                env: DeploymentEnvArgs {
-                    skip_env: true,
-                    ..Default::default()
-                },
-                backup: SafetyBackupArgs::default(),
-                allow_destructive: false,
-                dry_run: false,
-            },
-        )
-        .await
-        .unwrap();
-
-        let mut live_cfg2 = fs::read_to_string(&paths2.config_path).unwrap();
-        live_cfg2 = live_cfg2.replace("port = 5104", "port = 70000");
-        fs::write(&paths2.config_path, &live_cfg2).unwrap();
-
-        let down_err = handle_downgrade(
-            &ctx2,
-            DeploymentDowngradeArgs {
-                release_id: None,
-                version: Some("0.14.0".to_string()),
-                restore_snapshot_config: false,
-                quarantine_extensions: false,
-                skip_env: true,
-                backup: SafetyBackupArgs::default(),
-                dry_run: true,
-            },
-        )
-        .await
-        .expect_err("dry-run downgrade must validate against stored snapshot core_config_contract");
-        assert!(
-            down_err.to_string().contains("Schema validation failed")
-                && down_err.to_string().contains("server.port"),
-            "unexpected error: {down_err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn upgrade_with_core_contract_renames_toml_preserves_extensions_and_syncs_core_options() {
-        use crate::db::fetch_stored_options;
-
-        let tmp = TempDir::new().unwrap();
-        let v1_pkg = tmp.path().join("cfms-0.13.9.tar.gz");
-        let (v1_files, v1_manifest_bytes) = build_release_bundle_map(
-            "0.13.9",
-            &[("e952c02c1454", None)],
-            &base_config_template(""),
-            &[],
-        );
-        write_release_targz(&v1_pkg, "cfms-0.13.9", &v1_files, &v1_manifest_bytes);
-
-        let deploy = tmp.path().join("deploy-contract-upgrade");
-        install_fixture_release(&deploy, &v1_pkg, true).await;
-        let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
-        let ctx = test_ctx(&deploy);
-
-        let legacy_cfg = r#"# Operator deployment header
-[database]
-type = "sqlite"
-file = "cfms.db"
-db_name = "legacy_deploy.db"
-
-[security]
-pepper = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-[server]
-port = 5104
-secret_key = "deploy-secret-key"
-deprecated_flag = true
-
-[extensions]
-enabled = ["oidc_sso"]
-
-[extensions.oidc_sso]
-issuer = "https://sso.example.org"
-client_id = "cfms-web"
-"#;
-        fs::write(&paths.config_path, legacy_cfg).unwrap();
-        {
-            let db = ctx.connect_db(&paths).await.unwrap();
-            create_head_schema(&db, false).await.unwrap();
-            set_alembic_version(&db, "e952c02c1454").await.unwrap();
-            let DbPool::Sqlite(ref sq) = db else { unreachable!() };
-            sqlx::query(
-                "INSERT INTO options (namespace, owner, option_key, schema_version, revision, value_type, option_value, updated_at) VALUES \
-                 ('server', 'core', 'display_name', 1, 2, 'str', 'Old Core Name', 10.0), \
-                 ('server', 'core', 'removed_core_opt', 1, 1, 'str', 'keep-core', 10.0), \
-                 ('identity.oidc', 'oidc_sso', 'client_id', 1, 3, 'str', 'oidc-keep', 10.0)",
-            )
-            .execute(sq)
-            .await
-            .unwrap();
-            db.close().await;
-        }
-
-        let v2_template = b"[database]\ntype = \"sqlite\"\nname = \"cfms.db\"\n\n[security]\npepper = \"\"\n\n[server]\nport = 5104\nsecret_key = \"\"\n\n[extensions]\nenabled = []\n";
-        let v2_pkg = tmp.path().join("cfms-0.14.0.zip");
-        let (v2_files, mut v2_manifest_bytes) = build_contract_release_bundle_map(
-            "0.14.0",
-            &[("e952c02c1454", None)],
-            v2_template,
-            Some(make_contract(65535, true)),
-        );
-        let mut parsed_manifest: ReleaseManifest = serde_json::from_slice(&v2_manifest_bytes).unwrap();
-        parsed_manifest.managed_extensions.push("oidc_sso".to_string());
-        v2_manifest_bytes = serde_json::to_vec_pretty(&parsed_manifest).unwrap();
-        write_release_zip(&v2_pkg, "cfms-0.14.0", &v2_files, &v2_manifest_bytes);
-
-        // 1. Dry-run succeeds and leaves config.toml + DB untouched.
-        handle_upgrade(
-            &ctx,
-            DeploymentUpgradeArgs {
-                package: v2_pkg.clone(),
-                checksum: LocalChecksumArgs::default(),
-                env: DeploymentEnvArgs {
-                    skip_env: true,
-                    ..Default::default()
-                },
-                backup: SafetyBackupArgs::default(),
-                allow_destructive: false,
-                dry_run: true,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(fs::read_to_string(&paths.config_path).unwrap(), legacy_cfg);
-
-        // 2. Real upgrade renames core TOML + core DB keys, warns & preserves removed core items,
-        // and leaves extension TOML subtables and extension DB options completely untouched.
-        handle_upgrade(
-            &ctx,
-            DeploymentUpgradeArgs {
-                package: v2_pkg,
-                checksum: LocalChecksumArgs::default(),
-                env: DeploymentEnvArgs {
-                    skip_env: true,
-                    ..Default::default()
-                },
-                backup: SafetyBackupArgs::default(),
-                allow_destructive: false,
-                dry_run: false,
-            },
-        )
-        .await
-        .unwrap();
-
-        let upgraded_cfg = fs::read_to_string(&paths.config_path).unwrap();
-        assert!(upgraded_cfg.contains("# Operator deployment header"));
-        assert!(upgraded_cfg.contains("name = \"legacy_deploy.db\""));
-        assert!(!upgraded_cfg.contains("db_name"));
-        assert!(upgraded_cfg.contains("deprecated_flag = true"));
-        assert!(upgraded_cfg.contains("[extensions.oidc_sso]"));
-        assert!(upgraded_cfg.contains("issuer = \"https://sso.example.org\""));
-        assert!(upgraded_cfg.contains("enabled = [\"oidc_sso\"]"));
-
-        let db = ctx.connect_db(&paths).await.unwrap();
-        let stored = fetch_stored_options(&db, None).await.unwrap();
-        assert!(!stored.contains_key(&("server".to_string(), "display_name".to_string())));
-        assert_eq!(
-            stored[&("server".to_string(), "name".to_string())].value,
-            serde_json::json!("Old Core Name")
-        );
-        assert_eq!(
-            stored[&("server".to_string(), "removed_core_opt".to_string())].value,
-            serde_json::json!("keep-core")
-        );
-        assert_eq!(
-            stored[&("identity.oidc".to_string(), "client_id".to_string())].value,
-            serde_json::json!("oidc-keep")
-        );
-    }
 }

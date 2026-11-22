@@ -3,9 +3,8 @@
 use serde::Serialize;
 use serde_json::Value;
 use crate::core::error::{CfmsError, Result};
-use crate::core::paths::WorkspacePaths;
 use crate::db::backend::DbPool;
-use crate::db::options::{OptionsSchemaRegistry, list_options};
+use crate::db::options::list_options;
 
 pub const AUDIT_RETENTION_NAMESPACE: &str = "maintenance.audit_retention";
 pub const DEFAULT_RETENTION_DAYS: u64 = 365;
@@ -31,12 +30,8 @@ impl Default for AuditRetentionPolicy {
 
 impl AuditRetentionPolicy {
     /// Load and validate `maintenance.audit_retention` from the `options` table.
-    pub async fn load(pool: &DbPool, paths: Option<&WorkspacePaths>) -> Result<Self> {
-        let registry = match paths {
-            Some(p) => OptionsSchemaRegistry::from_workspace(p, None)?,
-            None => OptionsSchemaRegistry::empty(),
-        };
-        let records = list_options(pool, &registry, Some(AUDIT_RETENTION_NAMESPACE)).await?;
+    pub async fn load(pool: &DbPool) -> Result<Self> {
+        let records = list_options(pool, Some(AUDIT_RETENTION_NAMESPACE)).await?;
         let mut policy = Self::default();
 
         for rec in records {
@@ -117,10 +112,9 @@ mod tests {
     #[tokio::test]
     async fn retention_policy_defaults_and_db_overrides() {
         let pool = setup_memory_db().await;
-        let defaults = AuditRetentionPolicy::load(&pool, None).await.unwrap();
+        let defaults = AuditRetentionPolicy::load(&pool).await.unwrap();
         assert_eq!(defaults, AuditRetentionPolicy::default());
 
-        let registry = OptionsSchemaRegistry::empty();
         let mut updates = BTreeMap::new();
         updates.insert(
             "retention_days".to_string(),
@@ -136,11 +130,11 @@ mod tests {
                 expected_revision: 0,
             },
         );
-        write_options_batch(&pool, &registry, AUDIT_RETENTION_NAMESPACE, updates)
+        write_options_batch(&pool, AUDIT_RETENTION_NAMESPACE, updates)
             .await
             .unwrap();
 
-        let loaded = AuditRetentionPolicy::load(&pool, None).await.unwrap();
+        let loaded = AuditRetentionPolicy::load(&pool).await.unwrap();
         assert_eq!(loaded.retention_days, 90);
         assert_eq!(loaded.batch_size, 250);
     }
@@ -158,7 +152,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = AuditRetentionPolicy::load(&pool, None).await.unwrap_err();
+        let err = AuditRetentionPolicy::load(&pool).await.unwrap_err();
         assert!(matches!(err, CfmsError::Config(_)));
 
         sqlx::query(
@@ -171,7 +165,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err2 = AuditRetentionPolicy::load(&pool, None).await.unwrap_err();
+        let err2 = AuditRetentionPolicy::load(&pool).await.unwrap_err();
         assert!(matches!(err2, CfmsError::Config(_)));
     }
 }

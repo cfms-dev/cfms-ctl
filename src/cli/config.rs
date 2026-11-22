@@ -22,9 +22,9 @@ pub struct ConfigSyncTemplateArgs {
     #[arg(long = "template", value_name = "FILE")]
     pub template: Option<PathBuf>,
 
-    /// Optional core configuration contract JSON or `release-manifest.json` path.
-    #[arg(long = "contract", value_name = "FILE")]
-    pub contract: Option<PathBuf>,
+    /// Optional base template (previous `config.toml.sample`) to perform a 3-way merge.
+    #[arg(long = "base", value_name = "FILE")]
+    pub base: Option<PathBuf>,
 
     /// Report whether synchronization is needed without modifying `config.toml` (exits 1 if dirty).
     #[arg(long = "check")]
@@ -47,14 +47,11 @@ pub enum OptionsCommand {
     /// Read a single stored setting and its revision without loading extension code.
     Get(OptionsGetArgs),
 
-    /// Set a single core option value from a JSON file using optimistic concurrency (`--expected-revision`).
+    /// Set a single option value from a JSON file using optimistic concurrency (`--expected-revision`).
     Set(OptionsSetArgs),
 
-    /// Atomically update multiple keys in a core namespace from a JSON file.
+    /// Atomically update multiple keys in a namespace from a JSON file.
     SetMany(OptionsSetManyArgs),
-
-    /// Reset a core setting to its contract default value using its expected revision.
-    Reset(OptionsResetArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -62,10 +59,6 @@ pub struct OptionsListArgs {
     /// Filter options by namespace (e.g. `security.password`).
     #[arg(long = "namespace")]
     pub namespace: Option<String>,
-
-    /// Optional core configuration contract JSON or `release-manifest.json` path.
-    #[arg(long = "contract", value_name = "FILE")]
-    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -74,9 +67,6 @@ pub struct OptionsGetArgs {
     pub namespace: String,
     /// Option key (e.g. `name`).
     pub option_key: String,
-    /// Optional core configuration contract JSON or `release-manifest.json` path.
-    #[arg(long = "contract", value_name = "FILE")]
-    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -91,9 +81,6 @@ pub struct OptionsSetArgs {
     /// Expected current revision (0 creates a new entry).
     #[arg(long = "expected-revision")]
     pub expected_revision: u64,
-    /// Optional core configuration contract JSON or `release-manifest.json` path.
-    #[arg(long = "contract", value_name = "FILE")]
-    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -103,21 +90,4 @@ pub struct OptionsSetManyArgs {
     /// Path to JSON file mapping `option_key -> { value, expected_revision }`.
     #[arg(value_name = "PAYLOAD_FILE")]
     pub payload_file: PathBuf,
-    /// Optional core configuration contract JSON or `release-manifest.json` path.
-    #[arg(long = "contract", value_name = "FILE")]
-    pub contract: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct OptionsResetArgs {
-    /// Option namespace.
-    pub namespace: String,
-    /// Option key.
-    pub option_key: String,
-    /// Expected current revision.
-    #[arg(long = "expected-revision")]
-    pub expected_revision: u64,
-    /// Optional core configuration contract JSON or `release-manifest.json` path.
-    #[arg(long = "contract", value_name = "FILE")]
-    pub contract: Option<PathBuf>,
 }

@@ -46,10 +46,6 @@ pub struct ExtensionEnableArgs {
     /// Preview dependency resolution and `config.toml` changes without writing.
     #[arg(long = "dry-run")]
     pub dry_run: bool,
-
-    /// Optional core configuration contract JSON or `release-manifest.json` path used to validate `config.toml` before write.
-    #[arg(long = "contract", value_name = "FILE")]
-    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -61,10 +57,6 @@ pub struct ExtensionDisableArgs {
     /// Preview reverse-dependent closure and `config.toml` changes without writing.
     #[arg(long = "dry-run")]
     pub dry_run: bool,
-
-    /// Optional core configuration contract JSON or `release-manifest.json` path used to validate `config.toml` before write.
-    #[arg(long = "contract", value_name = "FILE")]
-    pub contract: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -126,8 +118,6 @@ mod tests {
             "http_api",
             "oidc_sso",
             "--dry-run",
-            "--contract",
-            "release-manifest.json",
         ])
         .expect("valid extension enable args");
 
@@ -135,10 +125,6 @@ mod tests {
             Commands::Extension(ExtensionCommand::Enable(args)) => {
                 assert_eq!(args.identifiers, vec!["http_api", "oidc_sso"]);
                 assert!(args.dry_run);
-                assert_eq!(
-                    args.contract.as_deref(),
-                    Some(std::path::Path::new("release-manifest.json"))
-                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -164,7 +150,6 @@ mod tests {
             Commands::Extension(ExtensionCommand::Disable(args)) => {
                 assert_eq!(args.identifiers, vec!["oidc_sso"]);
                 assert!(args.dry_run);
-                assert!(args.contract.is_none());
             }
             other => panic!("unexpected command: {other:?}"),
         }

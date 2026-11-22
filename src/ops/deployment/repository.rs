@@ -20,10 +20,10 @@ use super::manifest::{
 };
 use super::models::{
     DeploymentSettings, DeploymentTransaction, IntegrityMismatch, MAX_STATE_BYTES,
-    MAX_STORED_RELEASES, QUARANTINE_DIRNAME, RELEASE_MANIFEST_FILENAME, RELEASE_SUBDIR,
-    REQUIREMENTS_LOCK_FILENAME, ReleaseIntegrityReport, ReleaseManifest, SETTINGS_FILENAME,
-    SETTINGS_FORMAT_VERSION, STATE_DIRNAME, STAGING_DIRNAME, StoredReleaseSummary,
-    TX_JOURNAL_DIRNAME, VERSIONS_DIRNAME, ValidatedManifest,
+    MAX_STORED_RELEASES, RELEASE_MANIFEST_FILENAME, RELEASE_SUBDIR, REQUIREMENTS_LOCK_FILENAME,
+    ReleaseIntegrityReport, ReleaseManifest, SETTINGS_FILENAME, SETTINGS_FORMAT_VERSION,
+    STATE_DIRNAME, STAGING_DIRNAME, StoredReleaseSummary, TX_JOURNAL_DIRNAME, VERSIONS_DIRNAME,
+    ValidatedManifest,
 };
 
 #[derive(Debug, Clone)]
@@ -49,6 +49,8 @@ struct SwapJournalRecord {
     had_previous_manifest: bool,
     #[serde(default)]
     pre_swap_config_backed_up: bool,
+    #[serde(default)]
+    pre_swap_requirements_lock_backed_up: bool,
 }
 
 #[must_use]
@@ -64,11 +66,6 @@ pub fn staging_dir(paths: &WorkspacePaths) -> PathBuf {
 #[must_use]
 pub fn tx_root_dir(paths: &WorkspacePaths) -> PathBuf {
     paths.maintenance_root.join(TX_JOURNAL_DIRNAME)
-}
-
-#[must_use]
-pub fn quarantine_dir(paths: &WorkspacePaths) -> PathBuf {
-    paths.maintenance_root.join(QUARANTINE_DIRNAME)
 }
 
 #[must_use]
@@ -668,58 +665,6 @@ pub fn snapshot_active_release(
     Ok(final_dir)
 }
 
-/// Persist an already-verified release directory (e.g. from staging during upgrade/install)
-/// into `src/.maintenance/versions/<release_id>/release/` when needed (e.g. install / adopt).
-pub fn snapshot_from_verified_tree(
-    paths: &WorkspacePaths,
-    source_tree: &Path,
-    validated: &ValidatedManifest,
-    settings: &DeploymentSettings,
-) -> Result<PathBuf> {
-    let base_versions = versions_dir(paths);
-    fs::create_dir_all(&base_versions)?;
-    let final_dir = base_versions.join(&validated.release_id);
-    if final_dir.exists() {
-        let summary = inspect_stored_release_dir(
-            &validated.release_id,
-            &final_dir,
-            Some(&validated.release_id),
-            true,
-        );
-        if summary.healthy {
-            snapshot_state_into_dir(paths, validated, settings, &final_dir.join(STATE_DIRNAME))?;
-            return Ok(final_dir);
-        }
-        retry_fs_op(|| fs::remove_dir_all(&final_dir))?;
-    }
-
-    let tmp_guard = tempfile::Builder::new()
-        .prefix(".snap-")
-        .tempdir_in(&base_versions)?;
-    let tmp_release = tmp_guard.path().join(RELEASE_SUBDIR);
-    fs::create_dir_all(&tmp_release)?;
-
-    for rel_posix in validated.manifest.files.keys() {
-        let src_file = source_tree.join(rel_posix);
-        let dst_file = tmp_release.join(rel_posix);
-        if let Some(parent) = Path::new(rel_posix).parent()
-            && !parent.as_os_str().is_empty()
-        {
-            ensure_safe_directory_chain(&tmp_release, parent)?;
-        }
-        fs::copy(&src_file, &dst_file)?;
-    }
-    atomic_write(&tmp_release.join(RELEASE_MANIFEST_FILENAME), &validated.raw_bytes)?;
-    snapshot_state_into_dir(paths, validated, settings, &tmp_guard.path().join(STATE_DIRNAME))?;
-
-    let staged_root = tmp_guard.keep();
-    if let Err(err) = retry_fs_op(|| fs::rename(&staged_root, &final_dir)) {
-        let _ = retry_fs_op(|| fs::remove_dir_all(&staged_root));
-        return Err(CfmsError::Io(err));
-    }
-    Ok(final_dir)
-}
-
 fn snapshot_state_into_dir(
     paths: &WorkspacePaths,
     validated: &ValidatedManifest,
@@ -858,6 +803,13 @@ pub fn apply_swap_with_journal(
     } else {
         false
     };
+    let req_lock = requirements_lock_path(paths);
+    let pre_swap_requirements_lock_backed_up = if req_lock.is_file() {
+        fs::copy(&req_lock, backup_dir.join(".requirements.lock.pre-swap"))?;
+        true
+    } else {
+        false
+    };
 
     // Determine which files differ or are new.
     let mut files_to_write = Vec::new();
@@ -924,6 +876,7 @@ pub fn apply_swap_with_journal(
         backed_up_files,
         had_previous_manifest,
         pre_swap_config_backed_up,
+        pre_swap_requirements_lock_backed_up,
     };
     let journal_bytes = serde_json::to_vec_pretty(&journal)
         .map_err(|e| CfmsError::Deployment(format!("Failed serializing swap journal: {e}")))?;
@@ -1013,43 +966,18 @@ pub fn rollback_swap_journal(paths: &WorkspacePaths, journal_dir: &Path) -> Resu
         copy_file_atomic_with_retry(&config_bak, &paths.config_path)?;
     }
 
+    let req_lock_bak = backup_dir.join(".requirements.lock.pre-swap");
+    let req_lock_live = requirements_lock_path(paths);
+    if journal.pre_swap_requirements_lock_backed_up && req_lock_bak.is_file() {
+        copy_file_atomic_with_retry(&req_lock_bak, &req_lock_live)?;
+    } else if !journal.pre_swap_requirements_lock_backed_up && req_lock_live.is_file() {
+        let _ = retry_fs_op(|| fs::remove_file(&req_lock_live));
+    }
+
     Ok(())
 }
 
-/// Restore `src/config.toml` or third-party extensions from `<snapshot>/state/` when explicitly requested,
-/// or quarantine extensions that declare incompatibility with `target_version`.
-pub fn handle_downgrade_extensions(
-    paths: &WorkspacePaths,
-    target_version: &CfmsServerVersion,
-    quarantine_incompatible: bool,
-) -> Result<Vec<String>> {
-    if !quarantine_incompatible || !paths.extensions_root.is_dir() {
-        return Ok(Vec::new());
-    }
-    let catalog = crate::ops::extension::catalog::discover_catalog(&paths.extensions_root)?;
-    let mut quarantined = Vec::new();
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let q_root = quarantine_dir(paths).join(&stamp);
-
-    for ext in catalog.extensions.values() {
-        if ext.builtin {
-            continue;
-        }
-        let compat_res = crate::ops::extension::version::check_server_compatibility(
-            target_version,
-            ext.minimum_server_version.as_ref(),
-            ext.maximum_server_version.as_ref(),
-        );
-        if compat_res.is_err() {
-            fs::create_dir_all(&q_root)?;
-            let dest = q_root.join(&ext.identifier);
-            retry_fs_op(|| fs::rename(&ext.directory, &dest))?;
-            quarantined.push(ext.identifier.clone());
-        }
-    }
-    Ok(quarantined)
-}
-
+/// Restore `src/config.toml` from `<snapshot>/state/` during rollback fallback when the swap journal is missing.
 pub fn restore_snapshot_config(state_dir: &Path, config_dest: &Path) -> Result<bool> {
     let snap_cfg = state_dir.join("config.toml");
     if !snap_cfg.is_file() {
@@ -1057,6 +985,77 @@ pub fn restore_snapshot_config(state_dir: &Path, config_dest: &Path) -> Result<b
     }
     copy_file_atomic_with_retry(&snap_cfg, config_dest)?;
     Ok(true)
+}
+
+/// Remove a specific stored snapshot directory under `src/.maintenance/versions/` if present.
+pub fn remove_stored_release_dir(paths: &WorkspacePaths, release_id: &str) -> Result<()> {
+    let dir = versions_dir(paths).join(release_id);
+    if dir.exists() {
+        retry_fs_op(|| match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        })?;
+    }
+    Ok(())
+}
+
+/// Automatically trim `src/.maintenance/versions/` after an upgrade completes so that at most
+/// `max_inactive_keep` (typically 1) old version snapshot is retained on disk.
+///
+/// Prioritizes keeping `preferred_keep_id` (the just-superseded source release) and never
+/// deletes a release referenced by an active `transaction.json`.
+pub fn auto_prune_versions_keep_limit(
+    paths: &WorkspacePaths,
+    active_release_id: &str,
+    preferred_keep_id: Option<&str>,
+    max_inactive_keep: usize,
+) -> Result<Vec<String>> {
+    let dir = versions_dir(paths);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let tx_source_id = load_transaction(paths)
+        .ok()
+        .flatten()
+        .map(|tx| tx.source_release_id);
+    let all = list_stored_releases(paths, Some(active_release_id), false)?;
+
+    let mut kept_ids: BTreeSet<String> = BTreeSet::new();
+    if let Some(ref tx_src) = tx_source_id {
+        kept_ids.insert(tx_src.clone());
+    }
+
+    let mut kept_inactive = 0usize;
+    if let Some(pref) = preferred_keep_id
+        && pref != active_release_id
+        && all.iter().any(|r| r.release_id == pref && r.healthy)
+        && kept_inactive < max_inactive_keep
+    {
+        kept_ids.insert(pref.to_string());
+        kept_inactive += 1;
+    }
+
+    for rel in &all {
+        if rel.active || kept_ids.contains(&rel.release_id) {
+            continue;
+        }
+        if rel.healthy && kept_inactive < max_inactive_keep {
+            kept_ids.insert(rel.release_id.clone());
+            kept_inactive += 1;
+        }
+    }
+
+    let mut removed = Vec::new();
+    for rel in all {
+        // Also clean up redundant copies of the currently active release inside `versions/`
+        // (unless referenced as an in-flight transaction source), keeping `versions/` strictly for old versions.
+        if !kept_ids.contains(&rel.release_id) {
+            remove_stored_release_dir(paths, &rel.release_id)?;
+            removed.push(rel.release_id);
+        }
+    }
+    Ok(removed)
 }
 
 #[derive(Debug, Clone)]
@@ -1081,6 +1080,7 @@ pub struct PrunePlan {
 pub fn plan_prune(paths: &WorkspacePaths, selector: &PruneSelector) -> Result<PrunePlan> {
     let active_manifest = load_manifest_file(&paths.release_manifest_path)?;
     let active_id = active_manifest.release_id.clone();
+    let tx_source_id = load_transaction(paths)?.map(|tx| tx.source_release_id);
     // Use deep hash checks on stored releases so `--corrupt` or reporting sees real health cleanly.
     let all = list_stored_releases(paths, Some(&active_id), true)?;
 
@@ -1088,10 +1088,18 @@ pub fn plan_prune(paths: &WorkspacePaths, selector: &PruneSelector) -> Result<Pr
     let mut remove = Vec::new();
     let mut keep_ids = Vec::new();
 
+    let is_tx_protected = |id: &str| tx_source_id.as_deref() == Some(id);
+
     match selector {
         PruneSelector::AllInactive => {
             for rel in all {
                 if rel.active {
+                    keep_ids.push(rel.release_id);
+                } else if is_tx_protected(&rel.release_id) {
+                    warnings.push(format!(
+                        "Retained rollback snapshot '{}' referenced by active transaction.json",
+                        rel.release_id
+                    ));
                     keep_ids.push(rel.release_id);
                 } else {
                     if !rel.healthy {
@@ -1110,6 +1118,12 @@ pub fn plan_prune(paths: &WorkspacePaths, selector: &PruneSelector) -> Result<Pr
             for rel in all {
                 if rel.active {
                     keep_ids.push(rel.release_id);
+                } else if is_tx_protected(&rel.release_id) {
+                    warnings.push(format!(
+                        "Retained rollback snapshot '{}' referenced by active transaction.json",
+                        rel.release_id
+                    ));
+                    keep_ids.push(rel.release_id);
                 } else if rel.healthy && healthy_kept < *keep_n {
                     healthy_kept += 1;
                     keep_ids.push(rel.release_id);
@@ -1127,7 +1141,7 @@ pub fn plan_prune(paths: &WorkspacePaths, selector: &PruneSelector) -> Result<Pr
         }
         PruneSelector::CorruptOnly => {
             for rel in all {
-                if rel.active || rel.healthy {
+                if rel.active || rel.healthy || is_tx_protected(&rel.release_id) {
                     keep_ids.push(rel.release_id);
                 } else {
                     remove.push(rel);
@@ -1161,6 +1175,12 @@ pub fn plan_prune(paths: &WorkspacePaths, selector: &PruneSelector) -> Result<Pr
                 if item.active {
                     return Err(CfmsError::Deployment(format!(
                         "Refusing to prune currently active release '{}'",
+                        item.release_id
+                    )));
+                }
+                if is_tx_protected(&item.release_id) {
+                    return Err(CfmsError::Deployment(format!(
+                        "Refusing to prune rollback snapshot '{}' referenced by active transaction.json",
                         item.release_id
                     )));
                 }

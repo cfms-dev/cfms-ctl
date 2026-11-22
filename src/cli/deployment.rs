@@ -31,15 +31,11 @@ pub enum DeploymentCommand {
     /// Stage, verify, migrate, and atomically activate a local release archive (.zip or .tar.gz).
     Upgrade(DeploymentUpgradeArgs),
 
-    /// Download, verify, and activate an official GitHub release when newer or pinned.
+    /// Download, verify, and activate an official GitHub release when newer.
     #[command(disable_version_flag = true)]
     Update(DeploymentUpdateArgs),
 
-    /// Safely downgrade the database and restore a stored historical release.
-    #[command(disable_version_flag = true)]
-    Downgrade(DeploymentDowngradeArgs),
-
-    /// Inspect and finish or roll back an interrupted deployment transaction (`transaction.json`).
+    /// Inspect, continue forward, or explicitly roll back an interrupted deployment upgrade (`transaction.json`).
     Resume(DeploymentResumeArgs),
 
     /// Remove inactive historical snapshots under `src/.maintenance/versions`.
@@ -198,39 +194,9 @@ pub struct DeploymentUpdateArgs {
     pub dry_run: bool,
 }
 
-#[derive(Debug, Clone, Args)]
-pub struct DeploymentDowngradeArgs {
-    /// Stored release SHA-256 ID or unambiguous hex prefix.
-    #[arg(value_name = "RELEASE_ID", required_unless_present = "version")]
-    pub release_id: Option<String>,
-
-    /// Look up the stored historical release by version (e.g. `0.14.0`) instead of release ID.
-    #[arg(long = "version", value_name = "VERSION", conflicts_with = "release_id")]
-    pub version: Option<String>,
-
-    /// Replace `src/config.toml` byte-for-byte with the stored snapshot instead of template-syncing live config.
-    #[arg(long = "restore-snapshot-config")]
-    pub restore_snapshot_config: bool,
-
-    /// Move incompatible or post-upgrade third-party extensions into `src/.maintenance/quarantine/` instead of leaving them in place.
-    #[arg(long = "quarantine-extensions")]
-    pub quarantine_extensions: bool,
-
-    /// Skip `uv sync` / `uv pip install` execution during downgrade.
-    #[arg(long = "skip-env")]
-    pub skip_env: bool,
-
-    #[command(flatten)]
-    pub backup: SafetyBackupArgs,
-
-    /// Preflight Alembic downgrade, config delta, and extension impacts without mutating disk or DB.
-    #[arg(long = "dry-run")]
-    pub dry_run: bool,
-}
-
 #[derive(Debug, Clone, Default, Args)]
 pub struct DeploymentResumeArgs {
-    /// Roll back to the recorded source release where safely possible instead of continuing forward.
+    /// Abort the interrupted upgrade, undo in-flight database modifications, and restore the source release.
     #[arg(long = "rollback", conflicts_with_all = ["continue_forward", "abort_clear"])]
     pub rollback: bool,
 
@@ -374,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_upgrade_update_downgrade_prune_and_install() {
+    fn parses_upgrade_update_prune_and_install_and_rejects_downgrade() {
         let cli = Cli::try_parse_from([
             "cfms-ctl",
             "deployment",
@@ -397,23 +363,11 @@ mod tests {
             other => panic!("unexpected parsed command: {other:?}"),
         }
 
-        let cli = Cli::try_parse_from([
-            "cfms-ctl",
-            "deployment",
-            "downgrade",
-            "--version",
-            "0.14.0",
-            "--restore-snapshot-config",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Deployment(DeploymentCommand::Downgrade(args)) => {
-                assert!(args.release_id.is_none());
-                assert_eq!(args.version.as_deref(), Some("0.14.0"));
-                assert!(args.restore_snapshot_config);
-            }
-            other => panic!("unexpected parsed command: {other:?}"),
-        }
+        assert!(
+            Cli::try_parse_from(["cfms-ctl", "deployment", "downgrade", "--version", "0.14.0"])
+                .is_err(),
+            "downgrade subcommand must be removed"
+        );
 
         let cli = Cli::try_parse_from(["cfms-ctl", "deployment", "prune", "--keep", "2"]).unwrap();
         assert!(matches!(

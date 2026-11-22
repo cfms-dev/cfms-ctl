@@ -7,7 +7,7 @@ Built in Rust (Edition 2024), `cfms-ctl` manages the full operational lifecycle 
 ## Features
 
 - **Multi-database backend support**: Native `sqlx` + `sea-query` support for SQLite, MySQL, and PostgreSQL.
-- **Packaged deployment lifecycle**: Cold-install, adopt, verify, upgrade, online-update from GitHub Releases, downgrade, resume interrupted transactions, and prune historical snapshots.
+- **Packaged deployment lifecycle**: Cold-install, adopt, verify, upgrade (with lossless 3-way `config.toml` merge and strict no-downgrade enforcement), online-update from GitHub Releases, resume or abort interrupted transactions (with pre-migration rollback snapshots), and prune temporary rollback snapshots.
 - **Hybrid schema engine**: Inspect schema drift, diff schemas, render risk-annotated SQL/Alembic scripts, run hybrid Python + static-AST + native Rust upgrades, and migrate databases across engines.
 - **Encrypted logical backups**: Export, inspect, verify, and restore streaming `.confbak` (`CFMSCBK2`) archives compressed with Zstd and encrypted with HKDF-SHA256 + chunked AES-256-GCM.
 - **Safe, lock-aware operations**: Respects `src/.maintenance/server.lock` and `src/.maintenance/transaction.json`, performs atomic writes, and provides `--dry-run` previews on mutating workflows.
@@ -71,10 +71,10 @@ cfms-ctl backup verify ./backup.confbak --key-file ./backup.key
 | Command | Subcommands / Flags | Summary |
 | --- | --- | --- |
 | `doctor` | `[--skip-db]` | Run workspace, `config.toml`, runtime lock, and database schema diagnostics |
-| `deployment` | `status`, `verify`, `check`, `install`, `adopt`, `upgrade`, `update`, `downgrade`, `resume`, `prune` | Manage packaged CFMS releases, snapshots, `uv` environment sync, and recovery |
+| `deployment` | `status`, `verify`, `check`, `install`, `adopt`, `upgrade`, `update`, `resume`, `prune` | Manage packaged CFMS releases, temporary rollback snapshots, `uv` environment sync, and recovery |
 | `database` | `status`, `check`, `upgrade`, `diff`, `export-ir`, `migrate`, `stamp` | Inspect schema drift, diff/render DDL or Alembic scripts, upgrade, and migrate engines |
 | `backup` | `export`, `import`, `info`, `verify` | Create, inspect, cryptographically verify, and restore encrypted `.confbak` backups |
-| `config` | `sync-template`, `fill-pepper`, `options` (`list`, `get`, `set`, `set-many`, `reset`) | Losslessly sync `config.toml`, initialize `security.pepper`, and edit DB `options` |
+| `config` | `sync-template`, `fill-pepper`, `options` (`list`, `get`, `set`, `set-many`) | Losslessly sync or 3-way merge `config.toml`, initialize `security.pepper`, and edit DB `options` |
 | `extension` | `list`, `info`, `install`, `upgrade`, `enable`, `disable`, `uninstall`, `purge-data` | Manage built-in and third-party extensions declaratively via `manifest.toml` |
 | `user` | `reset-password`, `rotate-secrets`, `clear-totp` | Reset Argon2id passwords, rotate user signing keys, and clear TOTP credentials |
 | `permission` | `purge-expired`, `sync-defaults` | Prune expired permission entries and restore default `user` / `sysop` group rules |

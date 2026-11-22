@@ -15,7 +15,7 @@ use crate::cli::extension::{
     ExtensionPackageArgs, ExtensionPurgeDataArgs, ExtensionUninstallArgs,
 };
 use crate::core::atomic::atomic_write;
-use crate::core::{CfmsError, CoreConfigContract, Result, RuntimeLock, WorkspacePaths};
+use crate::core::{CfmsError, Result, RuntimeLock, WorkspacePaths};
 use crate::ops::AppContext;
 use crate::ui::{CommandReport, KeyValueTable, OutputFormat, UiConsole, confirm_or_abort, styled_table};
 use catalog::{
@@ -746,31 +746,17 @@ fn handle_info(ctx: &AppContext, args: ExtensionIdentifierArgs) -> Result<()> {
 
 fn handle_enable(ctx: &AppContext, args: ExtensionEnableArgs) -> Result<()> {
     let paths = ctx.resolve_paths()?;
-    let contract = CoreConfigContract::from_workspace(&paths, args.contract.as_deref())?;
     let config_doc = ctx.load_config(&paths)?;
     let catalog = discover_catalog(&paths.extensions_root)?;
-    let plan = plan_enable(
-        &catalog,
-        &config_doc,
-        &paths,
-        &args.identifiers,
-        contract.as_ref().map(|(c, _)| c),
-    )?;
+    let plan = plan_enable(&catalog, &config_doc, &paths, &args.identifiers)?;
     execute_toggle_plan(ctx, &paths, plan, args.dry_run)
 }
 
 fn handle_disable(ctx: &AppContext, args: ExtensionDisableArgs) -> Result<()> {
     let paths = ctx.resolve_paths()?;
-    let contract = CoreConfigContract::from_workspace(&paths, args.contract.as_deref())?;
     let config_doc = ctx.load_config(&paths)?;
     let catalog = discover_catalog(&paths.extensions_root)?;
-    let plan = plan_disable(
-        &catalog,
-        &config_doc,
-        &paths,
-        &args.identifiers,
-        contract.as_ref().map(|(c, _)| c),
-    )?;
+    let plan = plan_disable(&catalog, &config_doc, &paths, &args.identifiers)?;
     execute_toggle_plan(ctx, &paths, plan, args.dry_run)
 }
 
@@ -897,17 +883,9 @@ fn handle_upgrade(ctx: &AppContext, args: ExtensionPackageArgs) -> Result<()> {
     let config_doc = ctx.load_config(&paths)?;
     let catalog = discover_catalog(&paths.extensions_root)?;
     let managed = read_managed_extensions(&paths)?;
-    let contract = CoreConfigContract::from_workspace(&paths, None)?;
 
     let mut opened = OpenedExtensionPackage::open_and_verify(&args.package, args.sha256.as_deref())?;
-    let plan = plan_upgrade(
-        &opened.summary,
-        &catalog,
-        &config_doc,
-        &paths,
-        &managed,
-        contract.as_ref().map(|(c, _)| c),
-    )?;
+    let plan = plan_upgrade(&opened.summary, &catalog, &config_doc, &paths, &managed)?;
 
     let mut report = ExtensionUpgradeReport {
         identifier: plan.identifier.clone(),
@@ -966,7 +944,6 @@ async fn handle_uninstall(ctx: &AppContext, args: ExtensionUninstallArgs) -> Res
     let config_doc = ctx.load_config(&paths)?;
     let catalog = discover_catalog(&paths.extensions_root)?;
     let managed = read_managed_extensions(&paths)?;
-    let contract = CoreConfigContract::from_workspace(&paths, None)?;
 
     let plan = plan_uninstall(
         &args.identifier,
@@ -974,7 +951,6 @@ async fn handle_uninstall(ctx: &AppContext, args: ExtensionUninstallArgs) -> Res
         &catalog,
         &config_doc,
         &managed,
-        contract.as_ref().map(|(c, _)| c),
     )?;
 
     let mut warnings = plan.warnings.clone();
@@ -1429,7 +1405,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: true,
-                contract: None,
             }),
         )
         .await
@@ -1445,7 +1420,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: false,
-                contract: None,
             }),
         )
         .await
@@ -1465,7 +1439,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["http_api".to_string()],
                 dry_run: false,
-                contract: None,
             }),
         )
         .await
@@ -1492,7 +1465,6 @@ mod tests {
             ExtensionCommand::Disable(ExtensionDisableArgs {
                 identifiers: vec!["oidc_sso".to_string()],
                 dry_run: false,
-                contract: None,
             }),
         )
         .await
@@ -1566,7 +1538,7 @@ mod tests {
 
         let catalog = discover_catalog(&paths.extensions_root).expect("catalog");
         let doc = ctx.load_config(&paths).expect("load");
-        let plan = plan_enable(&catalog, &doc, &paths, &["oidc_sso".to_string()], None)
+        let plan = plan_enable(&catalog, &doc, &paths, &["oidc_sso".to_string()])
             .expect("enable plan");
         assert!(plan.changed);
         let backup = plan.candidate_doc.save_with_backup().expect("save");
@@ -1589,7 +1561,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["oidc_sso".to_string()],
                 dry_run: false,
-                contract: None,
             }),
         )
         .await
@@ -1601,7 +1572,6 @@ mod tests {
             ExtensionCommand::Disable(ExtensionDisableArgs {
                 identifiers: vec!["typo_extension".to_string()],
                 dry_run: false,
-                contract: None,
             }),
         )
         .await
@@ -1624,69 +1594,6 @@ mod tests {
                 .expect("read")
                 .contains("# no [extensions] section initially")
         );
-    }
-
-    #[tokio::test]
-    async fn enable_validates_core_config_contract_before_writing() {
-        use crate::core::{CORE_CONFIG_CONTRACT_VERSION, DRAFT_2020_12_DIALECT};
-
-        let dir = setup_workspace(
-            "[security]\npepper = \"abc\"\n[database]\ntype = \"sqlite\"\nfile = \"app.db\"\n[extensions]\nenabled = []\n",
-        );
-        let contract_path = dir.path().join("contract.json");
-        let contract = CoreConfigContract {
-            contract_version: CORE_CONFIG_CONTRACT_VERSION.to_string(),
-            core_version: "0.14.0".to_string(),
-            schema_dialect: DRAFT_2020_12_DIALECT.to_string(),
-            toml: serde_json::json!({
-                "$schema": DRAFT_2020_12_DIALECT,
-                "type": "object",
-                "properties": {
-                    "extensions": {
-                        "type": "object",
-                        "x-unmanaged-subtables": true,
-                        "additionalProperties": { "type": "object" },
-                        "properties": {
-                            "enabled": {
-                                "type": "array",
-                                "maxItems": 1
-                            }
-                        }
-                    }
-                }
-            }),
-            options: serde_json::json!({
-                "$schema": DRAFT_2020_12_DIALECT,
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {}
-            }),
-        };
-        std::fs::write(
-            &contract_path,
-            serde_json::to_vec_pretty(&contract).expect("serialize contract"),
-        )
-        .expect("write contract");
-
-        let cfg_path = dir.path().join("src").join("config.toml");
-        let original = std::fs::read_to_string(&cfg_path).expect("read");
-        let ctx = test_ctx(dir.path(), OutputFormat::Human, true);
-
-        // Enabling `http_api` adds ["oidc_sso", "http_api"] (2 items) which violates maxItems: 1
-        let err = handle(
-            &ctx,
-            ExtensionCommand::Enable(ExtensionEnableArgs {
-                identifiers: vec!["http_api".to_string()],
-                dry_run: false,
-                contract: Some(contract_path),
-            }),
-        )
-        .await
-        .expect_err("contract validation failure aborts before write");
-        let msg = err.to_string();
-        assert!(msg.contains("Schema validation failed"), "unexpected error: {msg}");
-        assert!(msg.contains("extensions.enabled"), "unexpected error: {msg}");
-        assert_eq!(std::fs::read_to_string(&cfg_path).expect("read"), original);
     }
 
     fn write_test_zip(pkg_path: &Path, manifest: &str, extra_files: &[(&str, &[u8])]) {
@@ -1823,7 +1730,6 @@ mod tests {
             ExtensionCommand::Enable(ExtensionEnableArgs {
                 identifiers: vec!["consumer_ext".to_string()],
                 dry_run: false,
-                contract: None,
             }),
         )
         .await
@@ -2112,7 +2018,6 @@ mod tests {
             ExtensionCommand::Disable(ExtensionDisableArgs {
                 identifiers: vec!["oidc_sso".to_string()],
                 dry_run: false,
-                contract: None,
             }),
         )
         .await

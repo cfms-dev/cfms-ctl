@@ -65,10 +65,6 @@ pub struct PermissionPurgeExpiredArgs {
     #[arg(long = "batch-size", value_name = "COUNT")]
     pub batch_size: Option<usize>,
 
-    /// Optional core configuration contract JSON or `release-manifest.json` path.
-    #[arg(long = "contract", value_name = "FILE")]
-    pub contract: Option<PathBuf>,
-
     /// Show eligible expired permission entries without deleting them.
     #[arg(long = "dry-run")]
     pub dry_run: bool,

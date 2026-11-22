@@ -405,7 +405,7 @@ pub async fn inspect_audit(ctx: &AppContext, args: &AuditInspectArgs) -> Result<
     let pool = ctx.connect_db(&paths).await?;
     preflight_audit_schema(&pool).await?;
 
-    let policy = AuditRetentionPolicy::load(&pool, Some(&paths)).await?;
+    let policy = AuditRetentionPolicy::load(&pool).await?;
     let filter = ResolvedAuditFilter::from_args(
         &args.filter,
         args.all,
@@ -448,7 +448,7 @@ pub async fn export_audit(ctx: &AppContext, args: &AuditExportArgs) -> Result<Au
     let policy = if args.all || args.filter.before.is_some() {
         None
     } else {
-        Some(AuditRetentionPolicy::load(&pool, Some(&paths)).await?)
+        Some(AuditRetentionPolicy::load(&pool).await?)
     };
     let filter = ResolvedAuditFilter::from_args(
         &args.filter,
@@ -515,7 +515,7 @@ pub async fn purge_audit(ctx: &AppContext, args: &AuditPurgeArgs) -> Result<Audi
     let pool = ctx.connect_db(&paths).await?;
     preflight_audit_schema(&pool).await?;
 
-    let policy = AuditRetentionPolicy::load(&pool, Some(&paths)).await?;
+    let policy = AuditRetentionPolicy::load(&pool).await?;
     let filter = ResolvedAuditFilter::from_args(
         &args.filter,
         false,
@@ -747,7 +747,7 @@ mod tests {
     use crate::core::lock::RuntimeLock;
     use crate::core::paths::WorkspacePaths;
     use crate::db::backend::DbPool;
-    use crate::db::options::{OptionUpdateInput, OptionsSchemaRegistry, write_options_batch};
+    use crate::db::options::{OptionUpdateInput, write_options_batch};
     use crate::db::schema::LATEST_SCHEMA_REVISION;
     use crate::db::schema::ddl::{create_head_schema, set_alembic_version};
     use serde_json::{Value, json};
@@ -970,7 +970,6 @@ mod tests {
         assert!(!all_filtered.warnings.is_empty());
 
         // Inspect using `--after` + `retention_days = 1` DB option (verifies no premature dummy-policy error!)
-        let registry = OptionsSchemaRegistry::empty();
         let mut updates = BTreeMap::new();
         updates.insert(
             "retention_days".to_string(),
@@ -979,7 +978,7 @@ mod tests {
                 expected_revision: 0,
             },
         );
-        write_options_batch(&env.pool, &registry, "maintenance.audit_retention", updates)
+        write_options_batch(&env.pool, "maintenance.audit_retention", updates)
             .await
             .unwrap();
         let mut f_window = empty_filter();
@@ -1005,7 +1004,7 @@ mod tests {
                 expected_revision: 1,
             },
         );
-        write_options_batch(&env.pool, &registry, "maintenance.audit_retention", restore)
+        write_options_batch(&env.pool, "maintenance.audit_retention", restore)
             .await
             .unwrap();
 
@@ -1072,7 +1071,6 @@ mod tests {
         let expired_ts = now - 500.0 * 86_400.0;
 
         // Configure batch_size = 2000 (> SQLite 999 host param cap) & retention_days = 365
-        let registry = OptionsSchemaRegistry::empty();
         let mut updates = BTreeMap::new();
         updates.insert(
             "batch_size".to_string(),
@@ -1081,7 +1079,7 @@ mod tests {
                 expected_revision: 0,
             },
         );
-        write_options_batch(&env.pool, &registry, "maintenance.audit_retention", updates)
+        write_options_batch(&env.pool, "maintenance.audit_retention", updates)
             .await
             .unwrap();
 

@@ -1,16 +1,13 @@
 //! Retention policy loading, CLI override resolution, and authoritative database UTC clock
 //! for `cfms-ctl permission purge-expired`.
 
-use std::path::Path;
-
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::cli::permission::PermissionPurgeExpiredArgs;
 use crate::core::error::{CfmsError, Result};
-use crate::core::paths::WorkspacePaths;
 use crate::db::backend::DbPool;
-use crate::db::options::{OptionsSchemaRegistry, list_options};
+use crate::db::options::list_options;
 use crate::ops::audit::filter::{format_unix_utc, parse_iso8601_timestamp};
 use crate::ops::audit::policy::SECONDS_PER_DAY;
 
@@ -127,7 +124,6 @@ pub async fn database_now(pool: &DbPool) -> Result<f64> {
 /// Resolve effective cutoff and batch size from CLI arguments overlaid on DB `options`.
 pub async fn resolve_purge_config(
     pool: &DbPool,
-    paths: Option<&WorkspacePaths>,
     args: &PermissionPurgeExpiredArgs,
 ) -> Result<ResolvedPurgeConfig> {
     let explicit_before = validate_purge_args(args)?;
@@ -135,14 +131,7 @@ pub async fn resolve_purge_config(
     let need_db_batch = args.batch_size.is_none();
 
     let db_policy = if need_db_retention || need_db_batch {
-        load_db_policy(
-            pool,
-            paths,
-            args.contract.as_deref(),
-            need_db_retention,
-            need_db_batch,
-        )
-        .await?
+        load_db_policy(pool, need_db_retention, need_db_batch).await?
     } else {
         PermissionRetentionPolicy::default()
     };
@@ -187,16 +176,10 @@ pub async fn resolve_purge_config(
 
 async fn load_db_policy(
     pool: &DbPool,
-    paths: Option<&WorkspacePaths>,
-    explicit_contract: Option<&Path>,
     validate_retention: bool,
     validate_batch: bool,
 ) -> Result<PermissionRetentionPolicy> {
-    let registry = match paths {
-        Some(p) => OptionsSchemaRegistry::from_workspace(p, explicit_contract)?,
-        None => OptionsSchemaRegistry::empty(),
-    };
-    let records = list_options(pool, &registry, Some(PERMISSION_RETENTION_NAMESPACE)).await?;
+    let records = list_options(pool, Some(PERMISSION_RETENTION_NAMESPACE)).await?;
     let mut policy = PermissionRetentionPolicy::default();
 
     for rec in records {
@@ -277,7 +260,6 @@ mod tests {
             retention_days: None,
             scope: PermissionScope::All,
             batch_size: None,
-            contract: None,
             dry_run: true,
         }
     }
@@ -288,7 +270,7 @@ mod tests {
         let now = database_now(&pool).await.unwrap();
         assert!(now > 1_700_000_000.0);
 
-        let default_cfg = resolve_purge_config(&pool, None, &base_args()).await.unwrap();
+        let default_cfg = resolve_purge_config(&pool, &base_args()).await.unwrap();
         assert_eq!(default_cfg.cutoff_source, CutoffSource::DbPolicy);
         assert_eq!(default_cfg.retention_days, Some(30));
         assert_eq!(default_cfg.batch_size, 500);
@@ -297,7 +279,6 @@ mod tests {
                 < 1e-3
         );
 
-        let registry = OptionsSchemaRegistry::empty();
         let mut updates = BTreeMap::new();
         updates.insert(
             "retention_days".to_string(),
@@ -313,18 +294,18 @@ mod tests {
                 expected_revision: 0,
             },
         );
-        write_options_batch(&pool, &registry, PERMISSION_RETENTION_NAMESPACE, updates)
+        write_options_batch(&pool, PERMISSION_RETENTION_NAMESPACE, updates)
             .await
             .unwrap();
 
-        let db_cfg = resolve_purge_config(&pool, None, &base_args()).await.unwrap();
+        let db_cfg = resolve_purge_config(&pool, &base_args()).await.unwrap();
         assert_eq!(db_cfg.retention_days, Some(7));
         assert_eq!(db_cfg.batch_size, 120);
 
         let mut cli_args = base_args();
         cli_args.retention_days = Some(0);
         cli_args.batch_size = Some(42);
-        let cli_cfg = resolve_purge_config(&pool, None, &cli_args).await.unwrap();
+        let cli_cfg = resolve_purge_config(&pool, &cli_args).await.unwrap();
         assert_eq!(cli_cfg.cutoff_source, CutoffSource::CliRetentionDays);
         assert_eq!(cli_cfg.retention_days, Some(0));
         assert_eq!(cli_cfg.batch_size, 42);
@@ -336,7 +317,7 @@ mod tests {
 
         let mut future_args = base_args();
         future_args.before = Some("2099-01-01T00:00:00Z".to_string());
-        let future_err = resolve_purge_config(&pool, None, &future_args).await.unwrap_err();
+        let future_err = resolve_purge_config(&pool, &future_args).await.unwrap_err();
         assert!(matches!(future_err, CfmsError::InvalidArgument(_)));
 
         let DbPool::Sqlite(ref sq) = pool else { unreachable!() };
@@ -347,13 +328,13 @@ mod tests {
         .await
         .unwrap();
 
-        let bad_db_err = resolve_purge_config(&pool, None, &base_args()).await.unwrap_err();
+        let bad_db_err = resolve_purge_config(&pool, &base_args()).await.unwrap_err();
         assert!(matches!(bad_db_err, CfmsError::Config(_)));
 
         // Explicit CLI --before bypasses broken stored DB retention_days
         let mut rescue_args = base_args();
         rescue_args.before = Some("2025-01-01T00:00:00Z".to_string());
-        let rescued = resolve_purge_config(&pool, None, &rescue_args).await.unwrap();
+        let rescued = resolve_purge_config(&pool, &rescue_args).await.unwrap();
         assert_eq!(rescued.cutoff_source, CutoffSource::CliBefore);
     }
 

@@ -68,7 +68,7 @@ pub enum Commands {
     /// Run comprehensive health, configuration, lock, and database schema diagnostics.
     Doctor(doctor::DoctorArgs),
 
-    /// Check, upgrade, update, downgrade, resume, and prune packaged CFMS deployments.
+    /// Check, install, adopt, upgrade, update, resume, and prune packaged CFMS deployments.
     #[command(subcommand)]
     Deployment(deployment::DeploymentCommand),
 

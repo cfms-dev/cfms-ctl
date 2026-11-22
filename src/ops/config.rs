@@ -9,12 +9,10 @@ use serde::Serialize;
 use serde_json::Value;
 use toml_edit::{Item, Table, Value as TomlValue, value};
 use crate::cli::config::{ConfigCommand, ConfigSyncTemplateArgs, OptionsCommand};
-use crate::core::{
-    CfmsError, ConfigDocument, CoreConfigContract, RenamedPathRecord, Result,
-};
+use crate::core::{CfmsError, ConfigDocument, ConfigMergeConflict, Result};
 use crate::db::{
-    OptionUpdateInput, OptionsSchemaRegistry, ResolvedOptionRecord, get_option, list_options,
-    reset_option, validate_option_key, write_options_batch,
+    OptionUpdateInput, ResolvedOptionRecord, get_option, list_options, validate_option_key,
+    write_options_batch,
 };
 use crate::ops::AppContext;
 use crate::ui::{
@@ -57,35 +55,34 @@ impl CommandReport for PepperFillReport {
 pub struct ConfigSyncReport {
     pub config_path: String,
     pub template_path: String,
-    pub contract_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_template_path: Option<String>,
     pub check_only: bool,
     pub changed: bool,
-    pub renamed_paths: Vec<RenamedPathRecord>,
     pub added_paths: Vec<String>,
+    pub updated_paths: Vec<String>,
     pub removed_paths: Vec<String>,
     pub preserved_paths: Vec<String>,
-    pub preserved_unknown_core_paths: Vec<String>,
+    pub conflicts: Vec<ConfigMergeConflict>,
     pub warnings: Vec<String>,
     pub backup_path: Option<String>,
 }
 
 impl CommandReport for ConfigSyncReport {
     fn render_human(&self, ui: &UiConsole) {
-        if !self.renamed_paths.is_empty()
-            || !self.added_paths.is_empty()
+        if !self.added_paths.is_empty()
+            || !self.updated_paths.is_empty()
             || !self.removed_paths.is_empty()
             || !self.preserved_paths.is_empty()
+            || !self.conflicts.is_empty()
         {
             ui.print_section("Configuration Template Sync");
             let mut table = styled_table(&["Change", "Configuration Path"]);
-            for r in &self.renamed_paths {
-                table.add_row(vec![
-                    Cell::new("Rename").fg(Color::Yellow),
-                    Cell::new(format!("{} -> {}", r.from, r.to)),
-                ]);
-            }
             for path in &self.added_paths {
                 table.add_row(vec![Cell::new("Add").fg(Color::Green), Cell::new(path)]);
+            }
+            for path in &self.updated_paths {
+                table.add_row(vec![Cell::new("Update").fg(Color::Yellow), Cell::new(path)]);
             }
             for path in &self.removed_paths {
                 table.add_row(vec![Cell::new("Remove").fg(Color::Red), Cell::new(path)]);
@@ -94,6 +91,12 @@ impl CommandReport for ConfigSyncReport {
                 table.add_row(vec![
                     Cell::new("Preserve").fg(Color::Cyan),
                     Cell::new(path),
+                ]);
+            }
+            for conflict in &self.conflicts {
+                table.add_row(vec![
+                    Cell::new("Conflict").fg(Color::Magenta),
+                    Cell::new(format!("{} ({})", conflict.path, conflict.kind)),
                 ]);
             }
             println!("{table}");
@@ -335,29 +338,33 @@ fn handle_sync_template(ctx: &AppContext, args: ConfigSyncTemplateArgs) -> Resul
         )));
     }
 
-    let contract = CoreConfigContract::from_workspace(&paths, args.contract.as_deref())?;
-    let contract_source = contract.as_ref().map(|(_, s)| s.clone());
-
     let mut current_doc = ctx.load_config(&paths)?;
     let template_doc = ConfigDocument::load(&template_path)?;
-    let plan = current_doc.sync_with_contract(
-        &template_doc,
-        &args.remove,
-        args.prune,
-        contract.as_ref().map(|(c, _)| c),
-    )?;
+    let plan = if let Some(explicit_base) = &args.base {
+        let base_path = paths.resolve_file_override(explicit_base);
+        if !base_path.is_file() {
+            return Err(CfmsError::Config(format!(
+                "Base configuration template not found: '{}'",
+                base_path.display()
+            )));
+        }
+        let base_doc = ConfigDocument::load(&base_path)?;
+        current_doc.merge_three_way(&base_doc, &template_doc, &args.remove, args.prune)?
+    } else {
+        current_doc.sync_with_template(&template_doc, &args.remove, args.prune)?
+    };
 
     let mut report = ConfigSyncReport {
         config_path: plan.config_path.display().to_string(),
         template_path: plan.template_path.display().to_string(),
-        contract_source,
+        base_template_path: plan.base_template_path.map(|p| p.display().to_string()),
         check_only: args.check,
         changed: plan.changed,
-        renamed_paths: plan.renamed_paths,
         added_paths: plan.added_paths,
+        updated_paths: plan.updated_paths,
         removed_paths: plan.removed_paths,
         preserved_paths: plan.preserved_paths,
-        preserved_unknown_core_paths: plan.preserved_unknown_core_paths,
+        conflicts: plan.conflicts,
         warnings: plan.warnings,
         backup_path: None,
     };
@@ -368,8 +375,9 @@ fn handle_sync_template(ctx: &AppContext, args: ConfigSyncTemplateArgs) -> Resul
                 report.render_human(&ctx.ui);
             }
             return Err(CfmsError::Config(format!(
-                "config.toml is out of sync with template ({} to add, {} to remove)",
+                "config.toml is out of sync with template ({} to add, {} to update, {} to remove)",
                 report.added_paths.len(),
+                report.updated_paths.len(),
                 report.removed_paths.len()
             )));
         }
@@ -404,10 +412,8 @@ async fn handle_options(ctx: &AppContext, cmd: OptionsCommand) -> Result<()> {
     let paths = ctx.resolve_paths()?;
     match cmd {
         OptionsCommand::List(args) => {
-            let registry =
-                OptionsSchemaRegistry::from_workspace(&paths, args.contract.as_deref())?;
             let pool = ctx.connect_db(&paths).await?;
-            let options = list_options(&pool, &registry, args.namespace.as_deref()).await?;
+            let options = list_options(&pool, args.namespace.as_deref()).await?;
             let report = OptionsListReport {
                 namespace_filter: args.namespace,
                 options,
@@ -416,16 +422,12 @@ async fn handle_options(ctx: &AppContext, cmd: OptionsCommand) -> Result<()> {
             Ok(())
         }
         OptionsCommand::Get(args) => {
-            let registry =
-                OptionsSchemaRegistry::from_workspace(&paths, args.contract.as_deref())?;
             let pool = ctx.connect_db(&paths).await?;
-            let option = get_option(&pool, &registry, &args.namespace, &args.option_key).await?;
+            let option = get_option(&pool, &args.namespace, &args.option_key).await?;
             ctx.ui.render(&OptionItemReport { option });
             Ok(())
         }
         OptionsCommand::Set(args) => {
-            let registry =
-                OptionsSchemaRegistry::from_workspace(&paths, args.contract.as_deref())?;
             let value = read_single_option_json(&args.payload_file)?;
             let pool = ctx.connect_db(&paths).await?;
             let mut updates = BTreeMap::new();
@@ -436,8 +438,7 @@ async fn handle_options(ctx: &AppContext, cmd: OptionsCommand) -> Result<()> {
                     expected_revision: args.expected_revision,
                 },
             );
-            let mut updated =
-                write_options_batch(&pool, &registry, &args.namespace, updates).await?;
+            let mut updated = write_options_batch(&pool, &args.namespace, updates).await?;
             let option = updated.remove(&args.option_key).ok_or_else(|| {
                 CfmsError::Database(format!(
                     "Failed to retrieve updated option {}/{}",
@@ -448,32 +449,14 @@ async fn handle_options(ctx: &AppContext, cmd: OptionsCommand) -> Result<()> {
             Ok(())
         }
         OptionsCommand::SetMany(args) => {
-            let registry =
-                OptionsSchemaRegistry::from_workspace(&paths, args.contract.as_deref())?;
             let updates = read_many_options_json(&args.payload_file)?;
             let pool = ctx.connect_db(&paths).await?;
-            let updated =
-                write_options_batch(&pool, &registry, &args.namespace, updates).await?;
+            let updated = write_options_batch(&pool, &args.namespace, updates).await?;
             let report = OptionsBatchReport {
                 namespace: args.namespace,
                 updated,
             };
             ctx.ui.render(&report);
-            Ok(())
-        }
-        OptionsCommand::Reset(args) => {
-            let registry =
-                OptionsSchemaRegistry::from_workspace(&paths, args.contract.as_deref())?;
-            let pool = ctx.connect_db(&paths).await?;
-            let option = reset_option(
-                &pool,
-                &registry,
-                &args.namespace,
-                &args.option_key,
-                args.expected_revision,
-            )
-            .await?;
-            ctx.ui.render(&OptionItemReport { option });
             Ok(())
         }
     }
@@ -620,10 +603,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_template_with_release_manifest_contract_and_options_core_boundary() {
+    async fn test_sync_template_three_way_and_schemaless_options() {
         use crate::cli::GlobalOpts;
         use crate::cli::config::{OptionsGetArgs, OptionsListArgs, OptionsSetArgs};
-        use crate::core::{CORE_CONFIG_CONTRACT_VERSION, DRAFT_2020_12_DIALECT, WorkspacePaths};
+        use crate::core::WorkspacePaths;
         use crate::db::schema::create_head_schema;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -631,9 +614,9 @@ mod tests {
         let src_dir = root.join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
 
-        let template_toml = r#"[database]
+        let base_toml = r#"[database]
 type = "sqlite"
-name = "cfms.db"
+file = "cfms.db"
 
 [security]
 pepper = ""
@@ -641,107 +624,43 @@ pepper = ""
 [server]
 port = 5104
 secret_key = ""
+deprecated_flag = false
 
 [extensions]
 enabled = []
 "#;
-        std::fs::write(src_dir.join("config.toml.sample"), template_toml).unwrap();
+        let new_template_toml = r#"[database]
+type = "sqlite"
+file = "cfms.db"
 
-        let contract = CoreConfigContract {
-            contract_version: CORE_CONFIG_CONTRACT_VERSION.to_string(),
-            core_version: "0.14.0".to_string(),
-            schema_dialect: DRAFT_2020_12_DIALECT.to_string(),
-            toml: json!({
-                "$schema": DRAFT_2020_12_DIALECT,
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["database", "security", "server", "extensions"],
-                "properties": {
-                    "database": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["type"],
-                        "properties": {
-                            "type": { "type": "string", "enum": ["sqlite", "mysql", "postgresql"] },
-                            "name": {
-                                "type": "string",
-                                "minLength": 1,
-                                "x-renamed-from": ["database.db_name"]
-                            }
-                        }
-                    },
-                    "security": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["pepper"],
-                        "properties": {
-                            "pepper": { "type": "string" }
-                        }
-                    },
-                    "server": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["secret_key"],
-                        "properties": {
-                            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-                            "secret_key": { "type": "string" }
-                        }
-                    },
-                    "extensions": {
-                        "type": "object",
-                        "additionalProperties": { "type": "object" },
-                        "required": ["enabled"],
-                        "x-unmanaged-subtables": true,
-                        "properties": {
-                            "enabled": { "type": "array", "items": { "type": "string" } }
-                        }
-                    }
-                }
-            }),
-            options: json!({
-                "$schema": DRAFT_2020_12_DIALECT,
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "security.password": {
-                        "type": "object",
-                        "x-owner": "core",
-                        "additionalProperties": false,
-                        "properties": {
-                            "passwd_min_length": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "default": 8,
-                                "x-schema-version": 1
-                            }
-                        }
-                    }
-                }
-            }),
-        };
+[security]
+pepper = ""
 
-        let manifest_json = json!({
-            "format_version": 1,
-            "product": "cfms-on-websocket",
-            "version": "0.14.0",
-            "requires_python": ">=3.14",
-            "managed_extensions": ["builtin", "oidc_sso"],
-            "files": {},
-            "core_config_contract": contract
-        });
-        std::fs::write(
-            root.join("release-manifest.json"),
-            serde_json::to_vec_pretty(&manifest_json).unwrap(),
-        )
-        .unwrap();
+[server]
+port = 5105
+secret_key = ""
+# New timeout
+timeout = 30
+
+[extensions]
+enabled = []
+"#;
+        let base_path = root.join("old.config.toml.sample");
+        std::fs::write(&base_path, base_toml).unwrap();
+        std::fs::write(src_dir.join("config.toml.sample"), new_template_toml).unwrap();
 
         let initial_toml = r#"# Operator header comment
 [database]
 type = "sqlite"
-db_name = "legacy.db"
+file = "prod.db"
 
 [security]
 pepper = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[server]
+port = 5104
+secret_key = "operator-secret"
+deprecated_flag = false
 
 [extensions]
 enabled = ["oidc_sso"]
@@ -774,12 +693,12 @@ client_id = "cfms-web"
             UiConsole::new(OutputFormat::Json),
         );
 
-        // 1. `--check` detects missing template sections + x-renamed-from rename without writing
+        // 1. `--check --base` detects pending 3-way merge changes without modifying disk
         let check_err = handle_sync_template(
             &check_ctx,
             ConfigSyncTemplateArgs {
                 template: None,
-                contract: None,
+                base: Some(base_path.clone()),
                 check: true,
                 remove: Vec::new(),
                 prune: false,
@@ -789,12 +708,13 @@ client_id = "cfms-web"
         assert!(check_err.to_string().contains("out of sync"));
         assert_eq!(std::fs::read_to_string(&paths.config_path).unwrap(), initial_toml);
 
-        // 2. Apply renames `database.db_name -> database.name`, merges [server], preserves `[extensions.oidc_sso]`
+        // 2. Apply 3-way merge: updates unmodified port 5104 -> 5105, adds timeout = 30,
+        // removes unmodified deprecated_flag, preserves custom db file, secrets & `[extensions.oidc_sso]`.
         handle_sync_template(
             &apply_ctx,
             ConfigSyncTemplateArgs {
                 template: None,
-                contract: None,
+                base: Some(base_path.clone()),
                 check: false,
                 remove: Vec::new(),
                 prune: false,
@@ -803,18 +723,19 @@ client_id = "cfms-web"
         .unwrap();
         let synced = std::fs::read_to_string(&paths.config_path).unwrap();
         assert!(synced.contains("# Operator header comment"));
-        assert!(synced.contains("name = \"legacy.db\""));
-        assert!(!synced.contains("db_name"));
-        assert!(synced.contains("[server]"));
+        assert!(synced.contains("file = \"prod.db\""));
+        assert!(synced.contains("port = 5105"));
+        assert!(synced.contains("timeout = 30"));
+        assert!(!synced.contains("deprecated_flag"));
         assert!(synced.contains("[extensions.oidc_sso]"));
         assert!(synced.contains("issuer = \"https://idp.example.com\""));
 
-        // 3. Re-running `--check` is idempotent
+        // 3. Re-running `--check` (2-way) is idempotent
         handle_sync_template(
             &check_ctx,
             ConfigSyncTemplateArgs {
                 template: None,
-                contract: None,
+                base: None,
                 check: true,
                 remove: Vec::new(),
                 prune: false,
@@ -822,7 +743,7 @@ client_id = "cfms-web"
         )
         .unwrap();
 
-        // 4. `config options` reads both core defaults & stored extension rows, allows core writes, rejects extension writes
+        // 4. Schema-less `config options` reads and writes options directly
         let pool = apply_ctx.connect_db(&paths).await.unwrap();
         create_head_schema(&pool, false).await.unwrap();
         let crate::db::DbPool::Sqlite(ref sq) = pool else { unreachable!() };
@@ -835,10 +756,7 @@ client_id = "cfms-web"
 
         handle_options(
             &apply_ctx,
-            OptionsCommand::List(OptionsListArgs {
-                namespace: None,
-                contract: None,
-            }),
+            OptionsCommand::List(OptionsListArgs { namespace: None }),
         )
         .await
         .unwrap();
@@ -848,7 +766,6 @@ client_id = "cfms-web"
             OptionsCommand::Get(OptionsGetArgs {
                 namespace: "identity.oidc".to_string(),
                 option_key: "issuer".to_string(),
-                contract: None,
             }),
         )
         .await
@@ -863,26 +780,15 @@ client_id = "cfms-web"
                 option_key: "passwd_min_length".to_string(),
                 payload_file: payload_core,
                 expected_revision: 0,
-                contract: None,
             }),
         )
         .await
         .unwrap();
 
-        let payload_ext = root.join("ext_opt.json");
-        std::fs::write(&payload_ext, "\"https://other.example.com\"").unwrap();
-        let ext_set_err = handle_options(
-            &apply_ctx,
-            OptionsCommand::Set(OptionsSetArgs {
-                namespace: "identity.oidc".to_string(),
-                option_key: "issuer".to_string(),
-                payload_file: payload_ext,
-                expected_revision: 1,
-                contract: None,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert!(ext_set_err.to_string().contains("core_config_contract"));
+        let stored = get_option(&pool, "security.password", "passwd_min_length")
+            .await
+            .unwrap();
+        assert_eq!(stored.value, json!(12));
+        assert_eq!(stored.revision, 1);
     }
 }

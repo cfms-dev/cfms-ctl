@@ -8,11 +8,9 @@ pub mod transfer;
 
 pub use backend::{DatabaseKind, DbPool};
 pub use options::{
-    CoreOptionRename, NamespaceSchemaSpec, OptionPropertySpec, OptionUpdateInput, OptionValueType,
-    OptionsSchemaRegistry, ResolvedOptionRecord, decode_option_value, encode_option_value,
-    fetch_stored_options, get_option, list_options, rename_core_option_keys, reset_option,
-    validate_namespace_values_with_schema, validate_option_key, validate_option_namespace,
-    validate_option_owner, write_options_batch, write_options_batches,
+    OptionUpdateInput, OptionValueType, ResolvedOptionRecord, decode_option_value,
+    encode_option_value, format_canonical_float, get_option, is_canonical_int_str, list_options,
+    validate_option_key, validate_option_namespace, validate_option_owner, write_options_batch,
 };
 pub use schema::{
     APPLICATION_TABLE_NAMES, DEFERRED_COLUMNS, KNOWN_EXTENSION_TABLES, LATEST_SCHEMA_REVISION,

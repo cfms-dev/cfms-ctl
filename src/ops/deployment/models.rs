@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
-use crate::core::CoreConfigContract;
 use crate::ui::{CommandReport, KeyValueTable, UiConsole};
 
 pub const RELEASE_MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -18,7 +17,6 @@ pub const TRANSACTION_FILENAME: &str = "transaction.json";
 pub const VERSIONS_DIRNAME: &str = "versions";
 pub const STAGING_DIRNAME: &str = "staging";
 pub const TX_JOURNAL_DIRNAME: &str = "tx";
-pub const QUARANTINE_DIRNAME: &str = "quarantine";
 pub const STATE_DIRNAME: &str = "state";
 pub const RELEASE_SUBDIR: &str = "release";
 
@@ -75,8 +73,6 @@ pub struct ReleaseManifest {
     pub managed_extensions: Vec<String>,
     #[serde(default)]
     pub files: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub core_config_contract: Option<CoreConfigContract>,
 }
 
 /// Validated manifest paired with its exact canonical byte SHA-256 (`release_id`) and raw bytes.
@@ -109,7 +105,6 @@ impl Default for DeploymentSettings {
 #[serde(rename_all = "kebab-case")]
 pub enum TransactionOperation {
     Upgrade,
-    Downgrade,
     Install,
 }
 
@@ -117,7 +112,6 @@ impl std::fmt::Display for TransactionOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Upgrade => "upgrade",
-            Self::Downgrade => "downgrade",
             Self::Install => "install",
         })
     }
@@ -168,6 +162,10 @@ pub struct DeploymentTransaction {
     pub staging_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_checkpoint_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_checkpoint_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -453,7 +451,7 @@ impl CommandReport for DeploymentCheckReport {
     }
 }
 
-/// Unified structured report for `upgrade`, `update`, `downgrade`, `resume`, `install`, and `adopt`.
+/// Unified structured report for `upgrade`, `update`, `resume`, `install`, and `adopt`.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeploymentMutationReport {
     pub operation: String,
@@ -474,7 +472,6 @@ pub struct DeploymentMutationReport {
     pub db_revision_after: Option<String>,
     pub backup_archive_path: Option<String>,
     pub backup_generated_key: Option<String>,
-    pub quarantined_extensions: Vec<String>,
     pub warnings: Vec<String>,
     pub next_steps: Vec<String>,
 }
@@ -543,12 +540,6 @@ impl CommandReport for DeploymentMutationReport {
             );
         if let Some(ref bak) = self.backup_archive_path {
             table.row("Safety Backup", bak.clone());
-        }
-        if !self.quarantined_extensions.is_empty() {
-            table.row(
-                "Quarantined Extensions",
-                self.quarantined_extensions.join(", "),
-            );
         }
         table.print();
 

@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Key, Table, TableLike, Value};
 use zeroize::Zeroizing;
 use crate::core::atomic::write_with_timestamped_backup;
-use crate::core::contract::CoreConfigContract;
 use crate::core::error::{CfmsError, Result};
 use crate::core::paths::WorkspacePaths;
 use crate::db::DatabaseKind;
@@ -337,24 +336,55 @@ pub struct ServerConfigSummary {
     pub s3: Option<S3SectionSummary>,
 }
 
-/// Core TOML path renamed cleanly via `x-renamed-from` in `core_config_contract`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RenamedPathRecord {
-    pub from: String,
-    pub to: String,
+/// Kind of 3-way merge conflict encountered while synchronizing `config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigMergeConflictKind {
+    /// Both local `config.toml` and the new template modified this key differently (kept local value).
+    BothModified,
+    /// Both local `config.toml` and the new template added this key with different values (kept local value).
+    BothAdded,
+    /// The new template removed this key, but local `config.toml` customized it (kept local value).
+    ModifyDelete,
+    /// Local `config.toml` removed this key, while the new template modified it (kept deleted).
+    DeleteModify,
+    /// Local `config.toml` and the new template disagree on table vs scalar shape (kept local value).
+    ShapeMismatch,
 }
 
-/// Result of synchronizing a `ConfigDocument` with a template `ConfigDocument`.
+impl fmt::Display for ConfigMergeConflictKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BothModified => "both_modified",
+            Self::BothAdded => "both_added",
+            Self::ModifyDelete => "modify_delete",
+            Self::DeleteModify => "delete_modify",
+            Self::ShapeMismatch => "shape_mismatch",
+        })
+    }
+}
+
+/// Non-destructive 3-way merge conflict resolved by keeping local `config.toml` (`ours`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigMergeConflict {
+    pub path: String,
+    pub kind: ConfigMergeConflictKind,
+    pub detail: String,
+}
+
+/// Result of synchronizing a `ConfigDocument` with a template (2-way or 3-way merge).
 #[derive(Debug, Clone, Serialize)]
 pub struct TemplateSyncPlan {
     pub config_path: PathBuf,
     pub template_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_template_path: Option<PathBuf>,
     pub changed: bool,
-    pub renamed_paths: Vec<RenamedPathRecord>,
     pub added_paths: Vec<String>,
+    pub updated_paths: Vec<String>,
     pub removed_paths: Vec<String>,
     pub preserved_paths: Vec<String>,
-    pub preserved_unknown_core_paths: Vec<String>,
+    pub conflicts: Vec<ConfigMergeConflict>,
     pub warnings: Vec<String>,
 }
 
@@ -650,12 +680,8 @@ impl ConfigDocument {
     }
 
     /// Replace this document's `[database]` section with the `[database]` section from `target`,
-    /// validating the resulting document (including optional core contract) before mutating `self`.
-    pub fn replace_database_section(
-        &mut self,
-        target: &Self,
-        contract: Option<&CoreConfigContract>,
-    ) -> Result<()> {
+    /// validating baseline structural invariants before mutating `self`.
+    pub fn replace_database_section(&mut self, target: &Self) -> Result<()> {
         if paths_refer_to_same_file(&self.path, &target.path) {
             return Err(CfmsError::Config(
                 "Target database configuration must be different from config.toml".to_string(),
@@ -683,7 +709,7 @@ impl ConfigDocument {
             raw_source: self.raw_source.clone(),
             doc: candidate,
         };
-        candidate_wrapper.validate_with_contract(contract)?;
+        candidate_wrapper.validate_structural_baseline()?;
         self.doc = candidate_wrapper.doc;
         Ok(())
     }
@@ -726,13 +752,8 @@ impl ConfigDocument {
 
     /// Losslessly update `[extensions].enabled` in memory, preserving comments and formatting.
     ///
-    /// Creates the `[extensions]` table if absent, validates against `contract` when supplied,
-    /// and commits the candidate `DocumentMut` only if validation succeeds.
-    pub fn set_extensions_enabled(
-        &mut self,
-        enabled: &[String],
-        contract: Option<&CoreConfigContract>,
-    ) -> Result<Vec<String>> {
+    /// Creates the `[extensions]` table if absent and commits the candidate `DocumentMut`.
+    pub fn set_extensions_enabled(&mut self, enabled: &[String]) -> Result<()> {
         let mut candidate = self.doc.clone();
         if !candidate.contains_key("extensions") {
             candidate["extensions"] = Item::Table(Table::new());
@@ -771,44 +792,16 @@ impl ConfigDocument {
             ext_table.insert("enabled", Item::Value(Value::Array(new_array)));
         }
 
-        let candidate_wrapper = Self {
-            path: self.path.clone(),
-            raw_source: self.raw_source.clone(),
-            doc: candidate,
-        };
-        let warnings = if contract.is_some() {
-            candidate_wrapper.validate_with_contract(contract)?
-        } else {
-            Vec::new()
-        };
-        self.doc = candidate_wrapper.doc;
-        Ok(warnings)
+        self.doc = candidate;
+        Ok(())
     }
 
-    /// Synchronize this configuration document in-place with `template` using `toml_edit` CST merging.
+    /// Synchronize this configuration document in-place with `template` using 2-way `toml_edit` CST merging.
     pub fn sync_with_template(
         &mut self,
         template: &Self,
         remove_paths: &[String],
         prune: bool,
-    ) -> Result<TemplateSyncPlan> {
-        self.sync_with_contract(template, remove_paths, prune, None)
-    }
-
-    /// Synchronize this configuration document in-place with `template` using `toml_edit` CST merging
-    /// and an optional [`CoreConfigContract`].
-    ///
-    /// When `contract` is provided:
-    /// - Core fields declaring `x-renamed-from` (e.g. `database.db_name -> database.name`) are moved
-    ///   before missing template defaults are merged.
-    /// - Unmanaged `[extensions.<id>]` subtables (`x-unmanaged-subtables: true`) are preserved verbatim.
-    /// - Removed/unknown core fields are preserved with warnings unless `--prune` removes them.
-    pub fn sync_with_contract(
-        &mut self,
-        template: &Self,
-        remove_paths: &[String],
-        prune: bool,
-        contract: Option<&CoreConfigContract>,
     ) -> Result<TemplateSyncPlan> {
         if paths_refer_to_same_file(&self.path, &template.path) {
             return Err(CfmsError::Config(
@@ -817,8 +810,6 @@ impl ConfigDocument {
         }
 
         let mut candidate = self.doc.clone();
-        let mut warnings = Vec::new();
-        let mut renamed_paths = Vec::new();
 
         let mut unknown_roots = Vec::new();
         find_unknown_roots(
@@ -858,10 +849,6 @@ impl ConfigDocument {
             remove_dotted_path(candidate.as_table_mut(), template.doc.as_table(), path);
         }
 
-        if let Some(c) = contract {
-            apply_contract_renames(&mut candidate, c, &mut renamed_paths, &mut warnings);
-        }
-
         let mut added_paths = Vec::new();
         merge_missing_from_template(
             candidate.as_table_mut(),
@@ -883,33 +870,14 @@ impl ConfigDocument {
             raw_source: self.raw_source.clone(),
             doc: candidate,
         };
-
-        let mut preserved_unknown_core_paths = Vec::new();
-        if let Some(c) = contract {
-            let config_json = candidate_wrapper.to_json_value()?;
-            let unknown_core = c.collect_unknown_core_toml_paths(&config_json);
-            if !prune {
-                for p in &unknown_core {
-                    warnings.push(format!(
-                        "Preserved removed/unknown core configuration path '{p}' (not present in core_config_contract.toml)"
-                    ));
-                }
-                preserved_unknown_core_paths = unknown_core.clone();
-            }
-            // Validate active core schema + invariants + `[extensions]`, ignoring any preserved unknown core paths.
-            candidate_wrapper.validate_structural_baseline()?;
-            warnings.extend(c.validate_toml(&config_json, &preserved_unknown_core_paths)?);
-        } else {
-            candidate_wrapper.validate_structural_baseline()?;
-        }
+        candidate_wrapper.validate_structural_baseline()?;
 
         added_paths.sort();
         let mut removed_paths = selected_removals;
         removed_paths.sort();
         preserved_paths.sort();
 
-        let changed =
-            !renamed_paths.is_empty() || !added_paths.is_empty() || !removed_paths.is_empty();
+        let changed = !added_paths.is_empty() || !removed_paths.is_empty();
         if changed {
             self.doc = candidate_wrapper.doc;
         }
@@ -917,17 +885,165 @@ impl ConfigDocument {
         Ok(TemplateSyncPlan {
             config_path: self.path.clone(),
             template_path: template.path.clone(),
+            base_template_path: None,
             changed,
-            renamed_paths,
             added_paths,
+            updated_paths: Vec::new(),
             removed_paths,
             preserved_paths,
-            preserved_unknown_core_paths,
+            conflicts: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Perform a lossless semantic 3-way TOML merge of `self` (`ours`) against `base` (previous
+    /// template) and `template` (`theirs`, new template) using `toml_edit` CST manipulation.
+    ///
+    /// Merge semantics:
+    /// - Keys added in `template` (absent from `base` and `ours`) are inserted verbatim with template comments.
+    /// - Keys modified in `template` (`base != template`) whose local value is unchanged (`ours == base`)
+    ///   are updated automatically while preserving inline `ours` decor/comments.
+    /// - Keys removed in `template` (`base` had them, `template` dropped them) whose local value is
+    ///   unchanged (`ours == base`) are removed cleanly (along with emptied parent tables).
+    /// - Unmanaged `[extensions.<id>]` subtables and operator custom keys are preserved verbatim.
+    /// - On any 3-way conflict, local `ours` always wins non-destructively and a structured conflict
+    ///   record plus human-readable warning are emitted.
+    pub fn merge_three_way(
+        &mut self,
+        base: &Self,
+        template: &Self,
+        remove_paths: &[String],
+        prune: bool,
+    ) -> Result<TemplateSyncPlan> {
+        if paths_refer_to_same_file(&self.path, &template.path) {
+            return Err(CfmsError::Config(
+                "The configuration template must be different from config.toml".to_string(),
+            ));
+        }
+        if paths_refer_to_same_file(&self.path, &base.path) {
+            return Err(CfmsError::Config(
+                "The base configuration template must be different from config.toml".to_string(),
+            ));
+        }
+
+        let mut candidate = self.doc.clone();
+        let mut added_paths = Vec::new();
+        let mut updated_paths = Vec::new();
+        let mut removed_paths = Vec::new();
+        let mut conflicts = Vec::new();
+        let mut warnings = Vec::new();
+
+        // Validate explicit `--remove` requests up front before mutating.
+        let requested_removals: BTreeSet<String> = remove_paths.iter().cloned().collect();
+        if !requested_removals.is_empty() {
+            let mut invalid_removals = Vec::new();
+            for req in &requested_removals {
+                let exists_in_current = has_dotted_path(candidate.as_table(), req);
+                let exists_in_template = has_dotted_path(template.doc.as_table(), req);
+                if !exists_in_current || exists_in_template {
+                    invalid_removals.push(req.clone());
+                }
+            }
+            if !invalid_removals.is_empty() {
+                return Err(CfmsError::Config(format!(
+                    "Unknown --remove path(s): {}",
+                    invalid_removals.join(", ")
+                )));
+            }
+            for path in &requested_removals {
+                remove_dotted_path(candidate.as_table_mut(), template.doc.as_table(), path);
+                removed_paths.push(path.clone());
+            }
+        }
+
+        merge_three_way_table(
+            Some(base.doc.as_table()),
+            candidate.as_table_mut(),
+            template.doc.as_table(),
+            &[],
+            &mut ThreeWayAccum {
+                added: &mut added_paths,
+                updated: &mut updated_paths,
+                removed: &mut removed_paths,
+                conflicts: &mut conflicts,
+                warnings: &mut warnings,
+            },
+        );
+
+        if prune {
+            let mut remaining_unknown = Vec::new();
+            find_unknown_roots_tolerant(
+                candidate.as_table(),
+                template.doc.as_table(),
+                &[],
+                &mut remaining_unknown,
+            );
+            for path in &remaining_unknown {
+                remove_dotted_path(candidate.as_table_mut(), template.doc.as_table(), path);
+                removed_paths.push(path.clone());
+            }
+            let pruned_set: BTreeSet<&str> = remaining_unknown.iter().map(String::as_str).collect();
+            if !pruned_set.is_empty() {
+                conflicts.retain(|c| {
+                    !(c.kind == ConfigMergeConflictKind::ModifyDelete
+                        && pruned_set.iter().any(|p| {
+                            c.path == *p || c.path.starts_with(&format!("{p}."))
+                        }))
+                });
+                warnings = conflicts
+                    .iter()
+                    .map(|c| format!("Config merge conflict at '{}' ({}): {}", c.path, c.kind, c.detail))
+                    .collect();
+            }
+        }
+
+        let mut preserved_paths = Vec::new();
+        find_unknown_roots_tolerant(
+            candidate.as_table(),
+            template.doc.as_table(),
+            &[],
+            &mut preserved_paths,
+        );
+
+        let candidate_wrapper = Self {
+            path: self.path.clone(),
+            raw_source: self.raw_source.clone(),
+            doc: candidate,
+        };
+        candidate_wrapper.validate_structural_baseline()?;
+
+        added_paths.sort();
+        added_paths.dedup();
+        updated_paths.sort();
+        updated_paths.dedup();
+        removed_paths.sort();
+        removed_paths.dedup();
+        preserved_paths.sort();
+        preserved_paths.dedup();
+        conflicts.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let changed =
+            !added_paths.is_empty() || !updated_paths.is_empty() || !removed_paths.is_empty();
+        if changed {
+            self.doc = candidate_wrapper.doc;
+        }
+
+        Ok(TemplateSyncPlan {
+            config_path: self.path.clone(),
+            template_path: template.path.clone(),
+            base_template_path: Some(base.path.clone()),
+            changed,
+            added_paths,
+            updated_paths,
+            removed_paths,
+            preserved_paths,
+            conflicts,
             warnings,
         })
     }
 
-    fn validate_structural_baseline(&self) -> Result<()> {
+    /// Validate minimal structural invariants required by `cfms-ctl` (`[security]`, `[database]`, `[provider]`/`[s3]`).
+    pub fn validate_structural_baseline(&self) -> Result<()> {
         if let Some(sec_item) = self.doc.get("security")
             && !sec_item.is_table_like()
         {
@@ -949,31 +1065,6 @@ impl ConfigDocument {
             }
         }
         Ok(())
-    }
-
-    fn to_json_value(&self) -> Result<serde_json::Value> {
-        toml::from_str(&self.doc.to_string()).map_err(|e| {
-            CfmsError::Config(format!(
-                "Unable to convert '{}' for contract validation: {e}",
-                self.path.display()
-            ))
-        })
-    }
-
-    /// Validate structural invariants and strictly evaluate an optional [`CoreConfigContract`]
-    /// (`Draft 2020-12` JSON Schema, `x-normalize`, `x-invariants`, and `[extensions]` rules).
-    pub fn validate_with_contract(
-        &self,
-        contract: Option<&CoreConfigContract>,
-    ) -> Result<Vec<String>> {
-        self.validate_structural_baseline()?;
-
-        let Some(c) = contract else {
-            return Ok(Vec::new());
-        };
-
-        let config_json = self.to_json_value()?;
-        c.validate_toml(&config_json, &[])
     }
 
     /// Extract normalized `[extensions.oidc_sso].issuer` if configured (trailing `/` stripped).
@@ -1116,117 +1207,312 @@ fn has_dotted_path(root: &dyn TableLike, dotted_path: &str) -> bool {
     true
 }
 
+fn find_unknown_roots_tolerant(
+    current: &dyn TableLike,
+    template: &dyn TableLike,
+    prefix: &[String],
+    out: &mut Vec<String>,
+) {
+    for (key, current_item) in current.iter() {
+        if current_item.is_none() {
+            continue;
+        }
+        if is_unmanaged_extension_key(prefix, key) {
+            continue;
+        }
+        let mut path = prefix.to_vec();
+        path.push(key.to_string());
+        let dotted = path.join(".");
+
+        let Some(template_item) = template.get(key).filter(|i| !i.is_none()) else {
+            out.push(dotted);
+            continue;
+        };
+        if let (Some(curr_sub), Some(tmpl_sub)) =
+            (current_item.as_table_like(), template_item.as_table_like())
+        {
+            find_unknown_roots_tolerant(curr_sub, tmpl_sub, &path, out);
+        }
+    }
+}
+
+fn is_unmanaged_extension_key(prefix: &[String], key: &str) -> bool {
+    prefix.len() == 1 && prefix[0] == "extensions" && key != "enabled"
+}
+
 fn is_unmanaged_extension_path(dotted_path: &str) -> bool {
     let mut parts = dotted_path.split('.');
     matches!((parts.next(), parts.next()), (Some("extensions"), Some(sub)) if sub != "enabled")
 }
 
-fn can_set_dotted_item(root: &dyn TableLike, dotted_path: &str) -> bool {
-    let parts: Vec<&str> = dotted_path.split('.').collect();
-    if parts.is_empty() {
+struct ThreeWayAccum<'a> {
+    added: &'a mut Vec<String>,
+    updated: &'a mut Vec<String>,
+    removed: &'a mut Vec<String>,
+    conflicts: &'a mut Vec<ConfigMergeConflict>,
+    warnings: &'a mut Vec<String>,
+}
+
+impl ThreeWayAccum<'_> {
+    fn push_conflict(&mut self, path: String, kind: ConfigMergeConflictKind, detail: String) {
+        self.warnings
+            .push(format!("Config merge conflict at '{path}' ({kind}): {detail}"));
+        self.conflicts.push(ConfigMergeConflict { path, kind, detail });
+    }
+}
+
+fn active_table_item<'a>(table: &'a dyn TableLike, key: &str) -> Option<&'a Item> {
+    table.get(key).filter(|i| !i.is_none())
+}
+
+fn merge_three_way_table(
+    base: Option<&dyn TableLike>,
+    ours: &mut dyn TableLike,
+    theirs: &dyn TableLike,
+    prefix: &[String],
+    acc: &mut ThreeWayAccum<'_>,
+) {
+    // Collect deterministic key order: theirs keys first (preserving template order for inserts),
+    // then any remaining keys from base or ours.
+    let mut ordered_keys: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for (k, item) in theirs.iter() {
+        if !item.is_none() && seen.insert(k.to_string()) {
+            ordered_keys.push(k.to_string());
+        }
+    }
+    if let Some(b_tbl) = base {
+        for (k, item) in b_tbl.iter() {
+            if !item.is_none() && seen.insert(k.to_string()) {
+                ordered_keys.push(k.to_string());
+            }
+        }
+    }
+    let ours_keys: Vec<String> = ours
+        .iter()
+        .filter(|(_, item)| !item.is_none())
+        .map(|(k, _)| k.to_string())
+        .collect();
+    for k in ours_keys {
+        if seen.insert(k.clone()) {
+            ordered_keys.push(k);
+        }
+    }
+
+    for key in ordered_keys {
+        if is_unmanaged_extension_key(prefix, &key) {
+            continue;
+        }
+        let mut path = prefix.to_vec();
+        path.push(key.clone());
+        let dotted = path.join(".");
+
+        let base_item = base.and_then(|b| active_table_item(b, &key));
+        let theirs_kv = theirs
+            .get_key_value(&key)
+            .filter(|(_, item)| !item.is_none());
+        let has_ours = active_table_item(ours, &key).is_some();
+
+        match (base_item, has_ours, theirs_kv) {
+            // 1. Added in theirs only
+            (None, false, Some((t_key, t_item))) => {
+                collect_leaf_paths(t_item, &path, acc.added);
+                let mut cloned = t_item.clone();
+                clear_table_positions(&mut cloned);
+                insert_formatted_into_table_like(ours, t_key, cloned);
+            }
+            // 2. Added in both ours and theirs
+            (None, true, Some((_, t_item))) => {
+                let ours_is_tbl = active_table_item(ours, &key).is_some_and(Item::is_table_like);
+                let theirs_is_tbl = t_item.is_table_like();
+                if ours_is_tbl && theirs_is_tbl {
+                    if let (Some(o_sub), Some(t_sub)) = (
+                        ours.get_mut(&key).and_then(|i| i.as_table_like_mut()),
+                        t_item.as_table_like(),
+                    ) {
+                        merge_three_way_table(None, o_sub, t_sub, &path, acc);
+                    }
+                } else if ours_is_tbl != theirs_is_tbl {
+                    acc.push_conflict(
+                        dotted,
+                        ConfigMergeConflictKind::ShapeMismatch,
+                        "local config and new template disagree on table vs scalar shape; kept local value"
+                            .to_string(),
+                    );
+                } else if let Some(o_item) = active_table_item(ours, &key)
+                    && !items_semantically_equal(o_item, t_item)
+                {
+                    acc.push_conflict(
+                        dotted,
+                        ConfigMergeConflictKind::BothAdded,
+                        "added in both local config and new template with different values; kept local value"
+                            .to_string(),
+                    );
+                }
+            }
+            // 3. Only in ours (operator custom key/table) -> preserve verbatim
+            (None, true, None) => {}
+            // 4. Absent from both ours and theirs -> no-op
+            (_, false, None) => {}
+            // 5. Present in base and theirs, deleted in ours
+            (Some(b_item), false, Some((_, t_item))) => {
+                if !items_semantically_equal(b_item, t_item) {
+                    acc.push_conflict(
+                        dotted,
+                        ConfigMergeConflictKind::DeleteModify,
+                        "key was removed in local config while modified in new template; kept removed"
+                            .to_string(),
+                    );
+                }
+            }
+            // 6. Present in base and ours, removed in theirs
+            (Some(b_item), true, None) => {
+                let unchanged = active_table_item(ours, &key)
+                    .is_some_and(|o_item| items_semantically_equal(o_item, b_item));
+                if unchanged {
+                    if let Some(removed_item) = ours.remove(&key) {
+                        collect_leaf_paths(&removed_item, &path, acc.removed);
+                    }
+                } else {
+                    acc.push_conflict(
+                        dotted,
+                        ConfigMergeConflictKind::ModifyDelete,
+                        "key was removed in new template but customized locally; kept local value"
+                            .to_string(),
+                    );
+                }
+            }
+            // 7. Present in base, ours, and theirs
+            (Some(b_item), true, Some((_, t_item))) => {
+                let b_is_tbl = b_item.is_table_like();
+                let o_is_tbl = active_table_item(ours, &key).is_some_and(Item::is_table_like);
+                let t_is_tbl = t_item.is_table_like();
+
+                if b_is_tbl && o_is_tbl && t_is_tbl {
+                    if let (Some(b_sub), Some(o_sub), Some(t_sub)) = (
+                        b_item.as_table_like(),
+                        ours.get_mut(&key).and_then(|i| i.as_table_like_mut()),
+                        t_item.as_table_like(),
+                    ) {
+                        merge_three_way_table(Some(b_sub), o_sub, t_sub, &path, acc);
+                    }
+                } else if !b_is_tbl && o_is_tbl && t_is_tbl {
+                    // Both ours and theirs converted scalar -> table; merge subkeys with empty base.
+                    if let (Some(o_sub), Some(t_sub)) = (
+                        ours.get_mut(&key).and_then(|i| i.as_table_like_mut()),
+                        t_item.as_table_like(),
+                    ) {
+                        merge_three_way_table(None, o_sub, t_sub, &path, acc);
+                    }
+                } else if items_semantically_equal(b_item, t_item) {
+                    // Unchanged in template -> keep ours untouched.
+                } else if active_table_item(ours, &key)
+                    .is_some_and(|o_item| items_semantically_equal(o_item, b_item))
+                {
+                    // Unchanged in ours, modified in theirs -> update cleanly.
+                    replace_item_preserving_decor(ours, &key, t_item);
+                    collect_leaf_paths(t_item, &path, acc.updated);
+                } else if active_table_item(ours, &key)
+                    .is_some_and(|o_item| items_semantically_equal(o_item, t_item))
+                {
+                    // Both ours and theirs converged to the same semantic value -> no-op.
+                } else if o_is_tbl != t_is_tbl {
+                    acc.push_conflict(
+                        dotted,
+                        ConfigMergeConflictKind::ShapeMismatch,
+                        "local config and new template disagree on table vs scalar shape; kept local value"
+                            .to_string(),
+                    );
+                } else {
+                    acc.push_conflict(
+                        dotted,
+                        ConfigMergeConflictKind::BothModified,
+                        "modified in both local config and new template; kept local value"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn replace_item_preserving_decor(target: &mut dyn TableLike, key: &str, new_item: &Item) {
+    if let (Some(Item::Value(existing_val)), Item::Value(new_val)) = (target.get_mut(key), new_item)
+        && !existing_val.is_inline_table()
+        && !new_val.is_inline_table()
+    {
+        let decor = existing_val.decor().clone();
+        let mut replacement = new_val.clone();
+        *replacement.decor_mut() = decor;
+        *existing_val = replacement;
+        return;
+    }
+
+    let mut cloned = new_item.clone();
+    clear_table_positions(&mut cloned);
+    target.insert(key, cloned);
+}
+
+fn items_semantically_equal(a: &Item, b: &Item) -> bool {
+    if a.is_none() && b.is_none() {
+        return true;
+    }
+    if let (Some(ta), Some(tb)) = (a.as_table_like(), b.as_table_like()) {
+        return table_likes_semantically_equal(ta, tb);
+    }
+    match (a, b) {
+        (Item::Value(va), Item::Value(vb)) => values_semantically_equal(va, vb),
+        (Item::ArrayOfTables(aa), Item::ArrayOfTables(ab)) => {
+            aa.len() == ab.len()
+                && aa
+                    .iter()
+                    .zip(ab.iter())
+                    .all(|(ta, tb)| table_likes_semantically_equal(ta, tb))
+        }
+        _ => false,
+    }
+}
+
+fn table_likes_semantically_equal(a: &dyn TableLike, b: &dyn TableLike) -> bool {
+    let count_a = a.iter().filter(|(_, item)| !item.is_none()).count();
+    let count_b = b.iter().filter(|(_, item)| !item.is_none()).count();
+    if count_a != count_b {
         return false;
     }
-    let mut current = root;
-    for part in &parts[..parts.len() - 1] {
-        match current.get(part) {
-            Some(item) if !item.is_none() => {
-                let Some(next) = item.as_table_like() else {
-                    return false;
-                };
-                current = next;
-            }
-            _ => return true,
+    for (k, va) in a.iter() {
+        if va.is_none() {
+            continue;
+        }
+        let Some(vb) = b.get(k).filter(|item| !item.is_none()) else {
+            return false;
+        };
+        if !items_semantically_equal(va, vb) {
+            return false;
         }
     }
     true
 }
 
-fn take_dotted_item(current: &mut dyn TableLike, dotted_path: &str) -> Option<Item> {
-    let parts: Vec<&str> = dotted_path.split('.').collect();
-    take_parts_recursive(current, &parts)
-}
-
-fn take_parts_recursive(current: &mut dyn TableLike, parts: &[&str]) -> Option<Item> {
-    let (first, rest) = parts.split_first()?;
-    if rest.is_empty() {
-        let removed = current.remove(first)?;
-        return if removed.is_none() { None } else { Some(removed) };
-    }
-    let (taken, became_empty) = if let Some(child_item) = current.get_mut(first)
-        && let Some(child_table) = child_item.as_table_like_mut()
-    {
-        let item = take_parts_recursive(child_table, rest);
-        (item, child_table.is_empty())
-    } else {
-        return None;
-    };
-    if taken.is_some() && became_empty {
-        current.remove(first);
-    }
-    taken
-}
-
-fn set_dotted_item(current: &mut dyn TableLike, dotted_path: &str, item: Item) {
-    let parts: Vec<&str> = dotted_path.split('.').collect();
-    set_parts_recursive(current, &parts, item);
-}
-
-fn set_parts_recursive(current: &mut dyn TableLike, parts: &[&str], item: Item) {
-    let Some((first, rest)) = parts.split_first() else {
-        return;
-    };
-    if rest.is_empty() {
-        current.insert(first, item);
-        return;
-    }
-    if !current.contains_key(first) || current.get(first).is_some_and(Item::is_none) {
-        let mut table = Table::new();
-        table.set_implicit(true);
-        current.insert(first, Item::Table(table));
-    }
-    if let Some(child) = current.get_mut(first).and_then(|i| i.as_table_like_mut()) {
-        set_parts_recursive(child, rest, item);
-    }
-}
-
-fn apply_contract_renames(
-    candidate: &mut DocumentMut,
-    contract: &CoreConfigContract,
-    renamed: &mut Vec<RenamedPathRecord>,
-    warnings: &mut Vec<String>,
-) {
-    for spec in contract.collect_toml_leaf_specs() {
-        if spec.renamed_from.is_empty() {
-            continue;
+fn values_semantically_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::String(sa), Value::String(sb)) => sa.value() == sb.value(),
+        (Value::Integer(ia), Value::Integer(ib)) => ia.value() == ib.value(),
+        (Value::Float(fa), Value::Float(fb)) => {
+            let x = *fa.value();
+            let y = *fb.value();
+            x == y || (x.is_nan() && y.is_nan())
         }
-        for old_path in &spec.renamed_from {
-            if !has_dotted_path(candidate.as_table(), old_path) {
-                continue;
-            }
-            if has_dotted_path(candidate.as_table(), &spec.dotted_path) {
-                warnings.push(format!(
-                    "Both legacy path '{old_path}' and new path '{}' exist; kept '{}'",
-                    spec.dotted_path, spec.dotted_path
-                ));
-                break;
-            }
-            if !can_set_dotted_item(candidate.as_table(), &spec.dotted_path) {
-                warnings.push(format!(
-                    "Could not rename '{old_path}' to '{}' because parent path is not a table; kept '{old_path}'",
-                    spec.dotted_path
-                ));
-                continue;
-            }
-            if let Some(mut moved_item) = take_dotted_item(candidate.as_table_mut(), old_path) {
-                clear_table_positions(&mut moved_item);
-                set_dotted_item(candidate.as_table_mut(), &spec.dotted_path, moved_item);
-                renamed.push(RenamedPathRecord {
-                    from: old_path.clone(),
-                    to: spec.dotted_path.clone(),
-                });
-                break;
-            }
+        (Value::Boolean(ba), Value::Boolean(bb)) => ba.value() == bb.value(),
+        (Value::Datetime(da), Value::Datetime(db)) => da.value() == db.value(),
+        (Value::Array(aa), Value::Array(ab)) => {
+            aa.len() == ab.len()
+                && aa
+                    .iter()
+                    .zip(ab.iter())
+                    .all(|(xa, xb)| values_semantically_equal(xa, xb))
         }
+        (Value::InlineTable(ta), Value::InlineTable(tb)) => table_likes_semantically_equal(ta, tb),
+        _ => false,
     }
 }
 
@@ -1630,31 +1916,31 @@ sqlite_path = "./data.db"
     }
 
     #[test]
-    fn test_sync_with_contract_renames_preserves_extensions_and_enforces_invariants() {
-        use crate::core::contract::{CORE_CONFIG_CONTRACT_VERSION, DRAFT_2020_12_DIALECT};
-        use serde_json::json;
-
+    fn test_merge_three_way_updates_adds_removes_preserves_extensions_and_reports_conflicts() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let base_path = dir.path().join("base.toml.sample");
         let config_path = dir.path().join("config.toml");
-        let template_path = dir.path().join("config.toml.sample");
+        let new_tpl_path = dir.path().join("new.toml.sample");
 
-        let template_content = r#"[server]
+        let base_content = r#"[server]
 host = "0.0.0.0"
 port = 5104
 secret_key = ""
-file_chunk_size = 1048576
+workers = 4
+old_unmodified_flag = false
+old_customized_flag = false
+deleted_by_operator = "v1"
+shape_key = "scalar_v1"
 
-[server.admission_control]
-max_connections = 64
-max_connections_per_ip = 16
-max_inflight_requests = 12
+[legacy_unmodified]
+k = 1
 
 [security]
 pepper = ""
 
 [database]
 type = "sqlite"
-name = "app_db"
+file = "app.db"
 
 [database.pool]
 size = 5
@@ -1663,132 +1949,27 @@ max_overflow = 10
 [extensions]
 enabled = []
 "#;
-        let contract = CoreConfigContract {
-            contract_version: CORE_CONFIG_CONTRACT_VERSION.to_string(),
-            core_version: "0.14.0".to_string(),
-            schema_dialect: DRAFT_2020_12_DIALECT.to_string(),
-            toml: json!({
-                "$schema": DRAFT_2020_12_DIALECT,
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["server", "security", "database", "extensions"],
-                "properties": {
-                    "server": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["file_chunk_size"],
-                        "properties": {
-                            "host": { "type": "string", "minLength": 1, "x-normalize": "trim" },
-                            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-                            "secret_key": { "type": "string" },
-                            "file_chunk_size": { "type": "integer", "exclusiveMinimum": 0 },
-                            "admission_control": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "max_connections": { "type": "integer", "minimum": 1 },
-                                    "max_connections_per_ip": { "type": "integer", "minimum": 1 },
-                                    "max_inflight_requests": { "type": "integer", "minimum": 1 }
-                                }
-                            }
-                        }
-                    },
-                    "security": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "pepper": { "type": "string" }
-                        }
-                    },
-                    "database": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["type"],
-                        "properties": {
-                            "type": { "type": "string", "enum": ["sqlite", "mysql", "postgresql"] },
-                            "name": {
-                                "type": "string",
-                                "default": "app_db",
-                                "x-renamed-from": ["database.db_name"]
-                            },
-                            "pool": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "size": { "type": "integer", "minimum": 1 },
-                                    "max_overflow": { "type": "integer", "minimum": 0 }
-                                }
-                            }
-                        }
-                    },
-                    "extensions": {
-                        "type": "object",
-                        "additionalProperties": { "type": "object" },
-                        "required": ["enabled"],
-                        "x-unmanaged-subtables": true,
-                        "properties": {
-                            "enabled": {
-                                "type": "array",
-                                "uniqueItems": true,
-                                "items": {
-                                    "type": "string",
-                                    "pattern": "^[a-z][a-z0-9_]*$",
-                                    "not": { "enum": ["builtin", "scheduling"] }
-                                }
-                            }
-                        }
-                    }
-                },
-                "x-invariants": [
-                    {
-                        "rule": "order",
-                        "lower": "server.admission_control.max_connections_per_ip",
-                        "upper": "server.admission_control.max_connections",
-                        "allow_equal": true,
-                        "message": "server.admission_control.max_connections_per_ip must not exceed max_connections"
-                    },
-                    {
-                        "rule": "order",
-                        "lower": "server.admission_control.max_inflight_requests",
-                        "upper": ["database.pool.size", "database.pool.max_overflow"],
-                        "allow_equal": true,
-                        "severity": "warning",
-                        "message": "`server.admission_control.max_inflight_requests` exceeds `database.pool.size + database.pool.max_overflow`."
-                    },
-                    {
-                        "rule": "non_empty",
-                        "path": "security.pepper",
-                        "severity": "warning",
-                        "message": "Setting `security.pepper` to empty can lead to password storage security risks; run `cfms-ctl config fill-pepper`."
-                    }
-                ]
-            }),
-            options: json!({
-                "$schema": DRAFT_2020_12_DIALECT,
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {}
-            }),
-        };
-        std::fs::write(&template_path, template_content).expect("write template");
+        let ours_content = r#"# Operator header comment
+[server]
+host = "127.0.0.1" # custom bind
+port = 5104 # unchanged default with inline note
+secret_key = "operator-secret-key"
+workers = 16 # customized by operator
+old_unmodified_flag = false
+old_customized_flag = true
+both_added = "ours_val"
+shape_key = "custom_scalar"
 
-        // 1. Legacy database.db_name renames cleanly, removed core field is preserved with warning,
-        // unmanaged extension subtable is left untouched, and non-blocking invariant warnings surface.
-        let valid_config = r#"[server]
-host = "  127.0.0.1  "
-port = 5104
-secret_key = "secret"
-removed_core_flag = true
-
-[server.admission_control]
-max_inflight_requests = 20
+[legacy_unmodified]
+k = 1
 
 [security]
-pepper = ""
+pepper = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 [database]
 type = "sqlite"
-db_name = "custom_legacy_db"
+file = "prod.db"
+pool = { size = 5, max_overflow = 20 }
 
 [extensions]
 enabled = ["oidc_sso"]
@@ -1796,72 +1977,154 @@ enabled = ["oidc_sso"]
 [extensions.oidc_sso]
 issuer = "https://idp.example.com"
 client_id = "cfms-web"
+
+[operator_custom]
+note = "keep-me"
 "#;
-        std::fs::write(&config_path, valid_config).expect("write config");
-        let mut doc = ConfigDocument::load(&config_path).expect("load config");
-        let template_doc = ConfigDocument::load(&template_path).expect("load template");
-        let plan = doc
-            .sync_with_contract(&template_doc, &[], false, Some(&contract))
-            .expect("sync with contract");
-        assert_eq!(
-            plan.renamed_paths,
-            vec![RenamedPathRecord {
-                from: "database.db_name".to_string(),
-                to: "database.name".to_string(),
-            }]
-        );
-        assert_eq!(
-            plan.preserved_unknown_core_paths,
-            vec!["server.removed_core_flag"]
-        );
-        assert!(plan.warnings.len() >= 3);
-        let rendered = doc.document().to_string();
-        assert!(rendered.contains("name = \"custom_legacy_db\""));
-        assert!(!rendered.contains("db_name"));
-        assert!(rendered.contains("removed_core_flag = true"));
-        assert!(rendered.contains("[extensions.oidc_sso]"));
-        assert!(rendered.contains("issuer = \"https://idp.example.com\""));
+        let new_tpl_content = r#"[server]
+host = "0.0.0.0"
+port = 5105
+secret_key = ""
+workers = 8
+# Newly introduced timeout setting
+request_timeout = 30
+deleted_by_operator = "v2"
+both_added = "theirs_val"
 
-        // Strict validate still fails on preserved unknown core field
-        assert!(doc.validate_with_contract(Some(&contract)).is_err());
-
-        // Prune removes removed core key while keeping [extensions.oidc_sso] untouched
-        let prune_plan = doc
-            .sync_with_contract(&template_doc, &[], true, Some(&contract))
-            .expect("prune with contract");
-        assert_eq!(prune_plan.removed_paths, vec!["server.removed_core_flag"]);
-        assert!(doc.document().to_string().contains("[extensions.oidc_sso]"));
-        doc.validate_with_contract(Some(&contract))
-            .expect("valid after prune");
-
-        // 2. Config violating blocking order invariant fails
-        let bad_config = r#"[server]
-host = "127.0.0.1"
-port = 5104
-file_chunk_size = 1024
-
-[server.admission_control]
-max_connections = 32
-max_connections_per_ip = 64
+[server.shape_key]
+mode = "structured"
 
 [security]
-pepper = "abc"
+pepper = ""
 
 [database]
 type = "sqlite"
+file = "app.db"
+
+[database.pool]
+size = 10
+max_overflow = 10
 
 [extensions]
 enabled = []
 "#;
-        std::fs::write(&config_path, bad_config).expect("write bad config");
-        let mut bad_doc = ConfigDocument::load(&config_path).expect("load bad config");
-        let err = bad_doc
-            .sync_with_contract(&template_doc, &[], false, Some(&contract))
-            .expect_err("blocking invariant violation");
-        assert!(
-            err.to_string()
-                .contains("max_connections_per_ip must not exceed max_connections")
+        std::fs::write(&base_path, base_content).unwrap();
+        std::fs::write(&config_path, ours_content).unwrap();
+        std::fs::write(&new_tpl_path, new_tpl_content).unwrap();
+
+        let base_doc = ConfigDocument::load(&base_path).unwrap();
+        let mut ours_doc = ConfigDocument::load(&config_path).unwrap();
+        let new_tpl_doc = ConfigDocument::load(&new_tpl_path).unwrap();
+
+        let plan = ours_doc
+            .merge_three_way(&base_doc, &new_tpl_doc, &[], false)
+            .expect("3-way merge succeeds non-destructively");
+
+        assert!(plan.changed);
+        assert_eq!(plan.base_template_path.as_deref(), Some(base_path.as_path()));
+        assert_eq!(plan.added_paths, vec!["server.request_timeout".to_string()]);
+        assert_eq!(
+            plan.updated_paths,
+            vec!["database.pool.size".to_string(), "server.port".to_string()]
         );
+        assert_eq!(
+            plan.removed_paths,
+            vec![
+                "legacy_unmodified.k".to_string(),
+                "server.old_unmodified_flag".to_string(),
+            ]
+        );
+        assert_eq!(
+            plan.preserved_paths,
+            vec![
+                "operator_custom".to_string(),
+                "server.old_customized_flag".to_string(),
+            ]
+        );
+
+        // Verify all 5 conflict kinds were recorded non-destructively (ours wins)
+        let by_path: BTreeMap<&str, ConfigMergeConflictKind> = plan
+            .conflicts
+            .iter()
+            .map(|c| (c.path.as_str(), c.kind))
+            .collect();
+        assert_eq!(
+            by_path.get("server.workers"),
+            Some(&ConfigMergeConflictKind::BothModified)
+        );
+        assert_eq!(
+            by_path.get("server.both_added"),
+            Some(&ConfigMergeConflictKind::BothAdded)
+        );
+        assert_eq!(
+            by_path.get("server.old_customized_flag"),
+            Some(&ConfigMergeConflictKind::ModifyDelete)
+        );
+        assert_eq!(
+            by_path.get("server.deleted_by_operator"),
+            Some(&ConfigMergeConflictKind::DeleteModify)
+        );
+        assert_eq!(
+            by_path.get("server.shape_key"),
+            Some(&ConfigMergeConflictKind::ShapeMismatch)
+        );
+        assert_eq!(plan.warnings.len(), 5);
+
+        let rendered = ours_doc.document().to_string();
+        assert!(rendered.contains("# Operator header comment"));
+        assert!(rendered.contains("port = 5105 # unchanged default with inline note"));
+        assert!(rendered.contains("workers = 16 # customized by operator"));
+        assert!(rendered.contains("# Newly introduced timeout setting"));
+        assert!(rendered.contains("request_timeout = 30"));
+        assert!(!rendered.contains("old_unmodified_flag"));
+        assert!(!rendered.contains("[legacy_unmodified]"));
+        assert!(rendered.contains("old_customized_flag = true"));
+        assert!(rendered.contains("both_added = \"ours_val\""));
+        assert!(rendered.contains("shape_key = \"custom_scalar\""));
+        assert!(!rendered.contains("deleted_by_operator"));
+        assert!(rendered.contains("size = 10"));
+        assert!(rendered.contains("max_overflow = 20"));
+        assert!(rendered.contains("secret_key = \"operator-secret-key\""));
+        assert!(rendered.contains("[extensions.oidc_sso]"));
+        assert!(rendered.contains("issuer = \"https://idp.example.com\""));
+        assert!(rendered.contains("[operator_custom]"));
+
+        // Running 3-way merge with base == template is idempotent and makes zero changes.
+        let mut idempotent_doc = ConfigDocument::load(&config_path).unwrap();
+        let noop_plan = idempotent_doc
+            .merge_three_way(&base_doc, &base_doc, &[], false)
+            .expect("base == template no-op");
+        assert!(!noop_plan.changed);
+        assert!(noop_plan.conflicts.is_empty());
+        assert_eq!(idempotent_doc.document().to_string(), ours_content);
+    }
+
+    #[test]
+    fn test_merge_three_way_with_prune_clears_modify_delete_and_preserves_extensions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_path = dir.path().join("base.toml.sample");
+        let config_path = dir.path().join("config.toml");
+        let new_tpl_path = dir.path().join("new.toml.sample");
+
+        let base = "[database]\ntype = \"sqlite\"\nfile = \"a.db\"\n[server]\nobsolete = false\n[extensions]\nenabled = []\n";
+        let ours = "[database]\ntype = \"sqlite\"\nfile = \"a.db\"\n[server]\nobsolete = true\n[extensions]\nenabled = [\"oidc_sso\"]\n[extensions.oidc_sso]\nissuer = \"https://idp.example.com\"\n";
+        let theirs = "[database]\ntype = \"sqlite\"\nfile = \"a.db\"\n[server]\n[extensions]\nenabled = []\n";
+        std::fs::write(&base_path, base).unwrap();
+        std::fs::write(&config_path, ours).unwrap();
+        std::fs::write(&new_tpl_path, theirs).unwrap();
+
+        let base_doc = ConfigDocument::load(&base_path).unwrap();
+        let mut ours_doc = ConfigDocument::load(&config_path).unwrap();
+        let new_tpl_doc = ConfigDocument::load(&new_tpl_path).unwrap();
+
+        let plan = ours_doc
+            .merge_three_way(&base_doc, &new_tpl_doc, &[], true)
+            .expect("prune with 3-way merge");
+        assert!(plan.changed);
+        assert_eq!(plan.removed_paths, vec!["server.obsolete".to_string()]);
+        assert!(plan.conflicts.is_empty());
+        assert!(ours_doc.document().to_string().contains("[extensions.oidc_sso]"));
+        assert!(!ours_doc.document().to_string().contains("obsolete"));
     }
 
     #[test]
@@ -1928,7 +2191,7 @@ enabled = []
             .expect("distinct dialect");
 
         source_doc
-            .replace_database_section(&pg_doc, None)
+            .replace_database_section(&pg_doc)
             .expect("replace database section");
         let backup_path = source_doc.save_with_backup().expect("save with backup");
         assert!(backup_path.is_file());
@@ -1951,7 +2214,7 @@ enabled = []
         .expect("write config");
         let mut doc = ConfigDocument::load(&cfg_path).expect("load");
         assert_eq!(doc.extensions_enabled_raw().expect("read"), Some(vec![]));
-        doc.set_extensions_enabled(&["http_api".to_string(), "oidc_sso".to_string()], None)
+        doc.set_extensions_enabled(&["http_api".to_string(), "oidc_sso".to_string()])
             .expect("update enabled");
         let rendered = doc.document().to_string();
         assert!(rendered.contains("# Keep extension comment"));
@@ -1968,7 +2231,7 @@ enabled = []
         let mut minimal = ConfigDocument::load(&minimal_path).expect("load minimal");
         assert_eq!(minimal.extensions_enabled_raw().expect("absent"), None);
         minimal
-            .set_extensions_enabled(&["oidc_sso".to_string()], None)
+            .set_extensions_enabled(&["oidc_sso".to_string()])
             .expect("create extensions section");
         assert_eq!(
             minimal.extensions_enabled_raw().expect("created"),
@@ -2078,7 +2341,7 @@ addressing_style = "path"
         )
         .unwrap();
         let local_doc = ConfigDocument::load(&local_sample).unwrap();
-        assert!(local_doc.validate_with_contract(None).is_ok());
+        assert!(local_doc.validate_structural_baseline().is_ok());
 
         // 3. s3 storage without bucket fails
         let missing_bucket = dir.path().join("missing_bucket.toml");

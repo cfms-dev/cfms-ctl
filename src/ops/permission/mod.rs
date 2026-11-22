@@ -317,7 +317,7 @@ pub async fn purge_expired(
 /// Core testable implementation of `purge-expired` with an injected pool.
 pub async fn purge_expired_with_context(
     pool: &DbPool,
-    paths: Option<&WorkspacePaths>,
+    _paths: Option<&WorkspacePaths>,
     args: &PermissionPurgeExpiredArgs,
     ui: &UiConsole,
     yes: bool,
@@ -331,7 +331,7 @@ pub async fn purge_expired_with_context(
     )?;
 
     let warnings = preflight_purge_schema(pool, args.scope).await?;
-    let cfg = resolve_purge_config(pool, paths, args).await?;
+    let cfg = resolve_purge_config(pool, args).await?;
     let inspect = inspect_expired_permissions(pool, args.scope, cfg.cutoff_timestamp).await?;
 
     let eligible_count = inspect.total_eligible();
@@ -783,7 +783,6 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::All,
                 batch_size: Some(250),
-                contract: None,
                 dry_run: false,
             },
         )
@@ -799,7 +798,6 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::All,
                 batch_size: Some(250),
-                contract: None,
                 dry_run: true,
             },
         )
@@ -820,7 +818,6 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::User,
                 batch_size: Some(2),
-                contract: None,
                 dry_run: false,
             },
         )
@@ -858,7 +855,6 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::Group,
                 batch_size: Some(250),
-                contract: None,
                 dry_run: false,
             },
         )
@@ -880,7 +876,6 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::Group,
                 batch_size: Some(250),
-                contract: None,
                 dry_run: false,
             },
         )
@@ -903,7 +898,6 @@ mod tests {
                 retention_days: None,
                 scope: PermissionScope::All,
                 batch_size: Some(250),
-                contract: None,
                 dry_run: false,
             },
         )
@@ -1085,7 +1079,6 @@ mod tests {
             retention_days: None,
             scope: PermissionScope::User,
             batch_size: Some(7),
-            contract: None,
             dry_run: false,
         };
         let ctx_p1 = ctx_for(&env.root, OutputFormat::Json, true);
