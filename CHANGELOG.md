@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- git-cliff: end of header -->
 
+## [0.5.0] - 2026-11-25
+
+### Added
+
+- [**breaking**] Refactor extension handling by removing CoreConfigContract dependency
+- Refactor backup and deployment components for schema updates and permission adjustments
+
+**Full Changelog**: https://github.com/cfms-dev/cfms-ctl/compare/v0.4.0..v0.5.0
+
 ## [0.4.0] - 2026-11-16
 
 ### Added
