@@ -562,7 +562,10 @@ pub async fn diagnose_resume_database(
 ) -> Result<ResumeDbDiagnosis> {
     let pool = ctx.connect_db(paths).await?;
     let dialect = pool.kind();
-    let drift = SchemaInspector::inspect(&pool).await?;
+    let target_ir = extract_code_schema_ir(paths, ExtractorMode::Auto, None, None, false, true)
+        .await
+        .unwrap_or_else(|_| builtin_schema_ir(false));
+    let drift = SchemaInspector::inspect_against_ir(&pool, &target_ir).await?;
     let rev_opt = drift.current_revision.clone();
     pool.close().await;
 

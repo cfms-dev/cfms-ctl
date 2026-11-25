@@ -1558,7 +1558,7 @@ mod tests {
         .await
         .unwrap();
         let reloaded_live = load_schema_ir_file(&exported_live_path, false).unwrap();
-        assert_eq!(reloaded_live.tables.len(), 40);
+        assert_eq!(reloaded_live.tables.len(), 35);
 
         // 4. `database diff live code --emit-sql ... --emit-alembic ...`
         let diff_sql_path = dir.path().join("diff_upgrade.sql");

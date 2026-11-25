@@ -6,9 +6,9 @@ use clap::{Args, Subcommand, ValueEnum};
 /// Logical backup components supported by `cfms-ctl backup export`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, ValueEnum)]
 pub enum BackupComponentArg {
-    /// Users, credentials, groups, permissions, keyrings, userblocks, schedules, and account extensions.
+    /// Users, credentials, groups, permissions, keyrings, schedules, and account extensions.
     Accounts,
-    /// Nodes, folders, documents, revisions, metadata, access entries, and compiled access rules.
+    /// Nodes, folders, documents, revisions, metadata, and DACL rules.
     Documents,
     /// Audit log entries (`audit_entries`).
     Audit,

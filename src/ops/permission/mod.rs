@@ -1009,15 +1009,15 @@ mod tests {
         let (rep_a, rep_b) = tokio::join!(sync_defaults(&ctx_a, &args), sync_defaults(&ctx_b, &args));
         let ra = rep_a.unwrap();
         let rb = rep_b.unwrap();
-        assert_eq!(ra.inserted_count + rb.inserted_count, 65);
+        assert_eq!(ra.inserted_count + rb.inserted_count, 43);
         assert!(ra.in_sync && rb.in_sync);
 
-        // Check total `group_permissions` rows for user (3) + sysop (64) + custom_team (1) == 68
+        // Check total `group_permissions` rows for user (3) + sysop (42) + custom_team (1) == 46
         let total_gp: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM group_permissions")
             .fetch_one(sq)
             .await
             .unwrap();
-        assert_eq!(total_gp, 68);
+        assert_eq!(total_gp, 46);
 
         // Verify revocation of `user`/`search` is completely untouched (`granted = 0`)
         let search_granted: bool = sqlx::query_scalar(

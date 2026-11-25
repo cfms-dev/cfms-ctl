@@ -8,7 +8,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{MySql, Postgres, Row, Sqlite, Transaction};
 use uuid::Uuid;
 use crate::core::error::{CfmsError, Result};
-use crate::db::schema::{LATEST_SCHEMA_REVISION, SchemaInspector};
+use crate::db::schema::{LATEST_SCHEMA_REVISION, ROOT_SCHEMA_REVISION, SchemaInspector};
 use crate::db::{DatabaseKind, DbPool};
 use crate::ops::user::auth_policy::{AuthPurpose, AuthStep, PolicyMutation, PolicyRow};
 
@@ -340,15 +340,27 @@ pub async fn preflight_user_schema(pool: &DbPool) -> Result<SchemaPreflight> {
 
     if !report.revision_matches {
         let current = report.current_revision.as_deref().unwrap_or("<none>");
-        return Err(CfmsError::SchemaDrift(format!(
-            "Database schema revision '{current}' does not match expected '{LATEST_SCHEMA_REVISION}'; run `cfms-ctl database upgrade` first"
-        )));
+        if report.current_revision.as_deref() != Some(ROOT_SCHEMA_REVISION) {
+            return Err(CfmsError::SchemaDrift(format!(
+                "Database schema revision '{current}' does not match expected '{LATEST_SCHEMA_REVISION}'; run `cfms-ctl database upgrade` first"
+            )));
+        }
     }
 
-    if !report.column_mismatches.is_empty() {
+    let relevant_drift: Vec<&str> = report
+        .column_mismatches
+        .iter()
+        .map(String::as_str)
+        .filter(|msg| {
+            REQUIRED_USER_TABLES
+                .iter()
+                .any(|tbl| msg.starts_with(&format!("{tbl}.")))
+        })
+        .collect();
+    if !relevant_drift.is_empty() {
         return Err(CfmsError::SchemaDrift(format!(
-            "Database schema has column drift ({} mismatch(es)); run `cfms-ctl database check` for details",
-            report.column_mismatches.len()
+            "Database schema has column drift in authentication tables ({}); run `cfms-ctl database check` for details",
+            relevant_drift.join("; ")
         )));
     }
 

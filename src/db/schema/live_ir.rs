@@ -1184,7 +1184,7 @@ mod tests {
         let ir = introspect_live_schema_ir(&pool, true, None)
             .await
             .expect("introspect live sqlite");
-        assert_eq!(ir.core_table_names().len(), 40);
+        assert_eq!(ir.core_table_names().len(), 35);
         assert_eq!(ir.extension_table_names(), BTreeSet::from(["user_oidc_credentials".to_string()]));
 
         let nodes = &ir.tables["nodes"];

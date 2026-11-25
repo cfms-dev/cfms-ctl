@@ -5,7 +5,7 @@
 //! 2. Dependency-free static Python AST inspection (`ruff_python_parser`) of
 //!    `<src_dir>/include/domains/access/permissions.py` and
 //!    `<src_dir>/include/domains/identity/default_groups.py`.
-//! 3. Compiled 0.14.x built-in fallback snapshot when Python source files are absent
+//! 3. Compiled CEP-0002 CACL built-in fallback snapshot when Python source files are absent
 //!    (for example, stripped or DB-only workspaces), accompanied by a warning.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -24,22 +24,16 @@ const MAX_IDENTIFIER_LEN: usize = 255;
 const PERMISSIONS_REL_PATH: &str = "include/domains/access/permissions.py";
 const DEFAULT_GROUPS_REL_PATH: &str = "include/domains/identity/default_groups.py";
 
-/// Built-in default permissions for the `user` group (CFMS 0.14.x baseline).
+/// Built-in default permissions for the `user` group.
 const BUILTIN_USER_PERMISSIONS: &[&str] = &["configure_auth_methods", "search", "set_username"];
 
-/// Built-in default permissions for the `sysop` group (CFMS 0.14.x baseline).
+/// Built-in default permissions for the `sysop` group (CEP-0002 CACL baseline).
 const BUILTIN_SYSOP_PERMISSIONS: &[&str] = &[
-    "move",
+    "purge",
+    "delete_revision",
+    "bypass_dacl",
+    "bypass_traverse_checking",
     "shutdown",
-    "super_create_document",
-    "super_create_directory",
-    "super_list_directory",
-    "create_document",
-    "create_directory",
-    "delete_document",
-    "rename_document",
-    "delete_directory",
-    "rename_directory",
     "view_settings",
     "manage_settings",
     "diagnostics",
@@ -55,10 +49,6 @@ const BUILTIN_SYSOP_PERMISSIONS: &[&str] = &[
     "get_group_info",
     "change_user_groups",
     "super_configure_auth_methods",
-    "view_access_rules",
-    "set_access_rules",
-    "view_metadata",
-    "set_metadata_tags",
     "list_users",
     "list_groups",
     "create_group",
@@ -71,26 +61,14 @@ const BUILTIN_SYSOP_PERMISSIONS: &[&str] = &[
     "bypass_request_rate_limit",
     "apply_lockdown",
     "view_audit_logs",
-    "manage_access",
-    "view_access_entries",
-    "block",
-    "unblock",
     "super_set_user_avatar",
     "debugging",
     "super_list_user_auth_methods",
-    "list_revisions",
-    "view_revision",
-    "set_current_revision",
-    "delete_revision",
     "manage_keyrings",
-    "list_user_blocks",
     "list_banned_subnets",
     "manage_banned_subnets",
     "list_auth_lockouts",
     "unlock_auth_lockouts",
-    "purge",
-    "restore",
-    "list_deleted_items",
     "super_set_nickname",
     "set_user_avatar",
 ];
@@ -149,7 +127,7 @@ impl DefaultGroupPermissions {
         }
     }
 
-    /// Return the built-in 0.14.x default group permission snapshot.
+    /// Return the built-in CEP-0002 CACL default group permission snapshot.
     #[must_use]
     pub fn builtin() -> Self {
         let mut groups = BTreeMap::new();
@@ -681,7 +659,7 @@ mod tests {
         let builtin = DefaultGroupPermissions::builtin();
         assert_eq!(builtin.source, DefaultsSource::BuiltinFallback);
         assert_eq!(builtin.groups["user"].len(), 3);
-        assert_eq!(builtin.groups["sysop"].len(), 64);
+        assert_eq!(builtin.groups["sysop"].len(), 42);
 
         // No duplicates inside any default group
         for (group, perms) in &builtin.groups {

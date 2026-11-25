@@ -467,10 +467,11 @@ pub fn extract_static_schema_ir(
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut env: HashMap<String, StaticScalar> = HashMap::new();
+    let mut custom_types: HashMap<String, CanonicalType> = HashMap::new();
     let mut classes: HashMap<String, ClassRecord> = HashMap::new();
     let mut class_order: Vec<String> = Vec::new();
 
-    // Pass 1: constants, Enums, Mixins, and model ClassDefs.
+    // Pass 1: constants, Enums, TypeDecorator subclasses, Mixins, and model ClassDefs.
     for (file_path, ownership) in &files {
         let src = match std::fs::read_to_string(file_path) {
             Ok(s) => s,
@@ -494,6 +495,7 @@ pub fn extract_static_schema_ir(
             file_path,
             ownership,
             &mut env,
+            &mut custom_types,
             &mut classes,
             &mut class_order,
         );
@@ -521,6 +523,7 @@ pub fn extract_static_schema_ir(
             &class_chain,
             &classes,
             &env,
+            &custom_types,
             &mut warnings,
         );
         pending_tables.insert(tablename.clone(), (raw_cols, table_ir));
@@ -650,11 +653,19 @@ fn collect_py_files_recursive(
     }
 }
 
+fn class_base_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Subscript(sub) => expr_dotted_last(&sub.value),
+        other => expr_ident(other).or_else(|| expr_dotted_last(other)),
+    }
+}
+
 fn collect_pass1(
     module: &ModModule,
     file_path: &Path,
     ownership: &TableOwnership,
     env: &mut HashMap<String, StaticScalar>,
+    custom_types: &mut HashMap<String, CanonicalType>,
     classes: &mut HashMap<String, ClassRecord>,
     class_order: &mut Vec<String>,
 ) {
@@ -682,7 +693,7 @@ fn collect_pass1(
                     .map(|args| {
                         args.args
                             .iter()
-                            .filter_map(|e| expr_ident(e).or_else(|| expr_dotted_last(e)))
+                            .filter_map(class_base_name)
                             .map(ToString::to_string)
                             .collect::<Vec<_>>()
                     })
@@ -693,6 +704,30 @@ fn collect_pass1(
                     .any(|b| matches!(b.as_str(), "Enum" | "IntEnum" | "StrEnum"));
                 if is_enum {
                     collect_enum_members(&cls.name, &cls.body, env);
+                    continue;
+                }
+
+                if bases.iter().any(|b| b == "TypeDecorator") {
+                    for body_stmt in &cls.body {
+                        let impl_expr = match body_stmt {
+                            Stmt::Assign(a)
+                                if a.targets.len() == 1
+                                    && expr_ident(&a.targets[0]) == Some("impl") =>
+                            {
+                                Some(a.value.as_ref())
+                            }
+                            Stmt::AnnAssign(a) if expr_ident(&a.target) == Some("impl") => {
+                                a.value.as_deref()
+                            }
+                            _ => None,
+                        };
+                        if let Some(expr) = impl_expr
+                            && let Some(ty) = parse_sqlalchemy_type_expr(expr, env, custom_types)
+                        {
+                            custom_types.insert(cls.name.to_string(), ty);
+                            break;
+                        }
+                    }
                     continue;
                 }
 
@@ -800,6 +835,7 @@ fn build_table_from_chain(
     chain: &[&ClassRecord],
     _classes: &HashMap<String, ClassRecord>,
     env: &HashMap<String, StaticScalar>,
+    custom_types: &HashMap<String, CanonicalType>,
     warnings: &mut Vec<String>,
 ) -> (Vec<RawColumn>, TableIr) {
     let mut raw_cols: Vec<RawColumn> = Vec::new();
@@ -873,6 +909,7 @@ fn build_table_from_chain(
                             Some(call),
                             table_name,
                             env,
+                            custom_types,
                             &mut pk_cols,
                             &mut foreign_keys,
                             &mut uniques,
@@ -920,6 +957,7 @@ fn build_table_from_chain(
                         call_opt,
                         table_name,
                         env,
+                        custom_types,
                         &mut pk_cols,
                         &mut foreign_keys,
                         &mut uniques,
@@ -1059,6 +1097,7 @@ fn parse_column_call(
     call_opt: Option<&ast::ExprCall>,
     table_name: &str,
     env: &HashMap<String, StaticScalar>,
+    custom_types: &HashMap<String, CanonicalType>,
     pk_cols: &mut Vec<String>,
     foreign_keys: &mut Vec<ForeignKeyIr>,
     uniques: &mut Vec<UniqueIr>,
@@ -1091,7 +1130,7 @@ fn parse_column_call(
                 foreign_keys.push(fk);
                 continue;
             }
-            if let Some(ct) = parse_sqlalchemy_type_expr(arg, env) {
+            if let Some(ct) = parse_sqlalchemy_type_expr(arg, env, custom_types) {
                 explicit_type = Some(ct);
             } else if is_computed_call(arg) {
                 computed = parse_computed_call(arg, env);
@@ -1215,15 +1254,16 @@ fn parse_foreign_key_expr(expr: &Expr, col_name: &str, table_name: &str) -> Opti
 fn parse_sqlalchemy_type_expr(
     expr: &Expr,
     env: &HashMap<String, StaticScalar>,
+    custom_types: &HashMap<String, CanonicalType>,
 ) -> Option<CanonicalType> {
     // Handle `.with_variant(variant_type, dialect_name)` chain recursively.
     if let Expr::Call(call) = expr
         && let Expr::Attribute(attr) = call.func.as_ref()
         && attr.attr.as_str() == "with_variant"
     {
-        let base = parse_sqlalchemy_type_expr(&attr.value, env)?;
+        let base = parse_sqlalchemy_type_expr(&attr.value, env, custom_types)?;
         let variant_ty = call.arguments.args.first().and_then(|v| {
-            parse_sqlalchemy_type_expr(v, env).or_else(|| class_ref_type_name(v))
+            parse_sqlalchemy_type_expr(v, env, custom_types).or_else(|| class_ref_type_name(v, custom_types))
         });
         let dialect = call.arguments.args.get(1).and_then(eval_string_expr);
         return match (base, variant_ty, dialect.as_deref()) {
@@ -1255,7 +1295,7 @@ fn parse_sqlalchemy_type_expr(
         };
     }
 
-    if let Some(class_ty) = class_ref_type_name(expr) {
+    if let Some(class_ty) = class_ref_type_name(expr, custom_types) {
         return Some(class_ty);
     }
 
@@ -1263,6 +1303,9 @@ fn parse_sqlalchemy_type_expr(
         return None;
     };
     let name = expr_dotted_last(&call.func)?;
+    if let Some(custom_ty) = custom_types.get(name) {
+        return Some(custom_ty.clone());
+    }
     let arg0_int = call
         .arguments
         .args
@@ -1347,8 +1390,14 @@ fn parse_sqlalchemy_type_expr(
     }
 }
 
-fn class_ref_type_name(expr: &Expr) -> Option<CanonicalType> {
+fn class_ref_type_name(
+    expr: &Expr,
+    custom_types: &HashMap<String, CanonicalType>,
+) -> Option<CanonicalType> {
     let name = expr_dotted_last(expr)?;
+    if let Some(custom_ty) = custom_types.get(name) {
+        return Some(custom_ty.clone());
+    }
     match name {
         "Integer" | "INTEGER" => Some(CanonicalType::Integer),
         "SmallInteger" | "SMALLINT" => Some(CanonicalType::SmallInt),
@@ -1860,6 +1909,48 @@ class ChildItem(Base):
         let child = &ir.tables["child_items"];
         assert_eq!(child.column("seq").unwrap().canonical_type, CanonicalType::BigSerial);
         assert_eq!(child.column("parent_id").unwrap().canonical_type, CanonicalType::Uuid);
+    }
+
+    #[test]
+    fn static_ast_unwraps_sqlalchemy_type_decorator_impl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let src = root.join("src");
+        let models_dir = src.join("include").join("database").join("models");
+        std::fs::create_dir_all(&models_dir).expect("mkdir models");
+        std::fs::write(src.join("main.py"), "# entry").expect("write main.py");
+
+        std::fs::write(
+            models_dir.join("access.py"),
+            r#"
+import datetime
+from sqlalchemy import BigInteger, Integer, TypeDecorator
+from sqlalchemy.orm import Mapped, mapped_column
+
+class UtcEpochMicros(TypeDecorator[datetime.datetime]):
+    impl = BigInteger
+    cache_ok = True
+
+class PlainCustomInt(TypeDecorator):
+    impl = Integer
+
+class NodeDaclRule(Base):
+    __tablename__ = "dacl_rules"
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    valid_from: Mapped[datetime.datetime | None] = mapped_column(UtcEpochMicros(), nullable=True)
+    valid_until: Mapped[datetime.datetime | None] = mapped_column(UtcEpochMicros, nullable=True)
+    custom_flag: Mapped[str] = mapped_column(PlainCustomInt())
+"#,
+        )
+        .expect("write access.py");
+
+        let paths = WorkspacePaths::discover(Some(&src), None).expect("discover");
+        let ir = extract_static_schema_ir(&paths, false).expect("extract");
+        let tbl = &ir.tables["dacl_rules"];
+        assert_eq!(tbl.column("valid_from").unwrap().canonical_type, CanonicalType::BigInt);
+        assert!(tbl.column("valid_from").unwrap().nullable);
+        assert_eq!(tbl.column("valid_until").unwrap().canonical_type, CanonicalType::BigInt);
+        assert_eq!(tbl.column("custom_flag").unwrap().canonical_type, CanonicalType::Integer);
     }
 
     #[test]

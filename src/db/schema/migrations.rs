@@ -1,22 +1,19 @@
 //! Native multi-backend (SQLite, MySQL, PostgreSQL) schema bootstrap and incremental
-//! migration engine covering all 20 CFMS Alembic revisions (`fe8863687aa4` .. `e952c02c1454`).
+//! migration engine covering CFMS 0.14.0 (`e952c02c1454`) -> CEP-0002 CACL (`a66108639ed7`).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
-use rand::Rng;
 use serde::Serialize;
 use sqlx::{Acquire, Row};
 use tokio::process::Command;
-use uuid::Uuid;
 
 use crate::core::error::{CfmsError, Result};
 use crate::core::paths::{AlembicPaths, WorkspacePaths};
 use crate::db::backend::{DatabaseKind, DbPool, ServerCompatibility};
 use crate::db::schema::ddl::{
-    USER_OIDC_CREDENTIALS_TABLE, builtin_schema_ir, create_head_schema, execute_ddl_statements,
-    set_alembic_version, table_def,
+    builtin_schema_ir, create_head_schema, execute_ddl_statements, set_alembic_version, table_def,
 };
 use crate::db::schema::diff::{DiffOptions, SchemaDiffPlan, SchemaOp, diff_schemas};
 use crate::db::schema::inspector::{SchemaDriftReport, SchemaInspector};
@@ -42,7 +39,7 @@ pub struct SchemaUpgradeOutcome {
     pub warnings: Vec<String>,
 }
 
-/// Inspect the target database and either bootstrap an empty database to HEAD (`e952c02c1454`)
+/// Inspect the target database and either bootstrap an empty database to HEAD (`a66108639ed7`)
 /// or execute the remaining linear upgrade steps to HEAD.
 pub async fn upgrade_database_schema(pool: &DbPool) -> Result<SchemaUpgradeOutcome> {
     let compatibility = pool.validate_server_compatibility().await?;
@@ -439,9 +436,8 @@ pub async fn plan_hybrid_upgrade(
         });
     }
 
-    // Preserve the battle-tested 19-step native historical upgrade path (including complex
-    // UUID backfills, password/TOTP splits, and rate limit pruning) when upgrading from 0.13.x/0.14.x
-    // straight to 0.14.x HEAD (`e952c02c1454`).
+    // Preserve the native upgrade path from CFMS 0.14.0 (`e952c02c1454`) to HEAD (`a66108639ed7`),
+    // including root DACL seeding, permission pruning/grants, and legacy table cleanup.
     if is_known_revision(current_rev)
         && current_rev != LATEST_SCHEMA_REVISION
         && target_revision == LATEST_SCHEMA_REVISION
@@ -500,7 +496,7 @@ pub async fn plan_hybrid_upgrade(
     };
 
     let diff_base = if !historical_steps.is_empty() {
-        // Historical native steps will first advance the live DB to `e952c02c1454`.
+        // Historical native steps will first advance the live DB to `a66108639ed7`.
         let mut base = builtin_schema_ir(true);
         base.schema_revision = Some(LATEST_SCHEMA_REVISION.to_string());
         filter_target_ir(&base, Some(&live_table_names), opts.include_extensions)
@@ -1030,31 +1026,18 @@ finally:
     )))
 }
 
+/// Execute the native `e952c02c1454` -> `a66108639ed7` CEP-0002 CACL migration step.
+pub(crate) async fn apply_cacl_migration_step(pool: &DbPool) -> Result<()> {
+    step_a66108639ed7(pool).await
+}
+
 async fn apply_revision_step(
     pool: &DbPool,
     revision: &str,
     _compat: &ServerCompatibility,
 ) -> Result<()> {
     match revision {
-        "b4b3061f385c" => step_b4b3061f385c(pool).await,
-        "76f1c7621e23" => step_76f1c7621e23(pool).await,
-        "f239d439f893" => step_f239d439f893(pool).await,
-        "170e0a16133e" => step_170e0a16133e(pool).await,
-        "7bddfba0d8aa" => step_7bddfba0d8aa(pool).await,
-        "ab7efda19079" => step_ab7efda19079(pool).await,
-        "8c130010a943" => step_8c130010a943(pool).await,
-        "39084f380eaa" => step_39084f380eaa(pool).await,
-        "adc1283fb393" => step_adc1283fb393(pool).await,
-        "6dba0956fa9d" => step_6dba0956fa9d(pool).await,
-        "3c496a214a87" => step_3c496a214a87(pool).await,
-        "0460356a5ba6" => step_0460356a5ba6(pool).await,
-        "5ad5aca75635" => step_5ad5aca75635(pool).await,
-        "d252e662fc05" => step_d252e662fc05(pool).await,
-        "b2ea9cac8462" => step_b2ea9cac8462(pool).await,
-        "3815ba18197b" => step_3815ba18197b(pool).await,
-        "03197fed3401" => step_03197fed3401(pool).await,
-        "16c86712512a" => step_16c86712512a(pool).await,
-        "e952c02c1454" => step_e952c02c1454(pool).await,
+        "a66108639ed7" => step_a66108639ed7(pool).await,
         other => Err(CfmsError::SchemaDrift(format!(
             "Unsupported migration revision step '{other}'"
         ))),
@@ -1070,12 +1053,6 @@ fn now_unix_seconds() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     dur.as_secs_f64()
-}
-
-fn random_hex(num_bytes: usize) -> String {
-    let mut bytes = vec![0u8; num_bytes];
-    rand::rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
 }
 
 async fn has_column(pool: &DbPool, table: &str, col: &str) -> Result<bool> {
@@ -1119,8 +1096,19 @@ async fn has_index(pool: &DbPool, table: &str, index_name: &str) -> Result<bool>
     Ok(found)
 }
 
-async fn execute_single_ddl(pool: &DbPool, sql: &str) -> Result<()> {
-    execute_ddl_statements(pool, &[sql.to_string()]).await
+async fn has_mysql_fk(pool: &DbPool, table: &str, fk_name: &str) -> Result<bool> {
+    let DbPool::Mysql(p) = pool else {
+        return Ok(false);
+    };
+    let cnt: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.table_constraints \
+         WHERE constraint_schema = DATABASE() AND table_name = ? AND constraint_name = ? AND constraint_type = 'FOREIGN KEY'",
+    )
+    .bind(table)
+    .bind(fk_name)
+    .fetch_one(p)
+    .await?;
+    Ok(cnt > 0)
 }
 
 /// Safely rebuild a SQLite table using the 12-step copy-and-swap pattern with `PRAGMA foreign_keys = OFF`
@@ -1225,7 +1213,7 @@ async fn grant_sysop_permissions(
         let already_granted: i64 = match pool {
             DbPool::Sqlite(p) => {
                 sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM group_permissions WHERE group_name = ? AND permission = ? AND granted = 1",
+                    "SELECT COUNT(*) FROM group_permissions WHERE group_name = ? AND permission = ? AND granted = 1 AND end_time IS NULL",
                 )
                 .bind("sysop")
                 .bind(perm)
@@ -1234,7 +1222,7 @@ async fn grant_sysop_permissions(
             }
             DbPool::Mysql(p) => {
                 sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM group_permissions WHERE group_name = ? AND permission = ? AND granted = true",
+                    "SELECT COUNT(*) FROM group_permissions WHERE group_name = ? AND permission = ? AND granted = true AND end_time IS NULL",
                 )
                 .bind("sysop")
                 .bind(perm)
@@ -1243,7 +1231,7 @@ async fn grant_sysop_permissions(
             }
             DbPool::Postgres(p) => {
                 sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM group_permissions WHERE group_name = $1 AND permission = $2 AND granted = true",
+                    "SELECT COUNT(*) FROM group_permissions WHERE group_name = $1 AND permission = $2 AND granted = true AND end_time IS NULL",
                 )
                 .bind("sysop")
                 .bind(perm)
@@ -1333,1550 +1321,96 @@ async fn grant_sysop_permissions(
 }
 
 // ============================================================================
-// 19 Forward Step Transitions: b4b3061f385c .. e952c02c1454
+// Forward Step Transition: e952c02c1454 (0.14.0) -> a66108639ed7 (CEP-0002 CACL)
 // ============================================================================
 
-async fn step_b4b3061f385c(pool: &DbPool) -> Result<()> {
-    grant_sysop_permissions(pool, None, &["diagnostics"]).await
-}
-
-async fn step_76f1c7621e23(pool: &DbPool) -> Result<()> {
-    if has_column(pool, "userblock_entries", "reason_comment_id").await? {
-        return Ok(());
-    }
-    match pool.kind() {
-        DatabaseKind::Sqlite => {
-            // Works identically whether called during old username-keyed or newer user_id-keyed rebuild.
-            let has_user_id = has_column(pool, "userblock_entries", "user_id").await?;
-            let id_col = if has_user_id {
-                "user_id CHAR(32) NOT NULL"
-            } else {
-                "username VARCHAR(256) NOT NULL"
-            };
-            let id_name = if has_user_id { "user_id" } else { "username" };
-            let fk_user = if has_user_id {
-                "CONSTRAINT fk_userblock_entries_user_id_users FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE"
-            } else {
-                "CONSTRAINT fk_userblock_entries_username_users FOREIGN KEY(username) REFERENCES users (username) ON DELETE CASCADE"
-            };
-            let create_tmp = format!(
-                "CREATE TABLE _cfms_rebuild_userblock_entries (\n\
-                    block_id VARCHAR(32) NOT NULL,\n\
-                    {id_col},\n\
-                    timestamp DOUBLE NOT NULL,\n\
-                    not_before DOUBLE NOT NULL,\n\
-                    not_after DOUBLE NOT NULL,\n\
-                    target_type VARCHAR(32) NOT NULL,\n\
-                    target_id VARCHAR(255),\n\
-                    reason_comment_id INTEGER,\n\
-                    CONSTRAINT pk_userblock_entries PRIMARY KEY (block_id),\n\
-                    {fk_user},\n\
-                    CONSTRAINT fk_userblock_entries_reason_comment_id_comments FOREIGN KEY(reason_comment_id) REFERENCES comments (comment_id) ON DELETE SET NULL\n\
-                )"
-            );
-            let copy_sql = format!(
-                "INSERT INTO _cfms_rebuild_userblock_entries (block_id, {id_name}, timestamp, not_before, not_after, target_type, target_id, reason_comment_id) \
-                 SELECT block_id, {id_name}, timestamp, not_before, not_after, target_type, target_id, NULL FROM userblock_entries"
-            );
-            sqlite_rebuild_table(pool, "userblock_entries", &create_tmp, &copy_sql, &[]).await
-        }
-        DatabaseKind::Mysql | DatabaseKind::Postgresql => {
-            execute_ddl_statements(
-                pool,
-                &[
-                    "ALTER TABLE userblock_entries ADD COLUMN reason_comment_id BIGINT".to_string(),
-                    "ALTER TABLE userblock_entries ADD CONSTRAINT fk_userblock_entries_reason_comment_id_comments FOREIGN KEY (reason_comment_id) REFERENCES comments (comment_id) ON DELETE SET NULL".to_string(),
-                ],
-            )
-            .await
-        }
-    }
-}
-
-async fn step_f239d439f893(pool: &DbPool) -> Result<()> {
-    let mut stmts = Vec::new();
-    if !has_index(pool, "group_permissions", "ix_group_permissions_end_time_id").await? {
-        stmts.push("CREATE INDEX ix_group_permissions_end_time_id ON group_permissions (end_time, id)".to_string());
-    }
-    if !has_index(pool, "user_permissions", "ix_user_permissions_end_time_id").await? {
-        stmts.push("CREATE INDEX ix_user_permissions_end_time_id ON user_permissions (end_time, id)".to_string());
-    }
-    if !stmts.is_empty() {
-        execute_ddl_statements(pool, &stmts).await?;
-    }
-    Ok(())
-}
-
-async fn step_170e0a16133e(pool: &DbPool) -> Result<()> {
-    if has_column(pool, "nodes", "active_name").await? {
-        return Ok(());
-    }
-    if !has_column(pool, "nodes", "active_parent_id").await? {
-        return Err(CfmsError::SchemaDrift(
-            "Cannot migrate node namespace: neither active_parent_id nor active_name exists on nodes".to_string(),
-        ));
-    }
-
-    match pool.kind() {
-        DatabaseKind::Sqlite => {
-            let create_tmp = "CREATE TABLE _cfms_rebuild_nodes (\n\
-                id VARCHAR(255) NOT NULL,\n\
-                type VARCHAR(16) NOT NULL,\n\
-                name VARCHAR(255) NOT NULL,\n\
-                parent_id VARCHAR(255),\n\
-                active_name VARCHAR(255) GENERATED ALWAYS AS (CASE WHEN status = 1 THEN NULL ELSE name END) STORED,\n\
-                inherit BOOLEAN NOT NULL,\n\
-                status INTEGER NOT NULL,\n\
-                status_operation_id VARCHAR(255),\n\
-                access_rule_set_id VARCHAR(32),\n\
-                CONSTRAINT pk_nodes PRIMARY KEY (id),\n\
-                CONSTRAINT ck_nodes_root_parent CHECK (id = '/' AND parent_id IS NULL AND type = 'directory' OR id != '/' AND parent_id IS NOT NULL),\n\
-                CONSTRAINT uq_nodes_active_parent_name UNIQUE (parent_id, active_name),\n\
-                CONSTRAINT fk_nodes_parent_id_folders FOREIGN KEY(parent_id) REFERENCES folders (id) ON DELETE CASCADE,\n\
-                CONSTRAINT fk_nodes_access_rule_set_id_compiled_access_rule_sets FOREIGN KEY(access_rule_set_id) REFERENCES compiled_access_rule_sets (id)\n\
-            )";
-            let copy_sql = "INSERT INTO _cfms_rebuild_nodes (id, type, name, parent_id, inherit, status, status_operation_id, access_rule_set_id) \
-                SELECT id, type, name, parent_id, inherit, status, status_operation_id, access_rule_set_id FROM nodes";
-            let indexes = table_def("nodes")
-                .expect("nodes def")
-                .compile_create_indexes(DatabaseKind::Sqlite);
-            sqlite_rebuild_table(pool, "nodes", create_tmp, copy_sql, &indexes).await
-        }
-        DatabaseKind::Mysql => {
-            execute_ddl_statements(
-                pool,
-                &[
-                    "ALTER TABLE nodes DROP INDEX uq_nodes_active_parent_name, DROP COLUMN active_parent_id, ADD COLUMN active_name VARCHAR(255) GENERATED ALWAYS AS (CASE WHEN status = 1 THEN NULL ELSE name END) STORED, ADD CONSTRAINT uq_nodes_active_parent_name UNIQUE (parent_id, active_name)".to_string(),
-                ],
-            )
-            .await
-        }
-        DatabaseKind::Postgresql => {
-            execute_ddl_statements(
-                pool,
-                &[
-                    "ALTER TABLE nodes DROP CONSTRAINT IF EXISTS uq_nodes_active_parent_name".to_string(),
-                    "ALTER TABLE nodes DROP COLUMN active_parent_id".to_string(),
-                    "ALTER TABLE nodes ADD COLUMN active_name VARCHAR(255) GENERATED ALWAYS AS (CASE WHEN status = 1 THEN NULL ELSE name END) STORED".to_string(),
-                    "ALTER TABLE nodes ADD CONSTRAINT uq_nodes_active_parent_name UNIQUE (parent_id, active_name)".to_string(),
-                ],
-            )
-            .await
-        }
-    }
-}
-
-async fn step_7bddfba0d8aa(pool: &DbPool) -> Result<()> {
-    if pool.kind() != DatabaseKind::Mysql {
-        return Ok(());
-    }
-    const FLOAT_COLS: &[(&str, &[(&str, bool)])] = &[
-        ("audit_entries", &[("logged_time", false)]),
-        ("compiled_access_rule_sets", &[("created_at", false)]),
-        ("document_revisions", &[("created_time", false)]),
-        ("documents", &[("created_time", false)]),
-        (
-            "file_deduplication_tasks",
-            &[
-                ("available_at", false),
-                ("lease_expires_at", true),
-                ("created_time", false),
-            ],
-        ),
-        ("file_tasks", &[("start_time", false), ("end_time", true)]),
-        ("files", &[("created_time", false)]),
-        ("folders", &[("created_time", false)]),
-        ("group_permissions", &[("start_time", false), ("end_time", true)]),
-        ("keyrings", &[("created_time", false)]),
-        ("object_access_entries", &[("start_time", false), ("end_time", true)]),
-        (
-            "rate_limit_buckets",
-            &[
-                ("tokens", false),
-                ("last_refill_at", false),
-                ("last_denied_at", true),
-                ("last_attempt", false),
-            ],
-        ),
-        ("risk_ip_accounts", &[("last_attempt", false)]),
-        ("system_states", &[("updated_at", false)]),
-        ("user_memberships", &[("start_time", false), ("end_time", true)]),
-        ("user_permissions", &[("start_time", false), ("end_time", true)]),
-        (
-            "userblock_entries",
-            &[("timestamp", false), ("not_before", false), ("not_after", false)],
-        ),
-        (
-            "users",
-            &[
-                ("passwd_last_modified", false),
-                ("last_login", true),
-                ("created_time", false),
-            ],
-        ),
+async fn step_a66108639ed7(pool: &DbPool) -> Result<()> {
+    const LEGACY_DROP_ORDER: &[&str] = &[
+        "compiled_access_rule_rights",
+        "compiled_access_rule_memberships",
+        "compiled_access_rule_groups",
+        "compiled_access_rules",
+        "compiled_access_rule_sets",
+        "userblock_sub_entries",
+        "userblock_entries",
+        "object_access_entries",
+    ];
+    const REMOVED_PERMISSIONS: &[&str] = &[
+        "move",
+        "create_document",
+        "delete_document",
+        "rename_document",
+        "create_directory",
+        "delete_directory",
+        "rename_directory",
+        "list_deleted_items",
+        "restore",
+        "super_create_document",
+        "super_create_directory",
+        "super_list_directory",
+        "view_access_rules",
+        "set_access_rules",
+        "view_metadata",
+        "set_metadata_tags",
+        "manage_access",
+        "view_access_entries",
+        "block",
+        "unblock",
+        "list_user_blocks",
+        "list_revisions",
+        "view_revision",
+        "set_current_revision",
     ];
 
-    let mut stmts = Vec::new();
-    for (table, cols) in FLOAT_COLS {
-        let clauses: Vec<String> = cols
-            .iter()
-            .map(|(col, nullable)| {
-                let null_kw = if *nullable { "NULL" } else { "NOT NULL" };
-                format!("MODIFY COLUMN {col} DOUBLE {null_kw}")
-            })
-            .collect();
-        stmts.push(format!("ALTER TABLE {table} {}", clauses.join(", ")));
-    }
-    execute_ddl_statements(pool, &stmts).await
-}
-
-async fn step_ab7efda19079(pool: &DbPool) -> Result<()> {
     let kind = pool.kind();
-    let double_ty = match kind {
-        DatabaseKind::Postgresql => "DOUBLE PRECISION",
-        DatabaseKind::Sqlite | DatabaseKind::Mysql => "DOUBLE",
-    };
-    let bool_ty = match kind {
-        DatabaseKind::Mysql => "BOOL",
-        DatabaseKind::Sqlite | DatabaseKind::Postgresql => "BOOLEAN",
-    };
 
-    let mut stmts = Vec::new();
-    stmts.push(format!(
-        "CREATE TABLE scheduling_runtime_state (\n\
-            id INTEGER NOT NULL,\n\
-            provider VARCHAR(16) NOT NULL,\n\
-            generation BIGINT NOT NULL,\n\
-            schema_version INTEGER NOT NULL,\n\
-            updated_at {double_ty} NOT NULL,\n\
-            CONSTRAINT pk_scheduling_runtime_state PRIMARY KEY (id),\n\
-            CONSTRAINT ck_scheduling_runtime_provider CHECK (provider IN ('local', 'redis')),\n\
-            CONSTRAINT ck_scheduling_generation_positive CHECK (generation > 0),\n\
-            CONSTRAINT ck_scheduling_runtime_state_singleton CHECK (id = 1)\n\
-        )"
-    ));
-    stmts.push(format!(
-        "CREATE TABLE schedules (\n\
-            id VARCHAR(32) NOT NULL,\n\
-            task_name VARCHAR(255) NOT NULL,\n\
-            task_contract_version INTEGER NOT NULL,\n\
-            payload JSON NOT NULL,\n\
-            trigger_type VARCHAR(16) NOT NULL,\n\
-            trigger_data JSON NOT NULL,\n\
-            timezone VARCHAR(255) NOT NULL,\n\
-            enabled {bool_ty} NOT NULL,\n\
-            status VARCHAR(16) NOT NULL,\n\
-            revision BIGINT NOT NULL,\n\
-            next_run_at {double_ty},\n\
-            active_execution_id VARCHAR(64),\n\
-            pending_scheduled_for {double_ty},\n\
-            created_by VARCHAR(256) NOT NULL,\n\
-            created_at {double_ty} NOT NULL,\n\
-            updated_by VARCHAR(256) NOT NULL,\n\
-            updated_at {double_ty} NOT NULL,\n\
-            deleted_at {double_ty},\n\
-            CONSTRAINT pk_schedules PRIMARY KEY (id),\n\
-            CONSTRAINT ck_schedules_status CHECK (status IN ('active', 'completed', 'failed', 'deleted')),\n\
-            CONSTRAINT ck_schedules_trigger_type CHECK (trigger_type IN ('cron', 'date', 'interval')),\n\
-            CONSTRAINT ck_schedules_revision_positive CHECK (revision > 0),\n\
-            CONSTRAINT ck_schedules_task_contract_version_positive CHECK (task_contract_version > 0),\n\
-            CONSTRAINT fk_schedules_created_by_users FOREIGN KEY(created_by) REFERENCES users (username),\n\
-            CONSTRAINT fk_schedules_updated_by_users FOREIGN KEY(updated_by) REFERENCES users (username)\n\
-        )"
-    ));
-    stmts.push("CREATE INDEX ix_schedules_due ON schedules (enabled, status, next_run_at)".to_string());
-    stmts.push(format!(
-        "CREATE TABLE schedule_executions (\n\
-            id VARCHAR(64) NOT NULL,\n\
-            schedule_id VARCHAR(32) NOT NULL,\n\
-            provider_generation BIGINT NOT NULL,\n\
-            scheduled_for {double_ty} NOT NULL,\n\
-            state VARCHAR(16) NOT NULL,\n\
-            dispatch_state VARCHAR(16) NOT NULL,\n\
-            attempt INTEGER NOT NULL,\n\
-            retry_at {double_ty},\n\
-            lease_owner VARCHAR(64),\n\
-            lease_expires_at {double_ty},\n\
-            started_at {double_ty},\n\
-            completed_at {double_ty},\n\
-            result JSON,\n\
-            error VARCHAR(1024),\n\
-            created_at {double_ty} NOT NULL,\n\
-            CONSTRAINT pk_schedule_executions PRIMARY KEY (id),\n\
-            CONSTRAINT uq_schedule_executions_occurrence UNIQUE (schedule_id, scheduled_for),\n\
-            CONSTRAINT ck_schedule_executions_dispatch_state CHECK (dispatch_state IN ('pending', 'sent')),\n\
-            CONSTRAINT ck_schedule_executions_state CHECK (state IN ('pending', 'running', 'retry_wait', 'succeeded', 'failed', 'cancelled')),\n\
-            CONSTRAINT ck_schedule_executions_attempt CHECK (attempt >= 0),\n\
-            CONSTRAINT fk_schedule_executions_schedule_id_schedules FOREIGN KEY(schedule_id) REFERENCES schedules (id) ON DELETE CASCADE\n\
-        )"
-    ));
-    stmts.push(
-        "CREATE INDEX ix_schedule_executions_claim ON schedule_executions (state, dispatch_state, retry_at, lease_expires_at)"
-            .to_string(),
-    );
-    stmts.push(
-        "CREATE INDEX ix_schedule_executions_schedule_id ON schedule_executions (schedule_id)"
-            .to_string(),
-    );
-    execute_ddl_statements(pool, &stmts).await
-}
-
-async fn step_8c130010a943(pool: &DbPool) -> Result<()> {
-    grant_sysop_permissions(
-        pool,
-        Some("migration:8c130010a943"),
-        &["view_schedules", "manage_schedules"],
-    )
-    .await
-}
-
-async fn step_39084f380eaa(pool: &DbPool) -> Result<()> {
-    match pool.kind() {
-        DatabaseKind::Sqlite => {
-            let create_tmp = "CREATE TABLE _cfms_rebuild_schedules (\n\
-                id VARCHAR(32) NOT NULL,\n\
-                task_name VARCHAR(255) NOT NULL,\n\
-                task_contract_version INTEGER NOT NULL,\n\
-                payload JSON NOT NULL,\n\
-                trigger_type VARCHAR(16) NOT NULL,\n\
-                trigger_data JSON NOT NULL,\n\
-                timezone VARCHAR(255) NOT NULL,\n\
-                system_managed BOOLEAN DEFAULT 0 NOT NULL,\n\
-                enabled BOOLEAN NOT NULL,\n\
-                status VARCHAR(16) NOT NULL,\n\
-                revision BIGINT NOT NULL,\n\
-                next_run_at DOUBLE,\n\
-                active_execution_id VARCHAR(64),\n\
-                pending_scheduled_for DOUBLE,\n\
-                created_by VARCHAR(256),\n\
-                created_at DOUBLE NOT NULL,\n\
-                updated_by VARCHAR(256),\n\
-                updated_at DOUBLE NOT NULL,\n\
-                deleted_at DOUBLE,\n\
-                CONSTRAINT pk_schedules PRIMARY KEY (id),\n\
-                CONSTRAINT ck_schedules_status CHECK (status IN ('active', 'completed', 'failed', 'deleted')),\n\
-                CONSTRAINT ck_schedules_trigger_type CHECK (trigger_type IN ('cron', 'date', 'interval')),\n\
-                CONSTRAINT ck_schedules_revision_positive CHECK (revision > 0),\n\
-                CONSTRAINT ck_schedules_task_contract_version_positive CHECK (task_contract_version > 0),\n\
-                CONSTRAINT fk_schedules_created_by_users FOREIGN KEY(created_by) REFERENCES users (username) ON DELETE SET NULL,\n\
-                CONSTRAINT fk_schedules_updated_by_users FOREIGN KEY(updated_by) REFERENCES users (username) ON DELETE SET NULL\n\
-            )";
-            let copy_sql = "INSERT INTO _cfms_rebuild_schedules (id, task_name, task_contract_version, payload, trigger_type, trigger_data, timezone, system_managed, enabled, status, revision, next_run_at, active_execution_id, pending_scheduled_for, created_by, created_at, updated_by, updated_at, deleted_at) \
-                SELECT id, task_name, task_contract_version, payload, trigger_type, trigger_data, timezone, 0, enabled, status, revision, next_run_at, active_execution_id, pending_scheduled_for, created_by, created_at, updated_by, updated_at, deleted_at FROM schedules";
-            let idxs = vec![
-                "CREATE INDEX ix_schedules_due ON schedules (enabled, status, next_run_at)"
-                    .to_string(),
-            ];
-            sqlite_rebuild_table(pool, "schedules", create_tmp, copy_sql, &idxs).await
-        }
-        DatabaseKind::Mysql => {
-            execute_ddl_statements(
-                pool,
-                &[
-                    "ALTER TABLE schedules DROP FOREIGN KEY fk_schedules_created_by_users, DROP FOREIGN KEY fk_schedules_updated_by_users, ADD COLUMN system_managed BOOL NOT NULL DEFAULT false, MODIFY COLUMN created_by VARCHAR(256) NULL, MODIFY COLUMN updated_by VARCHAR(256) NULL, ADD CONSTRAINT fk_schedules_created_by_users FOREIGN KEY (created_by) REFERENCES users (username) ON DELETE SET NULL, ADD CONSTRAINT fk_schedules_updated_by_users FOREIGN KEY (updated_by) REFERENCES users (username) ON DELETE SET NULL".to_string(),
-                ],
-            )
-            .await
-        }
-        DatabaseKind::Postgresql => {
-            execute_ddl_statements(
-                pool,
-                &[
-                    "ALTER TABLE schedules DROP CONSTRAINT fk_schedules_created_by_users".to_string(),
-                    "ALTER TABLE schedules DROP CONSTRAINT fk_schedules_updated_by_users".to_string(),
-                    "ALTER TABLE schedules ADD COLUMN system_managed BOOLEAN DEFAULT false NOT NULL".to_string(),
-                    "ALTER TABLE schedules ALTER COLUMN created_by DROP NOT NULL".to_string(),
-                    "ALTER TABLE schedules ALTER COLUMN updated_by DROP NOT NULL".to_string(),
-                    "ALTER TABLE schedules ADD CONSTRAINT fk_schedules_created_by_users FOREIGN KEY (created_by) REFERENCES users (username) ON DELETE SET NULL".to_string(),
-                    "ALTER TABLE schedules ADD CONSTRAINT fk_schedules_updated_by_users FOREIGN KEY (updated_by) REFERENCES users (username) ON DELETE SET NULL".to_string(),
-                ],
-            )
-            .await
-        }
-    }
-}
-
-async fn step_adc1283fb393(pool: &DbPool) -> Result<()> {
-    if has_column(pool, "scheduling_runtime_state", "redis_namespace").await? {
-        return Ok(());
-    }
-    execute_single_ddl(
-        pool,
-        "ALTER TABLE scheduling_runtime_state ADD COLUMN redis_namespace VARCHAR(63)",
-    )
-    .await
-}
-
-async fn step_6dba0956fa9d(pool: &DbPool) -> Result<()> {
-    if has_column(pool, "schedule_executions", "dispatched_at").await? {
-        return Ok(());
-    }
-    let double_ty = match pool.kind() {
-        DatabaseKind::Postgresql => "DOUBLE PRECISION",
-        DatabaseKind::Sqlite | DatabaseKind::Mysql => "DOUBLE",
-    };
-    execute_single_ddl(
-        pool,
-        &format!("ALTER TABLE schedule_executions ADD COLUMN dispatched_at {double_ty}"),
-    )
-    .await
-}
-
-async fn step_3c496a214a87(pool: &DbPool) -> Result<()> {
-    if has_column(pool, "schedule_executions", "task_name").await? {
-        return Ok(());
-    }
-    execute_ddl_statements(
-        pool,
-        &[
-            "ALTER TABLE schedule_executions ADD COLUMN task_name VARCHAR(255)".to_string(),
-            "ALTER TABLE schedule_executions ADD COLUMN task_contract_version INTEGER".to_string(),
-            "ALTER TABLE schedule_executions ADD COLUMN payload JSON".to_string(),
-        ],
-    )
-    .await?;
-
-    let backfill = "UPDATE schedule_executions \
-        SET task_name = (SELECT schedules.task_name FROM schedules WHERE schedules.id = schedule_executions.schedule_id), \
-            task_contract_version = (SELECT schedules.task_contract_version FROM schedules WHERE schedules.id = schedule_executions.schedule_id), \
-            payload = (SELECT schedules.payload FROM schedules WHERE schedules.id = schedule_executions.schedule_id)";
-    match pool {
-        DbPool::Sqlite(p) => {
-            sqlx::query(backfill).execute(p).await?;
-        }
-        DbPool::Mysql(p) => {
-            sqlx::query(backfill).execute(p).await?;
-        }
-        DbPool::Postgres(p) => {
-            sqlx::query(backfill).execute(p).await?;
-        }
-    }
-
-    match pool.kind() {
-        DatabaseKind::Sqlite => {
-            let def = table_def("schedule_executions").expect("schedule_executions def");
-            let temp_sql = def
-                .compile_create_table(DatabaseKind::Sqlite)
-                .replacen(
-                    "CREATE TABLE schedule_executions",
-                    "CREATE TABLE _cfms_rebuild_schedule_executions",
-                    1,
-                );
-            let cols: Vec<&str> = def.columns.iter().map(|c| c.name).collect();
-            let col_list = cols.join(", ");
-            let copy_sql = format!(
-                "INSERT INTO _cfms_rebuild_schedule_executions ({col_list}) SELECT {col_list} FROM schedule_executions"
-            );
-            let idxs = def.compile_create_indexes(DatabaseKind::Sqlite);
-            sqlite_rebuild_table(pool, "schedule_executions", &temp_sql, &copy_sql, &idxs).await
-        }
-        DatabaseKind::Mysql => {
-            execute_single_ddl(
-                pool,
-                "ALTER TABLE schedule_executions MODIFY COLUMN task_name VARCHAR(255) NOT NULL, MODIFY COLUMN task_contract_version INTEGER NOT NULL, MODIFY COLUMN payload JSON NOT NULL",
-            )
-            .await
-        }
-        DatabaseKind::Postgresql => {
-            execute_ddl_statements(
-                pool,
-                &[
-                    "ALTER TABLE schedule_executions ALTER COLUMN task_name SET NOT NULL".to_string(),
-                    "ALTER TABLE schedule_executions ALTER COLUMN task_contract_version SET NOT NULL".to_string(),
-                    "ALTER TABLE schedule_executions ALTER COLUMN payload SET NOT NULL".to_string(),
-                ],
-            )
-            .await
-        }
-    }
-}
-
-async fn step_0460356a5ba6(pool: &DbPool) -> Result<()> {
-    let mut stmts = Vec::new();
-    if !has_index(
-        pool,
-        "document_revisions",
-        "ix_document_revisions_document_created_id",
-    )
-    .await?
-    {
-        stmts.push(
-            "CREATE INDEX ix_document_revisions_document_created_id ON document_revisions (document_id, created_time, id)"
-                .to_string(),
-        );
-    }
-    if !has_index(
-        pool,
-        "document_revisions",
-        "ix_document_revisions_parent_revision_id",
-    )
-    .await?
-    {
-        stmts.push(
-            "CREATE INDEX ix_document_revisions_parent_revision_id ON document_revisions (parent_revision_id)"
-                .to_string(),
-        );
-    }
-    if !has_index(pool, "documents", "ix_documents_current_revision_id").await? {
-        stmts.push(
-            "CREATE INDEX ix_documents_current_revision_id ON documents (current_revision_id)"
-                .to_string(),
-        );
-    }
-    if !stmts.is_empty() {
-        execute_ddl_statements(pool, &stmts).await?;
-    }
-    Ok(())
-}
-
-async fn step_5ad5aca75635(pool: &DbPool) -> Result<()> {
-    let kind = pool.kind();
-    let double_ty = match kind {
-        DatabaseKind::Postgresql => "DOUBLE PRECISION",
-        DatabaseKind::Sqlite | DatabaseKind::Mysql => "DOUBLE",
-    };
-    let bool_ty = match kind {
-        DatabaseKind::Mysql => "BOOL",
-        DatabaseKind::Sqlite | DatabaseKind::Postgresql => "BOOLEAN",
-    };
-    let blob_ty = match kind {
-        DatabaseKind::Postgresql => "BYTEA",
-        DatabaseKind::Sqlite | DatabaseKind::Mysql => "BLOB",
-    };
-    let fixed32_ty = match kind {
-        DatabaseKind::Sqlite => "BLOB",
-        DatabaseKind::Mysql => "BINARY(32)",
-        DatabaseKind::Postgresql => "BYTEA",
-    };
-
-    execute_ddl_statements(
-        pool,
-        &[
-            format!(
-                "CREATE TABLE user_auth_public_keys (\n\
-                    id VARCHAR(32) NOT NULL,\n\
-                    username VARCHAR(256) NOT NULL,\n\
-                    public_key_der {blob_ty} NOT NULL,\n\
-                    fingerprint {fixed32_ty} NOT NULL,\n\
-                    label VARCHAR(255),\n\
-                    created_time {double_ty} NOT NULL,\n\
-                    last_used_time {double_ty},\n\
-                    CONSTRAINT pk_user_auth_public_keys PRIMARY KEY (id),\n\
-                    CONSTRAINT uq_user_auth_public_keys_user_fingerprint UNIQUE (username, fingerprint),\n\
-                    CONSTRAINT fk_user_auth_public_keys_username_users FOREIGN KEY(username) REFERENCES users (username) ON DELETE CASCADE\n\
-                )"
-            ),
-            "CREATE INDEX ix_user_auth_public_keys_fingerprint ON user_auth_public_keys (fingerprint)".to_string(),
-            format!(
-                "CREATE TABLE user_passwords (\n\
-                    username VARCHAR(256) NOT NULL,\n\
-                    pass_hash TEXT NOT NULL,\n\
-                    passwd_last_modified {double_ty} NOT NULL,\n\
-                    CONSTRAINT pk_user_passwords PRIMARY KEY (username),\n\
-                    CONSTRAINT fk_user_passwords_username_users FOREIGN KEY(username) REFERENCES users (username) ON DELETE CASCADE\n\
-                )"
-            ),
-            format!(
-                "CREATE TABLE user_totp_credentials (\n\
-                    username VARCHAR(256) NOT NULL,\n\
-                    secret VARCHAR(32) NOT NULL,\n\
-                    enabled {bool_ty} NOT NULL,\n\
-                    backup_codes TEXT,\n\
-                    created_time {double_ty} NOT NULL,\n\
-                    CONSTRAINT pk_user_totp_credentials PRIMARY KEY (username),\n\
-                    CONSTRAINT fk_user_totp_credentials_username_users FOREIGN KEY(username) REFERENCES users (username) ON DELETE CASCADE\n\
-                )"
-            ),
-        ],
-    )
-    .await?;
-
-    let false_lit = match kind {
-        DatabaseKind::Sqlite => "0",
-        DatabaseKind::Mysql | DatabaseKind::Postgresql => "false",
-    };
-    let copy_passwords = "INSERT INTO user_passwords (username, pass_hash, passwd_last_modified) \
-        SELECT username, pass_hash, COALESCE(passwd_last_modified, 0) FROM users WHERE pass_hash IS NOT NULL";
-    let copy_totp = format!(
-        "INSERT INTO user_totp_credentials (username, secret, enabled, backup_codes, created_time) \
-         SELECT username, totp_secret, COALESCE(totp_enabled, {false_lit}), totp_backup_codes, COALESCE(created_time, 0) FROM users WHERE totp_secret IS NOT NULL"
-    );
-
-    match pool {
-        DbPool::Sqlite(p) => {
-            let mut tx = p.begin().await?;
-            sqlx::query(copy_passwords).execute(&mut *tx).await?;
-            sqlx::query(sqlx::AssertSqlSafe(copy_totp))
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
-        }
-        DbPool::Mysql(p) => {
-            let mut tx = p.begin().await?;
-            sqlx::query(copy_passwords).execute(&mut *tx).await?;
-            sqlx::query(sqlx::AssertSqlSafe(copy_totp))
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
-        }
-        DbPool::Postgres(p) => {
-            let mut tx = p.begin().await?;
-            sqlx::query(copy_passwords).execute(&mut *tx).await?;
-            sqlx::query(sqlx::AssertSqlSafe(copy_totp))
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
-        }
-    }
-
-    let drop_stmts: Vec<String> = [
-        "passwd_last_modified",
-        "totp_enabled",
-        "totp_secret",
-        "totp_backup_codes",
-        "pass_hash",
-    ]
-    .into_iter()
-    .map(|col| format!("ALTER TABLE users DROP COLUMN {col}"))
-    .collect();
-    execute_ddl_statements(pool, &drop_stmts).await
-}
-
-async fn step_d252e662fc05(pool: &DbPool) -> Result<()> {
-    // 1. Load usernames and check non-null non-nullable references before mutating schema.
-    let usernames = query_strings(pool, "SELECT username FROM users").await?;
-    let name_set: HashSet<String> = usernames.iter().cloned().collect();
-
-    const NON_NULLABLE_REFS: &[(&str, &str)] = &[
-        ("user_passwords", "username"),
-        ("user_totp_credentials", "username"),
-        ("user_auth_public_keys", "username"),
-        ("user_permissions", "username"),
-        ("user_memberships", "username"),
-        ("keyrings", "username"),
-        ("userblock_entries", "username"),
-    ];
-    for &(table, col) in NON_NULLABLE_REFS {
-        let distinct_vals =
-            query_strings(pool, &format!("SELECT DISTINCT {col} FROM {table}")).await?;
-        for val in distinct_vals {
-            if !name_set.contains(&val) {
-                return Err(CfmsError::SchemaDrift(format!(
-                    "Orphaned account reference in {table}.{col}: '{val}'"
-                )));
-            }
-        }
-    }
-
-    let identities: HashMap<String, Uuid> = usernames
-        .into_iter()
-        .map(|name| (name, Uuid::new_v4()))
-        .collect();
-
-    // 2. Rewrite `users` (add `id` UUID, drop PK `username`, add PK `id`, add unique index `ix_users_username`)
-    // and convert all 13 referencing columns + `object_access_entries` + `risk_ip_accounts` + `rate_limit_buckets`.
-    match pool.kind() {
-        DatabaseKind::Sqlite => {
-            d252_sqlite(pool, &identities).await?;
-        }
-        DatabaseKind::Mysql | DatabaseKind::Postgresql => {
-            d252_mysql_or_postgres(pool, &identities).await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn query_strings(pool: &DbPool, sql: &str) -> Result<Vec<String>> {
-    let vals = match pool {
-        DbPool::Sqlite(p) => {
-            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
-                .fetch_all(p)
-                .await?
-        }
-        DbPool::Mysql(p) => {
-            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
-                .fetch_all(p)
-                .await?
-        }
-        DbPool::Postgres(p) => {
-            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
-                .fetch_all(p)
-                .await?
-        }
-    };
-    Ok(vals)
-}
-
-async fn d252_sqlite(pool: &DbPool, identities: &HashMap<String, Uuid>) -> Result<()> {
-    let DbPool::Sqlite(p) = pool else {
-        unreachable!();
-    };
-    let mut conn = p.acquire().await?;
-    sqlx::query("PRAGMA foreign_keys = OFF")
-        .execute(&mut *conn)
-        .await?;
-
-    let migration_res: Result<()> = async {
-        let mut tx = conn.begin().await?;
-
-        // 1. Rebuild `users` with `id CHAR(32) NOT NULL`, `secret_key VARCHAR(64)` still nullable before 3815ba18197b.
-        sqlx::query("DROP TABLE IF EXISTS _cfms_rebuild_users")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "CREATE TABLE _cfms_rebuild_users (\n\
-                id CHAR(32) NOT NULL,\n\
-                username VARCHAR(256) NOT NULL,\n\
-                nickname VARCHAR(255),\n\
-                avatar_id VARCHAR(255),\n\
-                last_login DOUBLE,\n\
-                created_time DOUBLE NOT NULL,\n\
-                status INTEGER NOT NULL,\n\
-                status_comment_id INTEGER,\n\
-                secret_key VARCHAR(64),\n\
-                preference_dek_id VARCHAR(64),\n\
-                CONSTRAINT pk_users PRIMARY KEY (id),\n\
-                CONSTRAINT fk_users_avatar_id_files FOREIGN KEY(avatar_id) REFERENCES files (id),\n\
-                CONSTRAINT fk_users_status_comment_id_comments FOREIGN KEY(status_comment_id) REFERENCES comments (comment_id) ON DELETE SET NULL,\n\
-                CONSTRAINT uq_users_preference_dek_id UNIQUE (preference_dek_id),\n\
-                CONSTRAINT fk_users_preference_dek_id FOREIGN KEY(preference_dek_id) REFERENCES keyrings (id) ON DELETE SET NULL\n\
-            )",
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        let user_rows = sqlx::query(
-            "SELECT username, nickname, avatar_id, last_login, created_time, status, status_comment_id, secret_key, preference_dek_id FROM users",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        for row in user_rows {
-            let uname: String = row.get("username");
-            let uid = identities[&uname].simple().to_string();
-            sqlx::query(
-                "INSERT INTO _cfms_rebuild_users (id, username, nickname, avatar_id, last_login, created_time, status, status_comment_id, secret_key, preference_dek_id) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(uid)
-            .bind(&uname)
-            .bind(row.get::<Option<String>, _>("nickname"))
-            .bind(row.get::<Option<String>, _>("avatar_id"))
-            .bind(row.get::<Option<f64>, _>("last_login"))
-            .bind(row.get::<f64, _>("created_time"))
-            .bind(row.get::<i64, _>("status"))
-            .bind(row.get::<Option<i64>, _>("status_comment_id"))
-            .bind(row.get::<Option<String>, _>("secret_key"))
-            .bind(row.get::<Option<String>, _>("preference_dek_id"))
-            .execute(&mut *tx)
-            .await?;
-        }
-        sqlx::query("DROP TABLE users").execute(&mut *tx).await?;
-        sqlx::query("ALTER TABLE _cfms_rebuild_users RENAME TO users")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("CREATE INDEX ix_users_avatar_id ON users (avatar_id)")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("CREATE UNIQUE INDEX ix_users_username ON users (username)")
-            .execute(&mut *tx)
-            .await?;
-
-        // 2. Rebuild each of the 11 dependent tables converting username -> CHAR(32) user_id.
-        // Note: SQL subquery against `users(username)` cleanly maps non-null hits and NULLs missing nullable orphans.
-        let join_expr = |col: &str| {
-            format!("(SELECT u.id FROM users u WHERE u.username = {col})")
-        };
-
-        // user_passwords (pre-credential_id)
-        sqlx::query(
-            "CREATE TABLE _cfms_rebuild_user_passwords (\n\
-                user_id CHAR(32) NOT NULL,\n\
-                pass_hash TEXT NOT NULL,\n\
-                passwd_last_modified DOUBLE NOT NULL,\n\
-                CONSTRAINT pk_user_passwords PRIMARY KEY (user_id),\n\
-                CONSTRAINT fk_user_passwords_user_id_users FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE\n\
-            )",
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO _cfms_rebuild_user_passwords (user_id, pass_hash, passwd_last_modified) SELECT {}, pass_hash, passwd_last_modified FROM user_passwords",
-            join_expr("user_passwords.username")
-        )))
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DROP TABLE user_passwords").execute(&mut *tx).await?;
-        sqlx::query("ALTER TABLE _cfms_rebuild_user_passwords RENAME TO user_passwords")
-            .execute(&mut *tx)
-            .await?;
-
-        // user_totp_credentials (pre-credential_id)
-        sqlx::query(
-            "CREATE TABLE _cfms_rebuild_user_totp_credentials (\n\
-                user_id CHAR(32) NOT NULL,\n\
-                secret VARCHAR(32) NOT NULL,\n\
-                enabled BOOLEAN NOT NULL,\n\
-                backup_codes TEXT,\n\
-                created_time DOUBLE NOT NULL,\n\
-                CONSTRAINT pk_user_totp_credentials PRIMARY KEY (user_id),\n\
-                CONSTRAINT fk_user_totp_credentials_user_id_users FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE\n\
-            )",
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO _cfms_rebuild_user_totp_credentials (user_id, secret, enabled, backup_codes, created_time) SELECT {}, secret, enabled, backup_codes, created_time FROM user_totp_credentials",
-            join_expr("user_totp_credentials.username")
-        )))
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DROP TABLE user_totp_credentials")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("ALTER TABLE _cfms_rebuild_user_totp_credentials RENAME TO user_totp_credentials")
-            .execute(&mut *tx)
-            .await?;
-
-        // user_auth_public_keys
-        sqlx::query(
-            "CREATE TABLE _cfms_rebuild_user_auth_public_keys (\n\
-                id VARCHAR(32) NOT NULL,\n\
-                user_id CHAR(32) NOT NULL,\n\
-                public_key_der BLOB NOT NULL,\n\
-                fingerprint BLOB NOT NULL,\n\
-                label VARCHAR(255),\n\
-                created_time DOUBLE NOT NULL,\n\
-                last_used_time DOUBLE,\n\
-                CONSTRAINT pk_user_auth_public_keys PRIMARY KEY (id),\n\
-                CONSTRAINT uq_user_auth_public_keys_user_fingerprint UNIQUE (user_id, fingerprint),\n\
-                CONSTRAINT fk_user_auth_public_keys_user_id_users FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE\n\
-            )",
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO _cfms_rebuild_user_auth_public_keys (id, user_id, public_key_der, fingerprint, label, created_time, last_used_time) SELECT id, {}, public_key_der, fingerprint, label, created_time, last_used_time FROM user_auth_public_keys",
-            join_expr("user_auth_public_keys.username")
-        )))
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DROP TABLE user_auth_public_keys")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("ALTER TABLE _cfms_rebuild_user_auth_public_keys RENAME TO user_auth_public_keys")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("CREATE INDEX ix_user_auth_public_keys_fingerprint ON user_auth_public_keys (fingerprint)")
-            .execute(&mut *tx)
-            .await?;
-
-        // user_permissions, user_memberships, keyrings, userblock_entries, audit_entries, document_metadata, file_tasks, schedules
-        for (tbl, copy_sql, idxs) in [
-            (
-                "user_permissions",
-                format!(
-                    "INSERT INTO _cfms_rebuild_user_permissions (id, user_id, permission, granted, start_time, end_time) SELECT id, {}, permission, granted, start_time, end_time FROM user_permissions",
-                    join_expr("user_permissions.username")
-                ),
-                table_def("user_permissions").unwrap().compile_create_indexes(DatabaseKind::Sqlite),
-            ),
-            (
-                "user_memberships",
-                format!(
-                    "INSERT INTO _cfms_rebuild_user_memberships (id, user_id, group_name, start_time, end_time) SELECT id, {}, group_name, start_time, end_time FROM user_memberships",
-                    join_expr("user_memberships.username")
-                ),
-                table_def("user_memberships").unwrap().compile_create_indexes(DatabaseKind::Sqlite),
-            ),
-            (
-                "keyrings",
-                format!(
-                    "INSERT INTO _cfms_rebuild_keyrings (id, user_id, content, label, created_time) SELECT id, {}, content, label, created_time FROM keyrings",
-                    join_expr("keyrings.username")
-                ),
-                table_def("keyrings").unwrap().compile_create_indexes(DatabaseKind::Sqlite),
-            ),
-            (
-                "userblock_entries",
-                format!(
-                    "INSERT INTO _cfms_rebuild_userblock_entries (block_id, user_id, timestamp, not_before, not_after, target_type, target_id, reason_comment_id) SELECT block_id, {}, timestamp, not_before, not_after, target_type, target_id, reason_comment_id FROM userblock_entries",
-                    join_expr("userblock_entries.username")
-                ),
-                table_def("userblock_entries").unwrap().compile_create_indexes(DatabaseKind::Sqlite),
-            ),
-            (
-                "audit_entries",
-                format!(
-                    "INSERT INTO _cfms_rebuild_audit_entries (id, action, user_id, target, data, result, remote_address, logged_time) SELECT id, action, {}, target, data, result, remote_address, logged_time FROM audit_entries",
-                    join_expr("audit_entries.username")
-                ),
-                table_def("audit_entries").unwrap().compile_create_indexes(DatabaseKind::Sqlite),
-            ),
-            (
-                "document_metadata",
-                format!(
-                    "INSERT INTO _cfms_rebuild_document_metadata (document_id, creator_id, last_modified_by_id) SELECT document_id, {}, {} FROM document_metadata",
-                    join_expr("document_metadata.creator_username"),
-                    join_expr("document_metadata.last_modified_by_username")
-                ),
-                table_def("document_metadata").unwrap().compile_create_indexes(DatabaseKind::Sqlite),
-            ),
-            (
-                "file_tasks",
-                format!(
-                    "INSERT INTO _cfms_rebuild_file_tasks (id, file_id, status, mode, start_time, end_time, issued_by_id, encryption_key, chunk_size, upload_file_size, upload_sha256, upload_session_id, upload_checkpoint_size, upload_checkpoint_data) SELECT id, file_id, status, mode, start_time, end_time, {}, encryption_key, chunk_size, upload_file_size, upload_sha256, upload_session_id, upload_checkpoint_size, upload_checkpoint_data FROM file_tasks",
-                    join_expr("file_tasks.issued_by_username")
-                ),
-                table_def("file_tasks").unwrap().compile_create_indexes(DatabaseKind::Sqlite),
-            ),
-            (
-                "schedules",
-                format!(
-                    "INSERT INTO _cfms_rebuild_schedules (id, task_name, task_contract_version, payload, trigger_type, trigger_data, timezone, system_managed, enabled, status, revision, next_run_at, active_execution_id, pending_scheduled_for, created_by, created_at, updated_by, updated_at, deleted_at) SELECT id, task_name, task_contract_version, payload, trigger_type, trigger_data, timezone, system_managed, enabled, status, revision, next_run_at, active_execution_id, pending_scheduled_for, {}, created_at, {}, updated_at, deleted_at FROM schedules",
-                    join_expr("schedules.created_by"),
-                    join_expr("schedules.updated_by")
-                ),
-                table_def("schedules").unwrap().compile_create_indexes(DatabaseKind::Sqlite),
-            ),
-        ] {
-            let def = table_def(tbl).unwrap();
-            let create_tmp = def.compile_create_table(DatabaseKind::Sqlite).replacen(
-                &format!("CREATE TABLE {tbl}"),
-                &format!("CREATE TABLE _cfms_rebuild_{tbl}"),
-                1,
-            );
-            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS _cfms_rebuild_{tbl}")))
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query(sqlx::AssertSqlSafe(create_tmp))
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query(sqlx::AssertSqlSafe(copy_sql))
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {tbl}")))
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE _cfms_rebuild_{tbl} RENAME TO {tbl}")))
-                .execute(&mut *tx)
-                .await?;
-            for idx_sql in idxs {
-                sqlx::query(sqlx::AssertSqlSafe(idx_sql))
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
-
-        // 3. Rewrite `object_access_entries` entity_type = 'user' -> hyphenated UUID str(mapped) or delete orphaned.
-        let grants = sqlx::query(
-            "SELECT id, entity_identifier FROM object_access_entries WHERE entity_type = 'user'",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        for row in grants {
-            let entry_id: i64 = row.get("id");
-            let uname: String = row.get("entity_identifier");
-            if let Some(uid) = identities.get(&uname) {
-                sqlx::query("UPDATE object_access_entries SET entity_identifier = ? WHERE id = ?")
-                    .bind(uid.hyphenated().to_string())
-                    .bind(entry_id)
-                    .execute(&mut *tx)
-                    .await?;
-            } else {
-                sqlx::query("DELETE FROM object_access_entries WHERE id = ?")
-                    .bind(entry_id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
-
-        // 4. Rebuild empty `risk_ip_accounts` with `user_id CHAR(32) NOT NULL`.
-        sqlx::query("DELETE FROM risk_ip_accounts").execute(&mut *tx).await?;
-        sqlx::query("DROP TABLE risk_ip_accounts").execute(&mut *tx).await?;
-        let risk_def = table_def("risk_ip_accounts").unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(risk_def.compile_create_table(DatabaseKind::Sqlite)))
-            .execute(&mut *tx)
-            .await?;
-        for idx_sql in risk_def.compile_create_indexes(DatabaseKind::Sqlite) {
-            sqlx::query(sqlx::AssertSqlSafe(idx_sql))
-                .execute(&mut *tx)
-                .await?;
-        }
-
-        // 5. Prune account-scoped rate_limit_buckets.
-        sqlx::query("DELETE FROM rate_limit_buckets WHERE scope = 'account'")
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-        Ok(())
-    }
-    .await;
-
-    let fk_restore = sqlx::query("PRAGMA foreign_keys = ON")
-        .execute(&mut *conn)
-        .await;
-    migration_res?;
-    fk_restore?;
-
-    let fk_errors = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_all(&mut *conn)
-        .await?;
-    if !fk_errors.is_empty() {
-        return Err(CfmsError::SchemaDrift(
-            "SQLite foreign_key_check failed after d252e662fc05 identity migration".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-async fn d252_mysql_or_postgres(
-    pool: &DbPool,
-    identities: &HashMap<String, Uuid>,
-) -> Result<()> {
-    let kind = pool.kind();
-    let is_pg = kind == DatabaseKind::Postgresql;
-    let uuid_ty = if is_pg { "UUID" } else { "CHAR(32)" };
-
-    // Drop FKs pointing to users(username) cleanly.
-    let drop_fk_pairs: &[(&str, &str)] = &[
-        ("user_passwords", "fk_user_passwords_username_users"),
-        ("user_totp_credentials", "fk_user_totp_credentials_username_users"),
-        ("user_auth_public_keys", "fk_user_auth_public_keys_username_users"),
-        ("user_permissions", "fk_user_permissions_username_users"),
-        ("user_memberships", "fk_user_memberships_username_users"),
-        ("keyrings", "fk_keyrings_username_users"),
-        ("userblock_entries", "fk_userblock_entries_username_users"),
-        ("audit_entries", "fk_audit_entries_username_users"),
-        ("document_metadata", "fk_document_metadata_creator_username_users"),
-        ("document_metadata", "fk_document_metadata_last_modified_by_username_users"),
-        ("file_tasks", "fk_file_tasks_issued_by_username_users"),
-        ("schedules", "fk_schedules_created_by_users"),
-        ("schedules", "fk_schedules_updated_by_users"),
-    ];
-    let mut pre_drop_stmts = Vec::new();
-    for (tbl, fk_name) in drop_fk_pairs {
-        if is_pg {
-            pre_drop_stmts.push(format!("ALTER TABLE {tbl} DROP CONSTRAINT IF EXISTS {fk_name}"));
-        } else {
-            pre_drop_stmts.push(format!("ALTER TABLE {tbl} DROP FOREIGN KEY {fk_name}"));
-        }
-    }
-    execute_ddl_statements(pool, &pre_drop_stmts).await?;
-
-    // Add `users.id` and populate it.
-    execute_single_ddl(pool, &format!("ALTER TABLE users ADD COLUMN id {uuid_ty}")).await?;
-    for (uname, uid) in identities {
-        match pool {
-            DbPool::Mysql(p) => {
-                sqlx::query("UPDATE users SET id = ? WHERE username = ?")
-                    .bind(uid.simple().to_string())
-                    .bind(uname)
-                    .execute(p)
-                    .await?;
-            }
-            DbPool::Postgres(p) => {
-                sqlx::query("UPDATE users SET id = $1 WHERE username = $2")
-                    .bind(*uid)
-                    .bind(uname)
-                    .execute(p)
-                    .await?;
-            }
-            DbPool::Sqlite(_) => unreachable!(),
-        }
-    }
-
-    if is_pg {
+    // 1. Detach and drop `nodes.access_rule_set_id` before dropping `compiled_access_rule_sets`.
+    if has_table(pool, "nodes").await? && has_column(pool, "nodes", "access_rule_set_id").await? {
         execute_ddl_statements(
             pool,
-            &[
-                "ALTER TABLE users DROP CONSTRAINT IF EXISTS pk_users".to_string(),
-                "ALTER TABLE users ALTER COLUMN id SET NOT NULL".to_string(),
-                "ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id)".to_string(),
-                "CREATE UNIQUE INDEX ix_users_username ON users (username)".to_string(),
-            ],
+            &["UPDATE nodes SET access_rule_set_id = NULL".to_string()],
         )
         .await?;
-    } else {
-        execute_ddl_statements(
-            pool,
-            &[
-                "ALTER TABLE users DROP PRIMARY KEY, MODIFY COLUMN id CHAR(32) NOT NULL, ADD CONSTRAINT pk_users PRIMARY KEY (id)".to_string(),
-                "CREATE UNIQUE INDEX ix_users_username ON users (username)".to_string(),
-            ],
-        )
-        .await?;
-    }
-
-    // Helper for adding temporary UUID column, populating from `users`, dropping old col, renaming tmp col.
-    struct ColMove {
-        table: &'static str,
-        old_col: &'static str,
-        new_col: &'static str,
-        nullable: bool,
-        in_pk: bool,
-        pk_name: &'static str,
-        new_pk_cols: &'static str,
-        drop_unique: Option<&'static str>,
-        create_unique: Option<(&'static str, &'static str)>,
-        drop_index: Option<&'static str>,
-        create_index: Option<(&'static str, &'static str)>,
-        on_delete: &'static str,
-    }
-
-    let moves = &[
-        ColMove {
-            table: "user_passwords",
-            old_col: "username",
-            new_col: "user_id",
-            nullable: false,
-            in_pk: true,
-            pk_name: "pk_user_passwords",
-            new_pk_cols: "user_id",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: None,
-            create_index: None,
-            on_delete: "CASCADE",
-        },
-        ColMove {
-            table: "user_totp_credentials",
-            old_col: "username",
-            new_col: "user_id",
-            nullable: false,
-            in_pk: true,
-            pk_name: "pk_user_totp_credentials",
-            new_pk_cols: "user_id",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: None,
-            create_index: None,
-            on_delete: "CASCADE",
-        },
-        ColMove {
-            table: "user_auth_public_keys",
-            old_col: "username",
-            new_col: "user_id",
-            nullable: false,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: Some("uq_user_auth_public_keys_user_fingerprint"),
-            create_unique: Some(("uq_user_auth_public_keys_user_fingerprint", "user_id, fingerprint")),
-            drop_index: None,
-            create_index: None,
-            on_delete: "CASCADE",
-        },
-        ColMove {
-            table: "user_permissions",
-            old_col: "username",
-            new_col: "user_id",
-            nullable: false,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: None,
-            create_index: None,
-            on_delete: "CASCADE",
-        },
-        ColMove {
-            table: "user_memberships",
-            old_col: "username",
-            new_col: "user_id",
-            nullable: false,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: None,
-            create_index: None,
-            on_delete: "CASCADE",
-        },
-        ColMove {
-            table: "keyrings",
-            old_col: "username",
-            new_col: "user_id",
-            nullable: false,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: Some("ix_keyrings_username"),
-            create_index: Some(("ix_keyrings_user_id", "user_id")),
-            on_delete: "CASCADE",
-        },
-        ColMove {
-            table: "userblock_entries",
-            old_col: "username",
-            new_col: "user_id",
-            nullable: false,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: None,
-            create_index: None,
-            on_delete: "CASCADE",
-        },
-        ColMove {
-            table: "audit_entries",
-            old_col: "username",
-            new_col: "user_id",
-            nullable: true,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: None,
-            create_index: None,
-            on_delete: "SET NULL",
-        },
-        ColMove {
-            table: "document_metadata",
-            old_col: "creator_username",
-            new_col: "creator_id",
-            nullable: true,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: Some("ix_document_metadata_creator_username"),
-            create_index: Some(("ix_document_metadata_creator_id", "creator_id")),
-            on_delete: "SET NULL",
-        },
-        ColMove {
-            table: "document_metadata",
-            old_col: "last_modified_by_username",
-            new_col: "last_modified_by_id",
-            nullable: true,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: Some("ix_document_metadata_last_modified_by_username"),
-            create_index: Some(("ix_document_metadata_last_modified_by_id", "last_modified_by_id")),
-            on_delete: "SET NULL",
-        },
-        ColMove {
-            table: "file_tasks",
-            old_col: "issued_by_username",
-            new_col: "issued_by_id",
-            nullable: true,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: None,
-            create_index: None,
-            on_delete: "SET NULL",
-        },
-        ColMove {
-            table: "schedules",
-            old_col: "created_by",
-            new_col: "created_by",
-            nullable: true,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: None,
-            create_index: None,
-            on_delete: "SET NULL",
-        },
-        ColMove {
-            table: "schedules",
-            old_col: "updated_by",
-            new_col: "updated_by",
-            nullable: true,
-            in_pk: false,
-            pk_name: "",
-            new_pk_cols: "",
-            drop_unique: None,
-            create_unique: None,
-            drop_index: None,
-            create_index: None,
-            on_delete: "SET NULL",
-        },
-    ];
-
-    for mv in moves {
-        execute_single_ddl(
-            pool,
-            &format!("ALTER TABLE {} ADD COLUMN _cfms_identity {uuid_ty}", mv.table),
-        )
-        .await?;
-
-        let update_sql = format!(
-            "UPDATE {} SET _cfms_identity = (SELECT u.id FROM users u WHERE u.username = {}.{})",
-            mv.table, mv.table, mv.old_col
-        );
-        match pool {
-            DbPool::Mysql(p) => {
-                sqlx::query(sqlx::AssertSqlSafe(update_sql)).execute(p).await?;
-            }
-            DbPool::Postgres(p) => {
-                sqlx::query(sqlx::AssertSqlSafe(update_sql)).execute(p).await?;
-            }
-            DbPool::Sqlite(_) => unreachable!(),
-        }
-
-        let mut stmts = Vec::new();
-        if let Some(uq) = mv.drop_unique {
-            if is_pg {
-                stmts.push(format!("ALTER TABLE {} DROP CONSTRAINT IF EXISTS {uq}", mv.table));
-            } else {
-                stmts.push(format!("ALTER TABLE {} DROP INDEX {uq}", mv.table));
-            }
-        }
-        if let Some(idx) = mv.drop_index
-            && has_index(pool, mv.table, idx).await?
-        {
-            if is_pg {
-                stmts.push(format!("DROP INDEX IF EXISTS {idx}"));
-            } else {
-                stmts.push(format!("DROP INDEX {idx} ON {}", mv.table));
-            }
-        }
-        if mv.in_pk {
-            if is_pg {
-                stmts.push(format!("ALTER TABLE {} DROP CONSTRAINT {}", mv.table, mv.pk_name));
-            } else {
-                stmts.push(format!("ALTER TABLE {} DROP PRIMARY KEY", mv.table));
-            }
-        }
-        stmts.push(format!("ALTER TABLE {} DROP COLUMN {}", mv.table, mv.old_col));
-        if is_pg {
-            stmts.push(format!(
-                "ALTER TABLE {} RENAME COLUMN _cfms_identity TO {}",
-                mv.table, mv.new_col
-            ));
-            if !mv.nullable {
-                stmts.push(format!(
-                    "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL",
-                    mv.table, mv.new_col
-                ));
-            }
-        } else {
-            let null_kw = if mv.nullable { "NULL" } else { "NOT NULL" };
-            stmts.push(format!(
-                "ALTER TABLE {} CHANGE COLUMN _cfms_identity {} CHAR(32) {null_kw}",
-                mv.table, mv.new_col
-            ));
-        }
-        if mv.in_pk {
-            stmts.push(format!(
-                "ALTER TABLE {} ADD CONSTRAINT {} PRIMARY KEY ({})",
-                mv.table, mv.pk_name, mv.new_pk_cols
-            ));
-        }
-        if let Some((uq_name, uq_cols)) = mv.create_unique {
-            stmts.push(format!(
-                "ALTER TABLE {} ADD CONSTRAINT {uq_name} UNIQUE ({uq_cols})",
-                mv.table
-            ));
-        }
-        if let Some((idx_name, idx_cols)) = mv.create_index {
-            stmts.push(format!("CREATE INDEX {idx_name} ON {} ({idx_cols})", mv.table));
-        }
-        stmts.push(format!(
-            "ALTER TABLE {} ADD CONSTRAINT fk_{}_{}_users FOREIGN KEY ({}) REFERENCES users (id) ON DELETE {}",
-            mv.table, mv.table, mv.new_col, mv.new_col, mv.on_delete
-        ));
-        execute_ddl_statements(pool, &stmts).await?;
-    }
-
-    // Rewrite `object_access_entries` grants for entity_type = 'user'.
-    let grants: Vec<(i32, String)> = match pool {
-        DbPool::Mysql(p) => {
-            sqlx::query_as(
-                "SELECT id, entity_identifier FROM object_access_entries WHERE entity_type = 'user'",
+        if has_table(pool, "compiled_access_rule_sets").await? {
+            execute_ddl_statements(
+                pool,
+                &["DELETE FROM compiled_access_rule_sets".to_string()],
             )
-            .fetch_all(p)
-            .await?
+            .await?;
         }
-        DbPool::Postgres(p) => {
-            sqlx::query_as(
-                "SELECT id, entity_identifier FROM object_access_entries WHERE entity_type = 'user'",
-            )
-            .fetch_all(p)
-            .await?
-        }
-        DbPool::Sqlite(_) => unreachable!(),
-    };
-    for (entry_id, uname) in grants {
-        match pool {
-            DbPool::Mysql(p) => {
-                if let Some(uid) = identities.get(&uname) {
-                    sqlx::query("UPDATE object_access_entries SET entity_identifier = ? WHERE id = ?")
-                        .bind(uid.hyphenated().to_string())
-                        .bind(entry_id)
-                        .execute(p)
-                        .await?;
-                } else {
-                    sqlx::query("DELETE FROM object_access_entries WHERE id = ?")
-                        .bind(entry_id)
-                        .execute(p)
-                        .await?;
-                }
-            }
-            DbPool::Postgres(p) => {
-                if let Some(uid) = identities.get(&uname) {
-                    sqlx::query("UPDATE object_access_entries SET entity_identifier = $1 WHERE id = $2")
-                        .bind(uid.hyphenated().to_string())
-                        .bind(entry_id)
-                        .execute(p)
-                        .await?;
-                } else {
-                    sqlx::query("DELETE FROM object_access_entries WHERE id = $1")
-                        .bind(entry_id)
-                        .execute(p)
-                        .await?;
-                }
-            }
-            DbPool::Sqlite(_) => unreachable!(),
-        }
-    }
 
-    // risk_ip_accounts & rate_limit_buckets cleanup.
-    match pool {
-        DbPool::Mysql(p) => {
-            sqlx::query("DELETE FROM risk_ip_accounts").execute(p).await?;
-            sqlx::query("DELETE FROM rate_limit_buckets WHERE scope = 'account'")
-                .execute(p)
-                .await?;
-        }
-        DbPool::Postgres(p) => {
-            sqlx::query("DELETE FROM risk_ip_accounts").execute(p).await?;
-            sqlx::query("DELETE FROM rate_limit_buckets WHERE scope = 'account'")
-                .execute(p)
-                .await?;
-        }
-        DbPool::Sqlite(_) => unreachable!(),
-    }
-
-    if is_pg {
-        execute_ddl_statements(
-            pool,
-            &[
-                "ALTER TABLE risk_ip_accounts DROP CONSTRAINT pk_risk_ip_accounts".to_string(),
-                "ALTER TABLE risk_ip_accounts DROP COLUMN username".to_string(),
-                "ALTER TABLE risk_ip_accounts ADD COLUMN user_id UUID NOT NULL".to_string(),
-                "ALTER TABLE risk_ip_accounts ADD CONSTRAINT pk_risk_ip_accounts PRIMARY KEY (namespace, ip_address, user_id)".to_string(),
-            ],
-        )
-        .await?;
-    } else {
-        execute_single_ddl(
-            pool,
-            "ALTER TABLE risk_ip_accounts DROP PRIMARY KEY, DROP COLUMN username, ADD COLUMN user_id CHAR(32) NOT NULL, ADD CONSTRAINT pk_risk_ip_accounts PRIMARY KEY (namespace, ip_address, user_id)",
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-async fn step_b2ea9cac8462(pool: &DbPool) -> Result<()> {
-    let kind = pool.kind();
-    let policies_def = table_def("user_auth_policies").unwrap();
-    let mut ddl = vec![policies_def.compile_create_table(kind)];
-    ddl.extend(policies_def.compile_create_indexes(kind));
-    if !has_table(pool, USER_OIDC_CREDENTIALS_TABLE.name).await? {
-        ddl.push(USER_OIDC_CREDENTIALS_TABLE.compile_create_table(kind));
-        ddl.extend(USER_OIDC_CREDENTIALS_TABLE.compile_create_indexes(kind));
-    }
-    execute_ddl_statements(pool, &ddl).await?;
-
-    // Add credential_id to user_passwords and user_totp_credentials.
-    for tbl in ["user_passwords", "user_totp_credentials"] {
-        if !has_column(pool, tbl, "credential_id").await? {
-            execute_single_ddl(pool, &format!("ALTER TABLE {tbl} ADD COLUMN credential_id VARCHAR(32)"))
-                .await?;
-        }
-        let existing_users: Vec<String> = match pool {
-            DbPool::Sqlite(p) => {
-                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT user_id FROM {tbl}")))
-                    .fetch_all(p)
-                    .await?
-            }
-            DbPool::Mysql(p) => {
-                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT user_id FROM {tbl}")))
-                    .fetch_all(p)
-                    .await?
-            }
-            DbPool::Postgres(p) => {
-                let ids: Vec<Uuid> =
-                    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT user_id FROM {tbl}")))
-                        .fetch_all(p)
-                        .await?;
-                ids.into_iter().map(|u| u.hyphenated().to_string()).collect()
-            }
-        };
-        for uid_str in existing_users {
-            let token = random_hex(16);
-            match pool {
-                DbPool::Sqlite(p) => {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "UPDATE {tbl} SET credential_id = ? WHERE user_id = ?"
-                    )))
-                    .bind(&token)
-                    .bind(&uid_str)
-                    .execute(p)
-                    .await?;
-                }
-                DbPool::Mysql(p) => {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "UPDATE {tbl} SET credential_id = ? WHERE user_id = ?"
-                    )))
-                    .bind(&token)
-                    .bind(&uid_str)
-                    .execute(p)
-                    .await?;
-                }
-                DbPool::Postgres(p) => {
-                    let uid = Uuid::parse_str(&uid_str).map_err(|e| CfmsError::Database(e.to_string()))?;
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "UPDATE {tbl} SET credential_id = $1 WHERE user_id = $2"
-                    )))
-                    .bind(&token)
-                    .bind(uid)
-                    .execute(p)
-                    .await?;
-                }
-            }
-        }
         match kind {
             DatabaseKind::Sqlite => {
-                let def = table_def(tbl).unwrap();
-                let tmp_sql = def.compile_create_table(DatabaseKind::Sqlite).replacen(
-                    &format!("CREATE TABLE {tbl}"),
-                    &format!("CREATE TABLE _cfms_rebuild_{tbl}"),
-                    1,
-                );
-                let col_list: Vec<&str> = def.columns.iter().map(|c| c.name).collect();
-                let joined = col_list.join(", ");
-                let copy_sql = format!(
-                    "INSERT INTO _cfms_rebuild_{tbl} ({joined}) SELECT {joined} FROM {tbl}"
-                );
-                sqlite_rebuild_table(pool, tbl, &tmp_sql, &copy_sql, &[]).await?;
+                let def = table_def("nodes").expect("nodes def");
+                let create_tmp = def
+                    .compile_create_table(DatabaseKind::Sqlite)
+                    .replacen("CREATE TABLE nodes", "CREATE TABLE _cfms_rebuild_nodes", 1);
+                let copy_sql = "INSERT INTO _cfms_rebuild_nodes (id, type, name, parent_id, inherit, status, status_operation_id) \
+                    SELECT id, type, name, parent_id, inherit, status, status_operation_id FROM nodes";
+                let indexes = def.compile_create_indexes(DatabaseKind::Sqlite);
+                sqlite_rebuild_table(pool, "nodes", &create_tmp, copy_sql, &indexes).await?;
             }
             DatabaseKind::Mysql => {
-                execute_single_ddl(
+                let mut clauses = Vec::new();
+                if has_mysql_fk(
                     pool,
-                    &format!(
-                        "ALTER TABLE {tbl} MODIFY COLUMN credential_id VARCHAR(32) NOT NULL, ADD CONSTRAINT uq_{tbl}_credential_id UNIQUE (credential_id)"
-                    ),
+                    "nodes",
+                    "fk_nodes_access_rule_set_id_compiled_access_rule_sets",
+                )
+                .await?
+                {
+                    clauses.push(
+                        "DROP FOREIGN KEY fk_nodes_access_rule_set_id_compiled_access_rule_sets"
+                            .to_string(),
+                    );
+                }
+                if has_index(pool, "nodes", "ix_nodes_access_rule_set_id").await? {
+                    clauses.push("DROP INDEX ix_nodes_access_rule_set_id".to_string());
+                }
+                clauses.push("DROP COLUMN access_rule_set_id".to_string());
+                execute_ddl_statements(
+                    pool,
+                    &[format!("ALTER TABLE nodes {}", clauses.join(", "))],
                 )
                 .await?;
             }
@@ -2884,8 +1418,9 @@ async fn step_b2ea9cac8462(pool: &DbPool) -> Result<()> {
                 execute_ddl_statements(
                     pool,
                     &[
-                        format!("ALTER TABLE {tbl} ALTER COLUMN credential_id SET NOT NULL"),
-                        format!("ALTER TABLE {tbl} ADD CONSTRAINT uq_{tbl}_credential_id UNIQUE (credential_id)"),
+                        "ALTER TABLE nodes DROP CONSTRAINT IF EXISTS fk_nodes_access_rule_set_id_compiled_access_rule_sets".to_string(),
+                        "DROP INDEX IF EXISTS ix_nodes_access_rule_set_id".to_string(),
+                        "ALTER TABLE nodes DROP COLUMN access_rule_set_id".to_string(),
                     ],
                 )
                 .await?;
@@ -2893,258 +1428,244 @@ async fn step_b2ea9cac8462(pool: &DbPool) -> Result<()> {
         }
     }
 
-    // Seed default policies for all existing users.
-    let all_users = fetch_uuid_keys(pool, "SELECT id FROM users").await?;
-    let pwd_map = fetch_uuid_string_map(pool, "SELECT user_id, credential_id FROM user_passwords").await?;
-    let totp_map = match kind {
-        DatabaseKind::Sqlite => {
-            fetch_uuid_string_map(
-                pool,
-                "SELECT user_id, credential_id FROM user_totp_credentials WHERE enabled = 1",
-            )
-            .await?
-        }
-        DatabaseKind::Mysql | DatabaseKind::Postgresql => {
-            fetch_uuid_string_map(
-                pool,
-                "SELECT user_id, credential_id FROM user_totp_credentials WHERE enabled = true",
-            )
-            .await?
-        }
-    };
-
-    for uid in all_users {
-        let login_chains = if let Some(cid) = pwd_map.get(&uid) {
-            serde_json::json!([[{ "method": "password", "credential_ids": [cid] }]])
-        } else {
-            serde_json::json!([])
-        };
-        let mfa_chains = if let Some(cid) = totp_map.get(&uid) {
-            serde_json::json!([[{ "method": "totp", "credential_ids": [cid] }]])
-        } else {
-            serde_json::json!([])
-        };
-        let esc_chains = serde_json::json!([]);
-        let defaults = [
-            ("login", login_chains),
-            ("mfa", mfa_chains),
-            ("escalation", esc_chains),
-        ];
-        for (purpose, chains) in defaults {
-            match pool {
-                DbPool::Sqlite(p) => {
-                    sqlx::query(
-                        "INSERT INTO user_auth_policies (user_id, purpose, revision, chains) VALUES (?, ?, 1, ?)",
-                    )
-                    .bind(uid.simple().to_string())
-                    .bind(purpose)
-                    .bind(chains.to_string())
-                    .execute(p)
-                    .await?;
-                }
-                DbPool::Mysql(p) => {
-                    sqlx::query(
-                        "INSERT INTO user_auth_policies (user_id, purpose, revision, chains) VALUES (?, ?, 1, ?)",
-                    )
-                    .bind(uid.simple().to_string())
-                    .bind(purpose)
-                    .bind(&chains)
-                    .execute(p)
-                    .await?;
-                }
-                DbPool::Postgres(p) => {
-                    sqlx::query(
-                        "INSERT INTO user_auth_policies (user_id, purpose, revision, chains) VALUES ($1, $2, 1, $3)",
-                    )
-                    .bind(uid)
-                    .bind(purpose)
-                    .bind(&chains)
-                    .execute(p)
-                    .await?;
-                }
-            }
+    // 2. Create CEP-0002 DACL tables in parent -> child order.
+    let mut create_stmts = Vec::new();
+    for tbl_name in ["dacl_rules", "dacl_rule_clauses", "dacl_rule_atoms"] {
+        if !has_table(pool, tbl_name).await? {
+            let def = table_def(tbl_name).expect("cacl table def");
+            create_stmts.push(def.compile_create_table(kind));
+            create_stmts.extend(def.compile_create_indexes(kind));
         }
     }
-
-    Ok(())
-}
-
-async fn fetch_uuid_keys(pool: &DbPool, sql: &str) -> Result<Vec<Uuid>> {
-    match pool {
-        DbPool::Sqlite(p) => {
-            let strs: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_all(p).await?;
-            strs.into_iter()
-                .map(|s| Uuid::parse_str(&s).map_err(|e| CfmsError::Database(e.to_string())))
-                .collect()
-        }
-        DbPool::Mysql(p) => {
-            let strs: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_all(p).await?;
-            strs.into_iter()
-                .map(|s| Uuid::parse_str(&s).map_err(|e| CfmsError::Database(e.to_string())))
-                .collect()
-        }
-        DbPool::Postgres(p) => Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_all(p).await?),
-    }
-}
-
-async fn fetch_uuid_string_map(pool: &DbPool, sql: &str) -> Result<BTreeMap<Uuid, String>> {
-    let mut map = BTreeMap::new();
-    match pool {
-        DbPool::Sqlite(p) => {
-            let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql)).fetch_all(p).await?;
-            for (u, val) in rows {
-                map.insert(
-                    Uuid::parse_str(&u).map_err(|e| CfmsError::Database(e.to_string()))?,
-                    val,
-                );
-            }
-        }
-        DbPool::Mysql(p) => {
-            let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql)).fetch_all(p).await?;
-            for (u, val) in rows {
-                map.insert(
-                    Uuid::parse_str(&u).map_err(|e| CfmsError::Database(e.to_string()))?,
-                    val,
-                );
-            }
-        }
-        DbPool::Postgres(p) => {
-            let rows: Vec<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql)).fetch_all(p).await?;
-            for (u, val) in rows {
-                map.insert(u, val);
-            }
-        }
-    }
-    Ok(map)
-}
-
-async fn step_3815ba18197b(pool: &DbPool) -> Result<()> {
-    let missing_ids = fetch_uuid_keys(
-        pool,
-        "SELECT id FROM users WHERE secret_key IS NULL OR length(secret_key) = 0",
-    )
-    .await?;
-    for uid in missing_ids {
-        let secret = random_hex(32);
-        match pool {
-            DbPool::Sqlite(p) => {
-                sqlx::query("UPDATE users SET secret_key = ? WHERE id = ?")
-                    .bind(&secret)
-                    .bind(uid.simple().to_string())
-                    .execute(p)
-                    .await?;
-            }
-            DbPool::Mysql(p) => {
-                sqlx::query("UPDATE users SET secret_key = ? WHERE id = ?")
-                    .bind(&secret)
-                    .bind(uid.simple().to_string())
-                    .execute(p)
-                    .await?;
-            }
-            DbPool::Postgres(p) => {
-                sqlx::query("UPDATE users SET secret_key = $1 WHERE id = $2")
-                    .bind(&secret)
-                    .bind(uid)
-                    .execute(p)
-                    .await?;
-            }
-        }
+    if !create_stmts.is_empty() {
+        execute_ddl_statements(pool, &create_stmts).await?;
     }
 
-    match pool.kind() {
-        DatabaseKind::Sqlite => {
-            let def = table_def("users").unwrap();
-            let tmp_sql = def.compile_create_table(DatabaseKind::Sqlite).replacen(
-                "CREATE TABLE users",
-                "CREATE TABLE _cfms_rebuild_users",
-                1,
-            );
-            let cols: Vec<&str> = def.columns.iter().map(|c| c.name).collect();
-            let joined = cols.join(", ");
-            let copy_sql =
-                format!("INSERT INTO _cfms_rebuild_users ({joined}) SELECT {joined} FROM users");
-            let idxs = def.compile_create_indexes(DatabaseKind::Sqlite);
-            sqlite_rebuild_table(pool, "users", &tmp_sql, &copy_sql, &idxs).await
-        }
-        DatabaseKind::Mysql => {
-            execute_single_ddl(
-                pool,
-                "ALTER TABLE users MODIFY COLUMN secret_key VARCHAR(64) NOT NULL, ADD CONSTRAINT ck_users_secret_key_nonempty CHECK (length(secret_key) > 0)",
-            )
-            .await
-        }
-        DatabaseKind::Postgresql => {
-            execute_ddl_statements(
-                pool,
-                &[
-                    "ALTER TABLE users ALTER COLUMN secret_key SET NOT NULL".to_string(),
-                    "ALTER TABLE users ADD CONSTRAINT ck_users_secret_key_nonempty CHECK (length(secret_key) > 0)".to_string(),
-                ],
-            )
-            .await
+    // 3. Drop legacy access-rule and userblock tables in child -> parent order.
+    let mut drop_stmts = Vec::new();
+    for legacy_tbl in LEGACY_DROP_ORDER {
+        if has_table(pool, legacy_tbl).await? {
+            drop_stmts.push(format!("DROP TABLE IF EXISTS {legacy_tbl}"));
         }
     }
-}
-
-async fn step_03197fed3401(pool: &DbPool) -> Result<()> {
-    const RENAMES: &[(&str, &str)] = &[
-        ("rename_user", "set_nickname"),
-        ("super_rename_user", "super_set_nickname"),
-    ];
-    for table in ["user_permissions", "group_permissions"] {
-        for &(old_name, new_name) in RENAMES {
-            match pool {
-                DbPool::Sqlite(p) => {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "UPDATE {table} SET permission = ? WHERE permission = ?"
-                    )))
-                    .bind(new_name)
-                    .bind(old_name)
-                    .execute(p)
-                    .await?;
-                }
-                DbPool::Mysql(p) => {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "UPDATE {table} SET permission = ? WHERE permission = ?"
-                    )))
-                    .bind(new_name)
-                    .bind(old_name)
-                    .execute(p)
-                    .await?;
-                }
-                DbPool::Postgres(p) => {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "UPDATE {table} SET permission = $1 WHERE permission = $2"
-                    )))
-                    .bind(new_name)
-                    .bind(old_name)
-                    .execute(p)
-                    .await?;
-                }
-            }
-        }
+    if !drop_stmts.is_empty() {
+        execute_ddl_statements(pool, &drop_stmts).await?;
     }
-    Ok(())
-}
 
-async fn step_16c86712512a(pool: &DbPool) -> Result<()> {
+    // 4. Seed default root `/` DACL rules when root node exists and has no DACL rules yet.
+    seed_default_root_dacl(pool).await?;
+
+    // 5. Remove obsolete recursive-check option row if `options` exists.
     if has_table(pool, "options").await? {
+        let del_opt_sql = "DELETE FROM options WHERE namespace = 'access' AND option_key = 'enable_access_recursive_check'";
+        execute_ddl_statements(pool, &[del_opt_sql.to_string()]).await?;
+    }
+
+    // 6. Prune the 24 removed core permissions from `group_permissions` and `user_permissions`.
+    let quoted_perms: Vec<String> = REMOVED_PERMISSIONS.iter().map(|p| format!("'{p}'")).collect();
+    let in_clause = quoted_perms.join(", ");
+    for perm_tbl in ["group_permissions", "user_permissions"] {
+        if has_table(pool, perm_tbl).await? {
+            let sql = format!("DELETE FROM {perm_tbl} WHERE permission IN ({in_clause})");
+            execute_ddl_statements(pool, &[sql]).await?;
+        }
+    }
+
+    // 7. Grant new CEP-0002 capabilities to `sysop` with migration ownership markers.
+    if has_table(pool, "user_groups").await?
+        && has_table(pool, "group_permissions").await?
+        && has_table(pool, "system_states").await?
+    {
+        grant_sysop_permissions(
+            pool,
+            Some("migration:a66108639ed7"),
+            &["bypass_dacl", "bypass_traverse_checking"],
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn seed_default_root_dacl(pool: &DbPool) -> Result<()> {
+    const PRESET_READ_MASK: i64 = 1043; // TRAVERSE | LIST_DIRECTORY | READ_CONTENT | READ_METADATA
+    const DEFAULT_SYSOP_ALL_OPS_MASK: i64 = 2_097_151; // All 21 CEP-0002 v1 AtomicOps (bits 0..20)
+
+    if !has_table(pool, "nodes").await? || !has_table(pool, "dacl_rules").await? {
         return Ok(());
     }
-    let kind = pool.kind();
-    let def = table_def("options").unwrap();
-    let mut ddl = vec![def.compile_create_table(kind)];
-    ddl.extend(def.compile_create_indexes(kind));
-    execute_ddl_statements(pool, &ddl).await
-}
 
-async fn step_e952c02c1454(pool: &DbPool) -> Result<()> {
-    grant_sysop_permissions(
-        pool,
-        Some("migration:e952c02c1454"),
-        &["view_settings", "manage_settings"],
-    )
-    .await
+    let root_count: i64 = match pool {
+        DbPool::Sqlite(p) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE id = '/'")
+                .fetch_one(p)
+                .await?
+        }
+        DbPool::Mysql(p) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE id = '/'")
+                .fetch_one(p)
+                .await?
+        }
+        DbPool::Postgres(p) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE id = '/'")
+                .fetch_one(p)
+                .await?
+        }
+    };
+    if root_count == 0 {
+        return Ok(());
+    }
+
+    let existing_rules: i64 = match pool {
+        DbPool::Sqlite(p) => {
+            sqlx::query("UPDATE nodes SET inherit = 0 WHERE id = '/'")
+                .execute(p)
+                .await?;
+            sqlx::query_scalar("SELECT COUNT(*) FROM dacl_rules WHERE node_id = '/'")
+                .fetch_one(p)
+                .await?
+        }
+        DbPool::Mysql(p) => {
+            sqlx::query("UPDATE nodes SET inherit = false WHERE id = '/'")
+                .execute(p)
+                .await?;
+            sqlx::query_scalar("SELECT COUNT(*) FROM dacl_rules WHERE node_id = '/'")
+                .fetch_one(p)
+                .await?
+        }
+        DbPool::Postgres(p) => {
+            sqlx::query("UPDATE nodes SET inherit = false WHERE id = '/'")
+                .execute(p)
+                .await?;
+            sqlx::query_scalar("SELECT COUNT(*) FROM dacl_rules WHERE node_id = '/'")
+                .fetch_one(p)
+                .await?
+        }
+    };
+    if existing_rules > 0 {
+        return Ok(());
+    }
+
+    match pool {
+        DbPool::Sqlite(p) => {
+            let mut tx = p.begin().await?;
+            let read_rule_id = sqlx::query(
+                "INSERT INTO dacl_rules (node_id, effect, permission_mask, scope, valid_from, valid_until, remark) \
+                 VALUES ('/', 'allow', ?, 'all', NULL, NULL, 'Default read access for authenticated users')",
+            )
+            .bind(PRESET_READ_MASK)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_rowid();
+            sqlx::query("INSERT INTO dacl_rule_clauses (rule_id) VALUES (?)")
+                .bind(read_rule_id)
+                .execute(&mut *tx)
+                .await?;
+
+            let admin_rule_id = sqlx::query(
+                "INSERT INTO dacl_rules (node_id, effect, permission_mask, scope, valid_from, valid_until, remark) \
+                 VALUES ('/', 'allow', ?, 'all', NULL, NULL, 'Default administrator full access')",
+            )
+            .bind(DEFAULT_SYSOP_ALL_OPS_MASK)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_rowid();
+            let admin_clause_id = sqlx::query("INSERT INTO dacl_rule_clauses (rule_id) VALUES (?)")
+                .bind(admin_rule_id)
+                .execute(&mut *tx)
+                .await?
+                .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO dacl_rule_atoms (clause_id, predicate_kind, predicate_value, is_negated) VALUES (?, 'group', 'sysop', 0)",
+            )
+            .bind(admin_clause_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+        DbPool::Mysql(p) => {
+            let mut tx = p.begin().await?;
+            let read_rule_id = i64::try_from(
+                sqlx::query(
+                    "INSERT INTO dacl_rules (node_id, effect, permission_mask, scope, valid_from, valid_until, remark) \
+                     VALUES ('/', 'allow', ?, 'all', NULL, NULL, 'Default read access for authenticated users')",
+                )
+                .bind(PRESET_READ_MASK)
+                .execute(&mut *tx)
+                .await?
+                .last_insert_id(),
+            )
+            .map_err(|_| CfmsError::Database("dacl_rules.id overflowed i64".to_string()))?;
+            sqlx::query("INSERT INTO dacl_rule_clauses (rule_id) VALUES (?)")
+                .bind(read_rule_id)
+                .execute(&mut *tx)
+                .await?;
+
+            let admin_rule_id = i64::try_from(
+                sqlx::query(
+                    "INSERT INTO dacl_rules (node_id, effect, permission_mask, scope, valid_from, valid_until, remark) \
+                     VALUES ('/', 'allow', ?, 'all', NULL, NULL, 'Default administrator full access')",
+                )
+                .bind(DEFAULT_SYSOP_ALL_OPS_MASK)
+                .execute(&mut *tx)
+                .await?
+                .last_insert_id(),
+            )
+            .map_err(|_| CfmsError::Database("dacl_rules.id overflowed i64".to_string()))?;
+            let admin_clause_id = i64::try_from(
+                sqlx::query("INSERT INTO dacl_rule_clauses (rule_id) VALUES (?)")
+                    .bind(admin_rule_id)
+                    .execute(&mut *tx)
+                    .await?
+                    .last_insert_id(),
+            )
+            .map_err(|_| CfmsError::Database("dacl_rule_clauses.id overflowed i64".to_string()))?;
+            sqlx::query(
+                "INSERT INTO dacl_rule_atoms (clause_id, predicate_kind, predicate_value, is_negated) VALUES (?, 'group', 'sysop', false)",
+            )
+            .bind(admin_clause_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+        DbPool::Postgres(p) => {
+            let mut tx = p.begin().await?;
+            let read_rule_id: i64 = sqlx::query_scalar(
+                "INSERT INTO dacl_rules (node_id, effect, permission_mask, scope, valid_from, valid_until, remark) \
+                 VALUES ('/', 'allow', $1, 'all', NULL, NULL, 'Default read access for authenticated users') RETURNING id",
+            )
+            .bind(PRESET_READ_MASK)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query("INSERT INTO dacl_rule_clauses (rule_id) VALUES ($1)")
+                .bind(read_rule_id)
+                .execute(&mut *tx)
+                .await?;
+
+            let admin_rule_id: i64 = sqlx::query_scalar(
+                "INSERT INTO dacl_rules (node_id, effect, permission_mask, scope, valid_from, valid_until, remark) \
+                 VALUES ('/', 'allow', $1, 'all', NULL, NULL, 'Default administrator full access') RETURNING id",
+            )
+            .bind(DEFAULT_SYSOP_ALL_OPS_MASK)
+            .fetch_one(&mut *tx)
+            .await?;
+            let admin_clause_id: i64 = sqlx::query_scalar(
+                "INSERT INTO dacl_rule_clauses (rule_id) VALUES ($1) RETURNING id",
+            )
+            .bind(admin_rule_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO dacl_rule_atoms (clause_id, predicate_kind, predicate_value, is_negated) VALUES ($1, 'group', 'sysop', false)",
+            )
+            .bind(admin_clause_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3179,7 +1700,7 @@ mod tests {
 
         let inspector = SchemaInspector::inspect(&pool).await.unwrap();
         assert!(inspector.healthy);
-        assert_eq!(inspector.present_core_tables, 40);
+        assert_eq!(inspector.present_core_tables, 35);
 
         let second = upgrade_database_schema(&pool).await.unwrap();
         assert!(!second.bootstrapped);
@@ -3210,209 +1731,189 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_historical_upgrade_from_fe8863687aa4_to_head_preserves_and_migrates_data() {
+    async fn upgrade_from_0_14_0_e952c02c1454_to_a66108639ed7_migrates_cacl_dacl_and_preserves_data() {
         let dir = tempdir().unwrap();
-        let pool = open_sqlite_test_pool(&dir.path().join("legacy.db")).await;
+        let pool = open_sqlite_test_pool(&dir.path().join("v014.db")).await;
         let DbPool::Sqlite(p) = &pool else {
             unreachable!();
         };
 
-        // Construct realistic historical schema at root revision `fe8863687aa4`.
-        let stmts: Vec<String> = vec![
-            table_def("files").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("comments").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            // Legacy `users` keyed by `username` before `5ad5aca75635` and `d252e662fc05`
-            "CREATE TABLE users (\n\
-                username VARCHAR(256) NOT NULL,\n\
-                nickname VARCHAR(255),\n\
-                pass_hash TEXT,\n\
-                passwd_last_modified DOUBLE NOT NULL,\n\
-                avatar_id VARCHAR(255),\n\
-                last_login DOUBLE,\n\
-                created_time DOUBLE NOT NULL,\n\
-                status INTEGER NOT NULL,\n\
-                status_comment_id INTEGER,\n\
-                totp_secret VARCHAR(32),\n\
-                totp_enabled BOOLEAN NOT NULL,\n\
-                totp_backup_codes TEXT,\n\
-                secret_key VARCHAR(64),\n\
-                preference_dek_id VARCHAR(64),\n\
-                CONSTRAINT pk_users PRIMARY KEY (username),\n\
-                CONSTRAINT fk_users_avatar_id_files FOREIGN KEY(avatar_id) REFERENCES files (id) ON DELETE RESTRICT,\n\
-                CONSTRAINT fk_users_status_comment_id_comments FOREIGN KEY(status_comment_id) REFERENCES comments (comment_id) ON DELETE SET NULL,\n\
-                CONSTRAINT fk_users_preference_dek_id FOREIGN KEY(preference_dek_id) REFERENCES keyrings (id) ON DELETE SET NULL\n\
-            )"
-            .to_string(),
-            table_def("user_groups").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("group_permissions").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            "CREATE TABLE user_memberships (\n\
-                id INTEGER NOT NULL,\n\
-                username VARCHAR(256) NOT NULL,\n\
-                group_name VARCHAR(256) NOT NULL,\n\
-                start_time DOUBLE,\n\
-                end_time DOUBLE,\n\
-                CONSTRAINT pk_user_memberships PRIMARY KEY (id),\n\
-                CONSTRAINT uq_user_memberships_username_group UNIQUE (username, group_name),\n\
-                CONSTRAINT fk_user_memberships_username_users FOREIGN KEY(username) REFERENCES users (username) ON DELETE CASCADE,\n\
-                CONSTRAINT fk_user_memberships_group_name_user_groups FOREIGN KEY(group_name) REFERENCES user_groups (group_name) ON DELETE CASCADE\n\
-            )"
-            .to_string(),
-            "CREATE TABLE user_permissions (\n\
-                id INTEGER NOT NULL,\n\
-                username VARCHAR(256) NOT NULL,\n\
-                permission VARCHAR(64) NOT NULL,\n\
-                granted BOOLEAN NOT NULL,\n\
-                start_time DOUBLE NOT NULL,\n\
-                end_time DOUBLE,\n\
-                CONSTRAINT pk_user_permissions PRIMARY KEY (id),\n\
-                CONSTRAINT fk_user_permissions_username_users FOREIGN KEY(username) REFERENCES users (username) ON DELETE CASCADE\n\
-            )"
-            .to_string(),
-            "CREATE TABLE keyrings (\n\
-                id VARCHAR(64) NOT NULL,\n\
-                username VARCHAR(256) NOT NULL,\n\
-                content TEXT NOT NULL,\n\
-                label VARCHAR(255),\n\
-                created_time DOUBLE NOT NULL,\n\
-                CONSTRAINT pk_keyrings PRIMARY KEY (id),\n\
-                CONSTRAINT fk_keyrings_username_users FOREIGN KEY(username) REFERENCES users (username) ON DELETE CASCADE\n\
-            )"
-            .to_string(),
-            // Legacy `nodes` with `active_parent_id` prior to `170e0a16133e`
+        // Construct CFMS 0.14.0 (`e952c02c1454`) 40-table SQLite schema.
+        let mut stmts: Vec<String> = Vec::new();
+        for name in [
+            "files",
+            "comments",
+            "users",
+            "user_passwords",
+            "user_totp_credentials",
+            "user_auth_public_keys",
+            "user_auth_policies",
+            "user_groups",
+            "group_permissions",
+            "user_memberships",
+            "user_permissions",
+            "keyrings",
+        ] {
+            let def = table_def(name).unwrap();
+            stmts.push(def.compile_create_table(DatabaseKind::Sqlite));
+            stmts.extend(def.compile_create_indexes(DatabaseKind::Sqlite));
+        }
+
+        // Legacy 0.14.0 `nodes` with `access_rule_set_id` + index.
+        stmts.push(
             "CREATE TABLE nodes (\n\
                 id VARCHAR(255) NOT NULL,\n\
                 type VARCHAR(16) NOT NULL,\n\
                 name VARCHAR(255) NOT NULL,\n\
                 parent_id VARCHAR(255),\n\
-                active_parent_id VARCHAR(255) GENERATED ALWAYS AS (CASE WHEN status = 1 THEN NULL ELSE parent_id END) STORED,\n\
+                active_name VARCHAR(255) GENERATED ALWAYS AS (CASE WHEN status = 1 THEN NULL ELSE name END) STORED,\n\
                 inherit BOOLEAN NOT NULL,\n\
                 status INTEGER NOT NULL,\n\
                 status_operation_id VARCHAR(255),\n\
                 access_rule_set_id VARCHAR(32),\n\
                 CONSTRAINT pk_nodes PRIMARY KEY (id),\n\
                 CONSTRAINT ck_nodes_root_parent CHECK (id = '/' AND parent_id IS NULL AND type = 'directory' OR id != '/' AND parent_id IS NOT NULL),\n\
-                CONSTRAINT uq_nodes_active_parent_name UNIQUE (active_parent_id, name),\n\
+                CONSTRAINT uq_nodes_active_parent_name UNIQUE (parent_id, active_name),\n\
                 CONSTRAINT fk_nodes_parent_id_folders FOREIGN KEY(parent_id) REFERENCES folders (id) ON DELETE CASCADE,\n\
                 CONSTRAINT fk_nodes_access_rule_set_id_compiled_access_rule_sets FOREIGN KEY(access_rule_set_id) REFERENCES compiled_access_rule_sets (id)\n\
             )"
             .to_string(),
-            table_def("folders").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("documents").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("document_revisions").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            "CREATE TABLE document_metadata (\n\
-                document_id VARCHAR(255) NOT NULL,\n\
-                creator_username VARCHAR(256),\n\
-                last_modified_by_username VARCHAR(256),\n\
-                CONSTRAINT pk_document_metadata PRIMARY KEY (document_id),\n\
-                CONSTRAINT fk_document_metadata_document_id_documents FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE CASCADE,\n\
-                CONSTRAINT fk_document_metadata_creator_username_users FOREIGN KEY(creator_username) REFERENCES users (username) ON DELETE SET NULL,\n\
-                CONSTRAINT fk_document_metadata_last_modified_by_username_users FOREIGN KEY(last_modified_by_username) REFERENCES users (username) ON DELETE SET NULL\n\
+        );
+        stmts.push("CREATE INDEX ix_nodes_access_rule_set_id ON nodes (access_rule_set_id)".to_string());
+        stmts.extend(
+            table_def("nodes")
+                .unwrap()
+                .compile_create_indexes(DatabaseKind::Sqlite),
+        );
+
+        for name in [
+            "folders",
+            "documents",
+            "document_revisions",
+            "document_metadata",
+            "document_metadata_tags",
+        ] {
+            let def = table_def(name).unwrap();
+            stmts.push(def.compile_create_table(DatabaseKind::Sqlite));
+            stmts.extend(def.compile_create_indexes(DatabaseKind::Sqlite));
+        }
+
+        // Legacy access & userblock tables dropped in `a66108639ed7`.
+        stmts.extend([
+            "CREATE TABLE object_access_entries (\n\
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,\n\
+                entity_type VARCHAR(16) NOT NULL,\n\
+                entity_identifier VARCHAR(255) NOT NULL,\n\
+                target_type VARCHAR(16) NOT NULL,\n\
+                target_identifier VARCHAR(255) NOT NULL,\n\
+                access_type VARCHAR(16) NOT NULL,\n\
+                start_time DOUBLE NOT NULL,\n\
+                end_time DOUBLE\n\
             )"
             .to_string(),
-            table_def("document_metadata_tags").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("object_access_entries").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("compiled_access_rule_sets").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("compiled_access_rules").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("compiled_access_rule_groups").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("compiled_access_rule_memberships").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("compiled_access_rule_rights").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            "CREATE TABLE audit_entries (\n\
-                id VARCHAR(255) NOT NULL,\n\
-                action VARCHAR(255) NOT NULL,\n\
-                username VARCHAR(256),\n\
-                target VARCHAR(255),\n\
-                data JSON,\n\
-                result INTEGER NOT NULL,\n\
-                remote_address VARCHAR(64),\n\
-                logged_time DOUBLE NOT NULL,\n\
-                CONSTRAINT pk_audit_entries PRIMARY KEY (id),\n\
-                CONSTRAINT fk_audit_entries_username_users FOREIGN KEY(username) REFERENCES users (username) ON DELETE SET NULL\n\
+            "CREATE TABLE compiled_access_rule_sets (\n\
+                id VARCHAR(32) NOT NULL,\n\
+                node_id VARCHAR(255) NOT NULL,\n\
+                created_at DOUBLE NOT NULL,\n\
+                CONSTRAINT pk_compiled_access_rule_sets PRIMARY KEY (id),\n\
+                CONSTRAINT fk_compiled_access_rule_sets_node_id_nodes FOREIGN KEY(node_id) REFERENCES nodes (id) ON DELETE CASCADE\n\
+            )"
+            .to_string(),
+            "CREATE TABLE compiled_access_rules (\n\
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,\n\
+                rule_set_id VARCHAR(32) NOT NULL,\n\
+                access_type VARCHAR(64) NOT NULL,\n\
+                match_mode VARCHAR(8) NOT NULL,\n\
+                CONSTRAINT fk_compiled_access_rules_rule_set_id_compiled_access_rule_sets FOREIGN KEY(rule_set_id) REFERENCES compiled_access_rule_sets (id) ON DELETE CASCADE\n\
+            )"
+            .to_string(),
+            "CREATE TABLE compiled_access_rule_groups (\n\
+                id VARCHAR(32) NOT NULL,\n\
+                rule_id INTEGER NOT NULL,\n\
+                group_index INTEGER NOT NULL,\n\
+                match_mode VARCHAR(8) NOT NULL,\n\
+                rights_match_mode VARCHAR(8) NOT NULL,\n\
+                rights_empty BOOLEAN NOT NULL,\n\
+                groups_match_mode VARCHAR(8) NOT NULL,\n\
+                groups_empty BOOLEAN NOT NULL,\n\
+                CONSTRAINT pk_compiled_access_rule_groups PRIMARY KEY (id),\n\
+                CONSTRAINT fk_compiled_access_rule_groups_rule_id_compiled_access_rules FOREIGN KEY(rule_id) REFERENCES compiled_access_rules (id) ON DELETE CASCADE\n\
+            )"
+            .to_string(),
+            "CREATE TABLE compiled_access_rule_memberships (\n\
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,\n\
+                group_id VARCHAR(32) NOT NULL,\n\
+                group_name VARCHAR(255) NOT NULL,\n\
+                CONSTRAINT fk_compiled_access_rule_memberships_group_id_compiled_access_rule_groups FOREIGN KEY(group_id) REFERENCES compiled_access_rule_groups (id) ON DELETE CASCADE\n\
+            )"
+            .to_string(),
+            "CREATE TABLE compiled_access_rule_rights (\n\
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,\n\
+                group_id VARCHAR(32) NOT NULL,\n\
+                permission VARCHAR(64) NOT NULL,\n\
+                CONSTRAINT fk_compiled_access_rule_rights_group_id_compiled_access_rule_groups FOREIGN KEY(group_id) REFERENCES compiled_access_rule_groups (id) ON DELETE CASCADE\n\
             )"
             .to_string(),
             "CREATE TABLE userblock_entries (\n\
                 block_id VARCHAR(32) NOT NULL,\n\
-                username VARCHAR(256) NOT NULL,\n\
+                user_id CHAR(32) NOT NULL,\n\
                 timestamp DOUBLE NOT NULL,\n\
                 not_before DOUBLE NOT NULL,\n\
                 not_after DOUBLE NOT NULL,\n\
                 target_type VARCHAR(32) NOT NULL,\n\
                 target_id VARCHAR(255),\n\
+                reason_comment_id INTEGER,\n\
                 CONSTRAINT pk_userblock_entries PRIMARY KEY (block_id),\n\
-                CONSTRAINT fk_userblock_entries_username_users FOREIGN KEY(username) REFERENCES users (username) ON DELETE CASCADE\n\
+                CONSTRAINT fk_userblock_entries_user_id_users FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE,\n\
+                CONSTRAINT fk_userblock_entries_reason_comment_id_comments FOREIGN KEY(reason_comment_id) REFERENCES comments (comment_id) ON DELETE SET NULL\n\
             )"
             .to_string(),
-            table_def("userblock_sub_entries").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("banned_subnets").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("account_throttles").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            "CREATE TABLE file_tasks (\n\
-                id VARCHAR(255) NOT NULL,\n\
-                file_id VARCHAR(255) NOT NULL,\n\
-                status INTEGER NOT NULL,\n\
-                mode INTEGER NOT NULL,\n\
-                start_time DOUBLE NOT NULL,\n\
-                end_time DOUBLE,\n\
-                issued_by_username VARCHAR(256),\n\
-                encryption_key VARCHAR(256),\n\
-                chunk_size INTEGER,\n\
-                upload_file_size BIGINT,\n\
-                upload_sha256 VARCHAR(64),\n\
-                upload_session_id TEXT,\n\
-                upload_checkpoint_size BIGINT,\n\
-                upload_checkpoint_data TEXT,\n\
-                CONSTRAINT pk_file_tasks PRIMARY KEY (id),\n\
-                CONSTRAINT ck_file_tasks_status_value CHECK (status IN (0, 1, 2, 3, 4)),\n\
-                CONSTRAINT fk_file_tasks_file_id_files FOREIGN KEY(file_id) REFERENCES files (id) ON DELETE CASCADE,\n\
-                CONSTRAINT fk_file_tasks_issued_by_username_users FOREIGN KEY(issued_by_username) REFERENCES users (username) ON DELETE SET NULL\n\
+            "CREATE TABLE userblock_sub_entries (\n\
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,\n\
+                parent_id VARCHAR(32) NOT NULL,\n\
+                block_type VARCHAR(64) NOT NULL,\n\
+                CONSTRAINT fk_userblock_sub_entries_parent_id_userblock_entries FOREIGN KEY(parent_id) REFERENCES userblock_entries (block_id) ON DELETE CASCADE\n\
             )"
             .to_string(),
-            table_def("login_throttles").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("rate_limit_buckets").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            "CREATE TABLE risk_ip_accounts (\n\
-                namespace VARCHAR(64) NOT NULL,\n\
-                ip_address VARCHAR(45) NOT NULL,\n\
-                username VARCHAR(256) NOT NULL,\n\
-                last_attempt DOUBLE NOT NULL,\n\
-                CONSTRAINT pk_risk_ip_accounts PRIMARY KEY (namespace, ip_address, username)\n\
-            )"
-            .to_string(),
-            table_def("system_states").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("traffic_throttles").unwrap().compile_create_table(DatabaseKind::Sqlite),
-            table_def("file_deduplication_tasks").unwrap().compile_create_table(DatabaseKind::Sqlite),
-        ];
+        ]);
+
+        for name in [
+            "audit_entries",
+            "banned_subnets",
+            "account_throttles",
+            "file_tasks",
+            "login_throttles",
+            "rate_limit_buckets",
+            "risk_ip_accounts",
+            "system_states",
+            "options",
+            "traffic_throttles",
+            "file_deduplication_tasks",
+            "schedules",
+            "schedule_executions",
+            "scheduling_runtime_state",
+        ] {
+            let def = table_def(name).unwrap();
+            stmts.push(def.compile_create_table(DatabaseKind::Sqlite));
+            stmts.extend(def.compile_create_indexes(DatabaseKind::Sqlite));
+        }
 
         execute_ddl_statements(&pool, &stmts).await.unwrap();
         set_alembic_version(&pool, ROOT_SCHEMA_REVISION).await.unwrap();
 
-        // Populate legacy rows across users, passwords, TOTP, keyrings, groups, permissions (with rename_user),
-        // nodes tree, object_access_entries, audit_entries, userblock_entries, and rate_limit_buckets.
+        // Seed 0.14.0 data including tree nodes, compiled rules, userblocks, options, and permissions.
         sqlx::query("INSERT INTO user_groups (group_name, group_display_name) VALUES ('sysop', 'Sysop Admins')")
             .execute(p)
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO users (username, nickname, pass_hash, passwd_last_modified, created_time, status, totp_secret, totp_enabled) \
-             VALUES ('alice', 'Alice', 'argon2$hash', 10.0, 1.0, 0, 'JBSWY3DPEHPK3PXP', 1)",
+            "INSERT INTO users (id, username, nickname, created_time, status, secret_key) \
+             VALUES ('019481f23c1b70008000000000000001', 'alice', 'Alice', 1.0, 0, 'secret-key-64-chars-placeholder-00000000000000000000000000000001')",
         )
         .execute(p)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO keyrings (id, username, content, label, created_time) VALUES ('dek-1', 'alice', '{}', 'k1', 2.0)")
-            .execute(p)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE users SET preference_dek_id = 'dek-1' WHERE username = 'alice'")
-            .execute(p)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO user_permissions (username, permission, granted, start_time) VALUES ('alice', 'rename_user', 1, 0.0)")
-            .execute(p)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO group_permissions (group_name, permission, granted, start_time) VALUES ('sysop', 'super_rename_user', 1, 0.0)")
-            .execute(p)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO user_memberships (username, group_name, start_time) VALUES ('alice', 'sysop', 0.0)")
+        sqlx::query("INSERT INTO files (id, path, size, sha256, active, created_time) VALUES ('f-1', 'blobs/1', 12, 'abcd', 1, 1.0)")
             .execute(p)
             .await
             .unwrap();
@@ -3424,111 +1925,167 @@ mod tests {
             .execute(p)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO object_access_entries (entity_type, entity_identifier, target_type, target_identifier, access_type, start_time) VALUES ('user', 'alice', 'folder', '/', 'read', 0.0)")
+        sqlx::query("INSERT INTO nodes (id, type, name, parent_id, inherit, status) VALUES ('/doc', 'document', 'doc', '/', 1, 0)")
             .execute(p)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO userblock_entries (block_id, username, timestamp, not_before, not_after, target_type) VALUES ('blk-1', 'alice', 1.0, 1.0, 9.0, 'login')")
+        sqlx::query("INSERT INTO documents (id, created_time, current_revision_id) VALUES ('/doc', 2.0, NULL)")
             .execute(p)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO risk_ip_accounts (namespace, ip_address, username, last_attempt) VALUES ('auth', '127.0.0.1', 'alice', 5.0)")
+        sqlx::query("INSERT INTO document_revisions (id, document_id, file_id, created_time, status) VALUES ('rev-1', '/doc', 'f-1', 2.0, 0)")
             .execute(p)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO rate_limit_buckets (namespace, scope, identity, tokens, last_refill_at, denial_count, last_attempt) VALUES ('login', 'account', 'alice', 5.0, 5.0, 0, 5.0)")
+        sqlx::query("UPDATE documents SET current_revision_id = 'rev-1' WHERE id = '/doc'")
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO compiled_access_rule_sets (id, node_id, created_at) VALUES ('ars-1', '/', 1.0)")
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE nodes SET access_rule_set_id = 'ars-1' WHERE id = '/'")
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO userblock_entries (block_id, user_id, timestamp, not_before, not_after, target_type) VALUES ('blk-1', '019481f23c1b70008000000000000001', 1.0, 1.0, 9.0, 'login')")
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO options (namespace, owner, option_key, schema_version, revision, value_type, option_value, updated_at) VALUES ('access', 'builtin', 'enable_access_recursive_check', 1, 1, 'bool', 'true', 1.0)")
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO options (namespace, owner, option_key, schema_version, revision, value_type, option_value, updated_at) VALUES ('server', 'builtin', 'name', 1, 1, 'str', '\"CFMS\"', 1.0)")
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO group_permissions (group_name, permission, granted, start_time) VALUES ('sysop', 'manage_access', 1, 0.0)")
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO group_permissions (group_name, permission, granted, start_time) VALUES ('sysop', 'view_settings', 1, 0.0)")
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_permissions (user_id, permission, granted, start_time) VALUES ('019481f23c1b70008000000000000001', 'create_document', 1, 0.0)")
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_permissions (user_id, permission, granted, start_time) VALUES ('019481f23c1b70008000000000000001', 'search', 1, 0.0)")
             .execute(p)
             .await
             .unwrap();
 
         let outcome = upgrade_database_schema(&pool)
             .await
-            .expect("full 19-step upgrade from fe8863687aa4");
+            .expect("upgrade from 0.14.0 e952c02c1454 to a66108639ed7");
         assert!(!outcome.bootstrapped);
-        assert_eq!(outcome.previous_revision.as_deref(), Some(ROOT_SCHEMA_REVISION));
+        assert_eq!(outcome.previous_revision.as_deref(), Some("e952c02c1454"));
         assert_eq!(outcome.current_revision, LATEST_SCHEMA_REVISION);
-        assert_eq!(outcome.applied_revisions.len(), 19);
+        assert_eq!(outcome.applied_revisions, vec!["a66108639ed7".to_string()]);
 
         let inspector = SchemaInspector::inspect(&pool).await.unwrap();
-        assert!(inspector.healthy);
-        assert_eq!(inspector.present_core_tables, 40);
+        assert!(
+            inspector.healthy,
+            "inspector drift: missing={:?}, extra={:?}, cols={:?}, constraints={:?}, idx={:?}",
+            inspector.missing_tables,
+            inspector.extra_tables,
+            inspector.column_mismatches,
+            inspector.constraint_mismatches,
+            inspector.index_mismatches
+        );
+        assert_eq!(inspector.present_core_tables, 35);
 
-        // Verify data migrations across revisions:
-        let alice_id: String =
-            sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
+        // Node hierarchy & documents survived SQLite table rebuild without FK cascade wipe.
+        let doc_rev: String =
+            sqlx::query_scalar("SELECT current_revision_id FROM documents WHERE id = '/doc'")
                 .fetch_one(p)
                 .await
                 .unwrap();
-        let parsed_uid = Uuid::parse_str(&alice_id).expect("valid uuid");
-        let secret_key: String =
-            sqlx::query_scalar("SELECT secret_key FROM users WHERE username = 'alice'")
-                .fetch_one(p)
-                .await
-                .unwrap();
-        assert_eq!(secret_key.len(), 64);
+        assert_eq!(doc_rev, "rev-1");
 
-        // 5ad5aca75635 + b2ea9cac8462: password & TOTP moved & credential_id generated & policy seeded
-        let pwd_cred_id: String =
-            sqlx::query_scalar("SELECT credential_id FROM user_passwords WHERE user_id = ?")
-                .bind(&alice_id)
-                .fetch_one(p)
-                .await
-                .unwrap();
-        assert_eq!(pwd_cred_id.len(), 32);
+        // Root `/` inherit cleared and default DACL seeded cleanly.
+        let root_inherit: i64 = sqlx::query_scalar("SELECT inherit FROM nodes WHERE id = '/'")
+            .fetch_one(p)
+            .await
+            .unwrap();
+        assert_eq!(root_inherit, 0);
 
-        let policy_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM user_auth_policies WHERE user_id = ?")
-                .bind(&alice_id)
-                .fetch_one(p)
-                .await
-                .unwrap();
-        assert!(policy_count >= 1);
-
-        // d252e662fc05: object_access_entries rewritten to hyphenated UUID, account rate limit pruned
-        let entity_id: String = sqlx::query_scalar(
-            "SELECT entity_identifier FROM object_access_entries WHERE entity_type = 'user'",
-        )
-        .fetch_one(p)
-        .await
-        .unwrap();
-        assert_eq!(entity_id, parsed_uid.hyphenated().to_string());
-
-        let acct_buckets: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_buckets WHERE scope = 'account'")
-                .fetch_one(p)
-                .await
-                .unwrap();
-        assert_eq!(acct_buckets, 0);
-
-        // 03197fed3401: rename_user / super_rename_user renamed
-        let user_perm: String =
-            sqlx::query_scalar("SELECT permission FROM user_permissions WHERE user_id = ?")
-                .bind(&alice_id)
-                .fetch_one(p)
-                .await
-                .unwrap();
-        assert_eq!(user_perm, "set_nickname");
-
-        // b4b3061f385c + 8c130010a943 + e952c02c1454: sysop permissions seeded
-        let sysop_perms: Vec<String> = sqlx::query_scalar(
-            "SELECT permission FROM group_permissions WHERE group_name = 'sysop'",
+        let rules: Vec<(i64, String, i64, String)> = sqlx::query_as(
+            "SELECT id, effect, permission_mask, scope FROM dacl_rules WHERE node_id = '/' ORDER BY id",
         )
         .fetch_all(p)
         .await
         .unwrap();
-        for expected in [
-            "super_set_nickname",
-            "diagnostics",
-            "view_schedules",
-            "manage_schedules",
-            "view_settings",
-            "manage_settings",
-        ] {
-            assert!(
-                sysop_perms.iter().any(|x| x == expected),
-                "missing expected sysop permission '{expected}', found: {sysop_perms:?}"
-            );
-        }
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].1, "allow");
+        assert_eq!(rules[0].2, 1043);
+        assert_eq!(rules[0].3, "all");
+        assert_eq!(rules[1].2, 2_097_151);
+
+        let atom: (String, String, i64) = sqlx::query_as(
+            "SELECT predicate_kind, predicate_value, is_negated FROM dacl_rule_atoms",
+        )
+        .fetch_one(p)
+        .await
+        .unwrap();
+        assert_eq!(atom, ("group".to_string(), "sysop".to_string(), 0));
+
+        // Obsolete option removed, valid option preserved.
+        let opt_cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM options WHERE namespace = 'access' AND option_key = 'enable_access_recursive_check'",
+        )
+        .fetch_one(p)
+        .await
+        .unwrap();
+        assert_eq!(opt_cnt, 0);
+        let kept_opt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM options WHERE namespace = 'server' AND option_key = 'name'",
+        )
+        .fetch_one(p)
+        .await
+        .unwrap();
+        assert_eq!(kept_opt, 1);
+
+        // Removed permissions pruned, kept & new permissions present with migration markers.
+        let user_perms: Vec<String> = sqlx::query_scalar(
+            "SELECT permission FROM user_permissions ORDER BY permission",
+        )
+        .fetch_all(p)
+        .await
+        .unwrap();
+        assert_eq!(user_perms, vec!["search".to_string()]);
+
+        let sysop_perms: Vec<String> = sqlx::query_scalar(
+            "SELECT permission FROM group_permissions WHERE group_name = 'sysop' ORDER BY permission",
+        )
+        .fetch_all(p)
+        .await
+        .unwrap();
+        assert_eq!(
+            sysop_perms,
+            vec![
+                "bypass_dacl".to_string(),
+                "bypass_traverse_checking".to_string(),
+                "view_settings".to_string(),
+            ]
+        );
+
+        let markers: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT state_key, schema_version, revision FROM system_states WHERE owner = 'migration:a66108639ed7' ORDER BY state_key",
+        )
+        .fetch_all(p)
+        .await
+        .unwrap();
+        assert_eq!(
+            markers,
+            vec![
+                ("bypass_dacl".to_string(), 2, 1),
+                ("bypass_traverse_checking".to_string(), 2, 1),
+            ]
+        );
     }
 
     #[tokio::test]

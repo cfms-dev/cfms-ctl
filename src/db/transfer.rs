@@ -1864,14 +1864,13 @@ mod tests {
         .unwrap();
 
         // Deep folder hierarchy: / -> /docs (Aa & aA mixed-case ordering check) -> /docs/spec.txt
-        sqlx::query("INSERT INTO nodes (id, type, name, parent_id, inherit, status, status_operation_id, access_rule_set_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO nodes (id, type, name, parent_id, inherit, status, status_operation_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
             .bind("/")
             .bind("directory")
             .bind("/")
             .bind(Option::<String>::None)
             .bind(true)
             .bind(0i64)
-            .bind(Option::<String>::None)
             .bind(Option::<String>::None)
             .execute(src_p)
             .await
@@ -1916,11 +1915,15 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("INSERT INTO compiled_access_rule_sets (id, node_id, created_at) VALUES ('ars-1', '/docs/readme', 5.0)")
+        sqlx::query("INSERT INTO dacl_rules (id, node_id, effect, permission_mask, scope, valid_from, valid_until, remark) VALUES (1, '/docs/readme', 'allow', 1043, 'self', 1700000000000000, NULL, 'Read rule')")
             .execute(src_p)
             .await
             .unwrap();
-        sqlx::query("UPDATE nodes SET access_rule_set_id = 'ars-1' WHERE id = '/docs/readme'")
+        sqlx::query("INSERT INTO dacl_rule_clauses (id, rule_id) VALUES (1, 1)")
+            .execute(src_p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO dacl_rule_atoms (id, clause_id, predicate_kind, predicate_value, is_negated) VALUES (1, 1, 'group', 'sysop', 0)")
             .execute(src_p)
             .await
             .unwrap();
@@ -1947,7 +1950,7 @@ mod tests {
         .expect("sqlite->sqlite migration");
 
         assert!(progress_events >= 10);
-        assert_eq!(summary.table_count, 41);
+        assert_eq!(summary.table_count, 36);
         assert_eq!(summary.extension_tables, vec!["user_oidc_credentials"]);
         assert_eq!(
             target.current_revision().await.unwrap().as_deref(),

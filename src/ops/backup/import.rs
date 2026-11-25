@@ -20,9 +20,9 @@ use crate::core::error::{CfmsError, Result};
 use crate::db::DbPool;
 use crate::db::options::encode_option_value;
 use crate::db::schema::ddl::execute_ddl_statements;
+use crate::db::schema::migrations::apply_cacl_migration_step;
 use crate::db::schema::{
-    DEFERRED_COLUMNS, DEFERRED_UPDATE_ORDER, ExtractorMode, LATEST_SCHEMA_REVISION,
-    SERIAL_IDENTITY_COLUMNS, SchemaInspector, SchemaIr, builtin_schema_ir,
+    ExtractorMode, LATEST_SCHEMA_REVISION, SchemaInspector, SchemaIr, builtin_schema_ir,
     compile_full_schema_ddl, drop_all_cfms_tables, extract_code_schema_ir,
     infer_transfer_metadata, set_alembic_version,
 };
@@ -285,7 +285,7 @@ pub async fn run_import(ctx: &AppContext, args: BackupImportArgs) -> Result<()> 
         .unwrap_or_else(|_| builtin_schema_ir(true));
 
     let mut guard = RollbackGuard::new(paths.config_path.clone(), paths.server_root.join("init"));
-    let (target_ir, created_tables) =
+    let (target_ir, created_tables, upgrade_legacy_to_cacl) =
         prepare_target_database(&pool, &manifest, &code_base_ir).await?;
     let blank_target_initialized = !created_tables.is_empty();
     guard.created_schema_tables = created_tables;
@@ -306,6 +306,30 @@ pub async fn run_import(ctx: &AppContext, args: BackupImportArgs) -> Result<()> 
 
     match import_res {
         Ok(mut stats) => {
+            let mut effective_revision = manifest.schema_revision.clone();
+            if upgrade_legacy_to_cacl {
+                for extra in ["dacl_rules", "dacl_rule_clauses", "dacl_rule_atoms"] {
+                    if !guard.created_schema_tables.iter().any(|t| t == extra) {
+                        guard.created_schema_tables.push(extra.to_string());
+                    }
+                }
+                if let Err(err) = async {
+                    apply_cacl_migration_step(&pool).await?;
+                    set_alembic_version(&pool, LATEST_SCHEMA_REVISION).await
+                }
+                .await
+                {
+                    guard.rollback(&pool, &storage).await;
+                    pool.close().await;
+                    return Err(err);
+                }
+                effective_revision = LATEST_SCHEMA_REVISION.to_string();
+                stats.warnings.push(format!(
+                    "Restored legacy CFMS 0.14.0 ('{}') archive and migrated database schema to CEP-0002 CACL ('{LATEST_SCHEMA_REVISION}'); legacy compiled access rules/userblocks were removed, removed permissions pruned, and default root '/' DACL seeded if root exists.",
+                    manifest.schema_revision
+                ));
+            }
+
             guard.disarm();
             pool.close().await;
             if cross_storage_restore {
@@ -329,7 +353,7 @@ pub async fn run_import(ctx: &AppContext, args: BackupImportArgs) -> Result<()> 
                 target_storage_location,
                 cross_storage_restore,
                 format_version: manifest.version,
-                schema_revision: manifest.schema_revision,
+                schema_revision: effective_revision,
                 components: manifest.components,
                 blank_target_initialized,
                 table_count: stats.table_count,
@@ -610,10 +634,10 @@ async fn execute_transactional_import<R: std::io::Read>(
     match outcome {
         Ok(stats) => {
             tx.commit().await?;
-            let serial_cols: Vec<(String, String)> = SERIAL_IDENTITY_COLUMNS
-                .iter()
-                .filter(|(tbl, _)| manifest.tables.contains_key(*tbl))
-                .map(|(tbl, col)| ((*tbl).to_string(), (*col).to_string()))
+            let (all_serial_cols, _, _) = infer_transfer_metadata(target_ir, pool.kind());
+            let serial_cols: Vec<(String, String)> = all_serial_cols
+                .into_iter()
+                .filter(|(tbl, _)| manifest.tables.contains_key(tbl))
                 .collect();
             sync_target_sequences(pool, &serial_cols).await?;
             pb.inc(1);
@@ -640,37 +664,76 @@ async fn rollback_tx(tx: TargetTx<'_>) {
     }
 }
 
+fn build_legacy_014_import_ir(manifest: &ManifestHeader, code_base_ir: &SchemaIr) -> SchemaIr {
+    let mut legacy = SchemaIr::new(code_base_ir.source, Some("e952c02c1454".to_string()));
+    for (name, table) in &manifest.schema_ir.tables {
+        legacy.tables.insert(name.clone(), table.clone());
+    }
+    let ext_names: BTreeSet<&str> = manifest
+        .extension_tables
+        .iter()
+        .map(|e| e.table_name.as_str())
+        .collect();
+    for (name, table) in &code_base_ir.tables {
+        if legacy.tables.contains_key(name)
+            || matches!(
+                name.as_str(),
+                "dacl_rules" | "dacl_rule_clauses" | "dacl_rule_atoms"
+            )
+        {
+            continue;
+        }
+        let include = match &table.ownership {
+            crate::db::schema::ir::TableOwnership::Core => true,
+            crate::db::schema::ir::TableOwnership::Extension(_) => {
+                ext_names.contains(name.as_str())
+            }
+        };
+        if include {
+            legacy.tables.insert(name.clone(), table.clone());
+        }
+    }
+    legacy
+}
+
 async fn prepare_target_database(
     pool: &DbPool,
     manifest: &ManifestHeader,
     code_base_ir: &SchemaIr,
-) -> Result<(SchemaIr, Vec<String>)> {
+) -> Result<(SchemaIr, Vec<String>, bool)> {
     let expected_code_revision = code_base_ir
         .schema_revision
         .as_deref()
         .unwrap_or(LATEST_SCHEMA_REVISION);
-    if manifest.schema_revision != expected_code_revision {
+
+    let legacy_014_upgrade =
+        manifest.schema_revision == "e952c02c1454" && expected_code_revision == LATEST_SCHEMA_REVISION;
+
+    if manifest.schema_revision != expected_code_revision && !legacy_014_upgrade {
         return Err(CfmsError::SchemaDrift(format!(
             "Backup schema revision '{}' does not match workspace schema revision '{expected_code_revision}'",
             manifest.schema_revision
         )));
     }
 
-    let ext_names: Vec<String> = manifest
-        .extension_tables
-        .iter()
-        .map(|e| e.table_name.clone())
-        .collect();
-    let mut full_target_ir = active_schema_subset(code_base_ir, &ext_names);
-    for ext in &manifest.extension_tables {
-        if !full_target_ir.tables.contains_key(&ext.table_name)
-            && let Some(ext_tbl) = manifest.schema_ir.tables.get(&ext.table_name)
-        {
-            full_target_ir
-                .tables
-                .insert(ext.table_name.clone(), ext_tbl.clone());
+    let mut full_target_ir = if legacy_014_upgrade {
+        build_legacy_014_import_ir(manifest, code_base_ir)
+    } else {
+        let ext_names: Vec<String> = manifest
+            .extension_tables
+            .iter()
+            .map(|e| e.table_name.clone())
+            .collect();
+        let mut ir = active_schema_subset(code_base_ir, &ext_names);
+        for ext in &manifest.extension_tables {
+            if !ir.tables.contains_key(&ext.table_name)
+                && let Some(ext_tbl) = manifest.schema_ir.tables.get(&ext.table_name)
+            {
+                ir.tables.insert(ext.table_name.clone(), ext_tbl.clone());
+            }
         }
-    }
+        ir
+    };
 
     let report = SchemaInspector::inspect_against_ir(pool, &full_target_ir).await?;
     if report.is_empty_database {
@@ -682,10 +745,16 @@ async fn prepare_target_database(
             return Err(err);
         }
         let created: Vec<String> = full_target_ir.tables.keys().cloned().collect();
-        return Ok((full_target_ir, created));
+        return Ok((full_target_ir, created, legacy_014_upgrade));
     }
 
     if report.current_revision.as_deref() != Some(manifest.schema_revision.as_str()) {
+        if legacy_014_upgrade {
+            let live_rev = report.current_revision.as_deref().unwrap_or("<none>");
+            return Err(CfmsError::SchemaDrift(format!(
+                "Legacy CFMS 0.14.0 backup archive ('e952c02c1454') cannot be imported into a non-empty database at revision '{live_rev}'; restore into a blank database (or an empty 'e952c02c1454' schema) so cfms-ctl can restore and automatically migrate it to '{expected_code_revision}'"
+            )));
+        }
         return Err(CfmsError::SchemaDrift(format!(
             "Target database schema revision {:?} does not match backup schema revision '{}'",
             report.current_revision, manifest.schema_revision
@@ -712,6 +781,14 @@ async fn prepare_target_database(
         )));
     }
 
+    // Ensure full_target_ir knows about any tables present in the archive.
+    for (name, tbl) in &manifest.schema_ir.tables {
+        full_target_ir
+            .tables
+            .entry(name.clone())
+            .or_insert_with(|| tbl.clone());
+    }
+
     let mut tables_to_check_empty: BTreeSet<String> =
         full_target_ir.tables.keys().cloned().collect();
     tables_to_check_empty.extend(known_extra_exts);
@@ -724,7 +801,7 @@ async fn prepare_target_database(
         }
     }
 
-    Ok((full_target_ir, Vec::new()))
+    Ok((full_target_ir, Vec::new(), legacy_014_upgrade))
 }
 
 fn build_import_subset_ir(target_ir: &SchemaIr, manifest: &ManifestHeader) -> Result<SchemaIr> {
@@ -750,16 +827,6 @@ fn build_deferred_column_map(
     coupled: bool,
 ) -> BTreeMap<String, Vec<String>> {
     let (_, mut deferred, _) = infer_transfer_metadata(import_ir, dialect);
-    for (tbl, cols) in DEFERRED_COLUMNS {
-        if import_ir.tables.contains_key(*tbl) {
-            let entry = deferred.entry((*tbl).to_string()).or_default();
-            for col in *cols {
-                if !entry.iter().any(|c| c == col) {
-                    entry.push((*col).to_string());
-                }
-            }
-        }
-    }
     if coupled && let Some(node_def) = deferred.get_mut("nodes") {
         node_def.retain(|c| c != "parent_id");
         if node_def.is_empty() {
@@ -880,9 +947,15 @@ async fn restore_deferred_pairs(
     manifest: &ManifestHeader,
     deferred_pairs: &DeferredPairMap,
 ) -> Result<()> {
+    const PREFERRED_DEFERRED_ORDER: &[(&str, &[&str])] = &[
+        ("users", &["preference_dek_id"]),
+        ("document_revisions", &["parent_revision_id"]),
+        ("documents", &["current_revision_id"]),
+        ("nodes", &["access_rule_set_id"]),
+    ];
     let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
 
-    for (table_name, _, cols) in DEFERRED_UPDATE_ORDER {
+    for (table_name, cols) in PREFERRED_DEFERRED_ORDER {
         for col_name in *cols {
             let key = ((*table_name).to_string(), (*col_name).to_string());
             if let Some(pairs) = deferred_pairs.get(&key) {

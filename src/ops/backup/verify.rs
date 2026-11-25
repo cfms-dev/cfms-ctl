@@ -24,7 +24,7 @@ use super::backup_progress_bar;
 use super::format::{
     BackupHeaderReport, ChunkedDecryptReader, read_envelope_and_hash, read_key_from_args,
 };
-use super::selection::{expected_tables_for, parse_and_validate_manifest_components};
+use super::selection::{expected_tables_for_schema, parse_and_validate_manifest_components};
 use super::stream::{
     BackupValue, BlobEndPayload, FileEntryPayload, IntegrityFooter, ManifestHeader,
     MissingInactiveFilePayload, StreamRecord, StreamRecordReader, TableDigestSummary,
@@ -871,7 +871,11 @@ pub async fn run_verify(ctx: &AppContext, args: BackupVerifyArgs) -> Result<()> 
 
 fn validate_open_manifest(manifest: &ManifestHeader, envelope: &BackupHeaderReport) -> Result<()> {
     let components = parse_and_validate_manifest_components(&manifest.components)?;
-    let expected_tables = expected_tables_for(&components, &manifest.extension_tables);
+    let expected_tables = expected_tables_for_schema(
+        &components,
+        &manifest.extension_tables,
+        Some(&manifest.schema_ir),
+    );
     validate_manifest_header(manifest, envelope, &expected_tables)?;
 
     for ext in &manifest.extension_tables {

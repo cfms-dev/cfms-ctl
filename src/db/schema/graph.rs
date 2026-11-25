@@ -273,11 +273,11 @@ mod tests {
     use crate::db::schema::ddl::builtin_schema_ir;
 
     #[test]
-    fn tarjan_scc_breaks_cfms_40_table_fk_cycles_and_produces_valid_dag_order() {
+    fn tarjan_scc_breaks_cfms_35_table_fk_cycles_and_produces_valid_dag_order() {
         let ir = builtin_schema_ir(false);
         let plan = plan_schema_graph(&ir, DatabaseKind::Postgresql);
 
-        assert_eq!(plan.creation_order.len(), 40);
+        assert_eq!(plan.creation_order.len(), 35);
         assert!(plan.cyclic_sccs.len() >= 2);
         assert!(plan
             .cyclic_sccs
@@ -316,5 +316,9 @@ mod tests {
                 );
             }
         }
+
+        assert!(pos["nodes"] < pos["dacl_rules"]);
+        assert!(pos["dacl_rules"] < pos["dacl_rule_clauses"]);
+        assert!(pos["dacl_rule_clauses"] < pos["dacl_rule_atoms"]);
     }
 }

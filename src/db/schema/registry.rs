@@ -1,10 +1,10 @@
-//! Declarative schema contracts for CFMS 0.14.x+ databases.
+//! Declarative schema contracts for CFMS 0.14.0+ databases.
 
-/// Latest known core Alembic revision head for CFMS 0.14.0 (`e952c02c1454`).
-pub const LATEST_SCHEMA_REVISION: &str = "e952c02c1454";
+/// Latest known core Alembic revision head (`a66108639ed7`, CEP-0002 CACL DACL).
+pub const LATEST_SCHEMA_REVISION: &str = "a66108639ed7";
 
-/// Root Alembic revision from which retained CFMS 0.14.x linear migrations originate.
-pub const ROOT_SCHEMA_REVISION: &str = "fe8863687aa4";
+/// Baseline Alembic revision from which retained CFMS native migrations originate (CFMS 0.14.0).
+pub const ROOT_SCHEMA_REVISION: &str = "e952c02c1454";
 
 /// Metadata describing a single revision in the CFMS linear Alembic schema chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,107 +14,17 @@ pub struct SchemaRevisionInfo {
     pub description: &'static str,
 }
 
-/// Ordered linear chain of CFMS Alembic revisions from `fe8863687aa4` to `e952c02c1454`.
+/// Ordered linear chain of supported CFMS Alembic revisions from `e952c02c1454` (0.14.0) to `a66108639ed7`.
 pub const SCHEMA_REVISIONS: &[SchemaRevisionInfo] = &[
     SchemaRevisionInfo {
-        id: "fe8863687aa4",
-        down_revision: None,
-        description: "enforce node name uniqueness",
-    },
-    SchemaRevisionInfo {
-        id: "b4b3061f385c",
-        down_revision: Some("fe8863687aa4"),
-        description: "grant server diagnostics permission",
-    },
-    SchemaRevisionInfo {
-        id: "76f1c7621e23",
-        down_revision: Some("b4b3061f385c"),
-        description: "add user block reasons",
-    },
-    SchemaRevisionInfo {
-        id: "f239d439f893",
-        down_revision: Some("76f1c7621e23"),
-        description: "index permission entry expiry",
-    },
-    SchemaRevisionInfo {
-        id: "170e0a16133e",
-        down_revision: Some("f239d439f893"),
-        description: "make node namespace compatible with mysql",
-    },
-    SchemaRevisionInfo {
-        id: "7bddfba0d8aa",
-        down_revision: Some("170e0a16133e"),
-        description: "preserve float precision across databases",
-    },
-    SchemaRevisionInfo {
-        id: "ab7efda19079",
-        down_revision: Some("7bddfba0d8aa"),
-        description: "add scheduling infrastructure",
-    },
-    SchemaRevisionInfo {
-        id: "8c130010a943",
-        down_revision: Some("ab7efda19079"),
-        description: "grant scheduling permissions",
-    },
-    SchemaRevisionInfo {
-        id: "39084f380eaa",
-        down_revision: Some("8c130010a943"),
-        description: "add system-managed schedules",
-    },
-    SchemaRevisionInfo {
-        id: "adc1283fb393",
-        down_revision: Some("39084f380eaa"),
-        description: "add scheduling redis namespace",
-    },
-    SchemaRevisionInfo {
-        id: "6dba0956fa9d",
-        down_revision: Some("adc1283fb393"),
-        description: "add scheduling dispatch timestamps",
-    },
-    SchemaRevisionInfo {
-        id: "3c496a214a87",
-        down_revision: Some("6dba0956fa9d"),
-        description: "snapshot scheduled execution contracts",
-    },
-    SchemaRevisionInfo {
-        id: "0460356a5ba6",
-        down_revision: Some("3c496a214a87"),
-        description: "index document revision lookups",
-    },
-    SchemaRevisionInfo {
-        id: "5ad5aca75635",
-        down_revision: Some("0460356a5ba6"),
-        description: "decouple user credentials",
-    },
-    SchemaRevisionInfo {
-        id: "d252e662fc05",
-        down_revision: Some("5ad5aca75635"),
-        description: "bind accounts and references to immutable user IDs",
-    },
-    SchemaRevisionInfo {
-        id: "b2ea9cac8462",
-        down_revision: Some("d252e662fc05"),
-        description: "separate registered credentials from authentication purpose policies",
-    },
-    SchemaRevisionInfo {
-        id: "3815ba18197b",
-        down_revision: Some("b2ea9cac8462"),
-        description: "require independent user signing keys",
-    },
-    SchemaRevisionInfo {
-        id: "03197fed3401",
-        down_revision: Some("3815ba18197b"),
-        description: "rename nickname permissions",
-    },
-    SchemaRevisionInfo {
-        id: "16c86712512a",
-        down_revision: Some("03197fed3401"),
-        description: "add namespaced persistent options",
-    },
-    SchemaRevisionInfo {
         id: "e952c02c1454",
-        down_revision: Some("16c86712512a"),
-        description: "grant setting permissions",
+        down_revision: None,
+        description: "CFMS 0.14.0 baseline (grant setting permissions)",
+    },
+    SchemaRevisionInfo {
+        id: "a66108639ed7",
+        down_revision: Some("e952c02c1454"),
+        description: "migrate to cacl dacl",
     },
 ];
 
@@ -137,7 +47,7 @@ pub fn revisions_after(current_revision: &str) -> Option<&'static [SchemaRevisio
 /// Built-in optional extension tables supported natively by `cfms-ctl`.
 pub const KNOWN_EXTENSION_TABLES: &[&str] = &["user_oidc_credentials"];
 
-/// Canonical application tables in topological dependency order (CFMS 0.14.x+).
+/// Canonical application tables in topological dependency order (CEP-0002 CACL HEAD).
 pub const APPLICATION_TABLE_NAMES: &[&str] = &[
     "files",
     "comments",
@@ -157,15 +67,10 @@ pub const APPLICATION_TABLE_NAMES: &[&str] = &[
     "document_revisions",
     "document_metadata",
     "document_metadata_tags",
-    "object_access_entries",
-    "compiled_access_rule_sets",
-    "compiled_access_rules",
-    "compiled_access_rule_groups",
-    "compiled_access_rule_memberships",
-    "compiled_access_rule_rights",
+    "dacl_rules",
+    "dacl_rule_clauses",
+    "dacl_rule_atoms",
     "audit_entries",
-    "userblock_entries",
-    "userblock_sub_entries",
     "banned_subnets",
     "account_throttles",
     "file_tasks",
@@ -184,14 +89,12 @@ pub const APPLICATION_TABLE_NAMES: &[&str] = &[
 /// Columns backed by auto-increment / PostgreSQL `SERIAL` or `BIGSERIAL` sequences.
 pub const SERIAL_IDENTITY_COLUMNS: &[(&str, &str)] = &[
     ("comments", "comment_id"),
-    ("object_access_entries", "id"),
     ("group_permissions", "id"),
-    ("compiled_access_rules", "id"),
     ("user_permissions", "id"),
     ("user_memberships", "id"),
-    ("userblock_sub_entries", "id"),
-    ("compiled_access_rule_rights", "id"),
-    ("compiled_access_rule_memberships", "id"),
+    ("dacl_rules", "id"),
+    ("dacl_rule_clauses", "id"),
+    ("dacl_rule_atoms", "id"),
 ];
 
 /// Columns that participate in cyclic or self-referential foreign keys and must be
@@ -200,7 +103,6 @@ pub const DEFERRED_COLUMNS: &[(&str, &[&str])] = &[
     ("users", &["preference_dek_id"]),
     ("documents", &["current_revision_id"]),
     ("document_revisions", &["parent_revision_id"]),
-    ("nodes", &["access_rule_set_id"]),
 ];
 
 /// Order in which deferred foreign-key columns are populated after base rows exist.
@@ -208,5 +110,4 @@ pub const DEFERRED_UPDATE_ORDER: &[(&str, &str, &[&str])] = &[
     ("users", "id", &["preference_dek_id"]),
     ("document_revisions", "id", &["parent_revision_id"]),
     ("documents", "id", &["current_revision_id"]),
-    ("nodes", "id", &["access_rule_set_id"]),
 ];

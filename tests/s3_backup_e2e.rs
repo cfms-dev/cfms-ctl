@@ -759,8 +759,8 @@ async fn seed_source_db(pool: &DbPool, entries: &[(&str, &str, bool, i64)]) {
     .unwrap();
 
     sqlx::query(
-        "INSERT INTO nodes (id, type, name, parent_id, inherit, status, status_operation_id, access_rule_set_id) \
-         VALUES ('/', 'directory', '/', NULL, 1, 0, NULL, NULL)",
+        "INSERT INTO nodes (id, type, name, parent_id, inherit, status, status_operation_id) \
+         VALUES ('/', 'directory', '/', NULL, 1, 0, NULL)",
     )
     .execute(p)
     .await

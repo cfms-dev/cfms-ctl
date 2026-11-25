@@ -596,7 +596,9 @@ async fn stream_regular_table<W: Write>(
         CfmsError::Backup(format!("Missing transfer metadata for table '{table_name}'"))
     })?;
     let cols: Vec<TransferColumn> = table_def.data_columns().cloned().collect();
-    let where_clause = partial_export_where_clause(table_name, &selection.selected);
+    let has_userblock_entries = plan.export_ir.tables.contains_key("userblock_entries");
+    let where_clause =
+        partial_export_where_clause(table_name, &selection.selected, has_userblock_entries);
     let sql = build_filtered_select_sql(pool.kind(), table_def, &cols, where_clause, true);
 
     let file_indices = if table_name == "files" {

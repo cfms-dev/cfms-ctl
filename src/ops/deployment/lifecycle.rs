@@ -1862,12 +1862,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let pkg = tmp.path().join("cfms-0.14.0.tar.gz");
         let (files, manifest_bytes) = build_release_bundle_map(
-            "0.14.0",
-            &[("16c86712512a", None), ("e952c02c1454", Some("16c86712512a"))],
+            "0.15.0",
+            &[("e952c02c1454", None), ("a66108639ed7", Some("e952c02c1454"))],
             &base_config_template(""),
             &[],
         );
-        write_release_targz(&pkg, "cfms-0.14.0", &files, &manifest_bytes);
+        write_release_targz(&pkg, "cfms-0.15.0", &files, &manifest_bytes);
 
         let target = tmp.path().join("deploy-fresh");
         let ctx = test_ctx(&target);
@@ -1895,7 +1895,7 @@ mod tests {
         assert!(!target.join("release-manifest.json").exists());
 
         // Real cold-start install without --skip-env? No, with --skip-env for host independence,
-        // initializing fresh config.toml secrets and SQLite schema at HEAD e952c02c1454.
+        // initializing fresh config.toml secrets and SQLite schema at HEAD a66108639ed7.
         install_fixture_release(&target, &pkg, false).await;
 
         assert!(target.join("release-manifest.json").is_file());
@@ -1909,7 +1909,7 @@ mod tests {
             .connect_db(&paths)
             .await
             .unwrap();
-        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("e952c02c1454"));
+        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("a66108639ed7"));
         db.close().await;
 
         handle_verify(
@@ -1971,10 +1971,10 @@ mod tests {
     #[tokio::test]
     async fn adopt_verifies_unpacked_tree_and_rejects_mismatch() {
         let tmp = TempDir::new().unwrap();
-        let pkg = tmp.path().join("cfms-0.14.0.zip");
+        let pkg = tmp.path().join("cfms-0.15.0.zip");
         let (files, manifest_bytes) = build_release_bundle_map(
-            "0.14.0",
-            &[("e952c02c1454", None)],
+            "0.15.0",
+            &[("a66108639ed7", None)],
             &base_config_template(""),
             &[],
         );
@@ -2051,14 +2051,14 @@ mod tests {
     #[tokio::test]
     async fn upgrade_dry_run_real_sqlite_migration_config_sync_backup_and_extension_preservation() {
         let tmp = TempDir::new().unwrap();
-        let v1_pkg = tmp.path().join("cfms-0.13.9.tar.gz");
+        let v1_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
         let (v1_files, v1_manifest_bytes) = build_release_bundle_map(
-            "0.13.9",
-            &[("16c86712512a", None)],
+            "0.14.0",
+            &[("e952c02c1454", None)],
             &base_config_template(""),
             &[("src/legacy_only.py", b"# will be removed on upgrade\n")],
         );
-        write_release_targz(&v1_pkg, "cfms-0.13.9", &v1_files, &v1_manifest_bytes);
+        write_release_targz(&v1_pkg, "cfms-0.14.0", &v1_files, &v1_manifest_bytes);
 
         let deploy = tmp.path().join("live-deploy");
         install_fixture_release(&deploy, &v1_pkg, true).await;
@@ -2066,28 +2066,28 @@ mod tests {
         let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
         let ctx = test_ctx(&deploy);
 
-        // Customize live config secrets + DB path, create schema at 16c86712512a, add operator data & extension.
+        // Customize live config secrets + DB path, create schema at e952c02c1454, add operator data & extension.
         let custom_cfg = "[database]\ntype = \"sqlite\"\nfile = \"custom_cfms.db\"\n\n[security]\npepper = \"operator-secret-999\"\n\n[server]\nsecret_key = \"operator-srv-key\"\n";
         fs::write(&paths.config_path, custom_cfg).unwrap();
         let db = ctx.connect_db(&paths).await.unwrap();
         create_head_schema(&db, false).await.unwrap();
-        set_alembic_version(&db, "16c86712512a").await.unwrap();
+        set_alembic_version(&db, "e952c02c1454").await.unwrap();
         db.close().await;
 
         let content_upload = deploy.join("src").join("content").join("files").join("upload.bin");
         fs::create_dir_all(content_upload.parent().unwrap()).unwrap();
         fs::write(&content_upload, b"operator-binary-payload").unwrap();
-        install_dummy_third_party_extension(&deploy, "acme_plugin", Some("0.13.0"), Some("0.15.9"));
+        install_dummy_third_party_extension(&deploy, "acme_plugin", Some("0.14.0"), Some("0.15.9"));
 
-        // Build v0.14.0 ZIP bundle adding a new file, removing legacy_only.py, adding [logging] config, advancing DB head to e952c02c1454.
-        let v2_pkg = tmp.path().join("cfms-0.14.0.zip");
+        // Build v0.15.0 ZIP bundle adding a new file, removing legacy_only.py, adding [logging] config, advancing DB head to a66108639ed7.
+        let v2_pkg = tmp.path().join("cfms-0.15.0.zip");
         let (v2_files, v2_manifest_bytes) = build_release_bundle_map(
-            "0.14.0",
-            &[("16c86712512a", None), ("e952c02c1454", Some("16c86712512a"))],
+            "0.15.0",
+            &[("e952c02c1454", None), ("a66108639ed7", Some("e952c02c1454"))],
             &base_config_template("\n[logging]\nlevel = \"INFO\"\n"),
             &[("src/new_feature.py", b"NEW = True\n")],
         );
-        write_release_zip(&v2_pkg, "cfms-0.14.0", &v2_files, &v2_manifest_bytes);
+        write_release_zip(&v2_pkg, "cfms-0.15.0", &v2_files, &v2_manifest_bytes);
 
         // 1) Dry-run upgrade leaves files, config, and DB unchanged.
         handle_upgrade(
@@ -2114,10 +2114,10 @@ mod tests {
                 .unwrap()
                 .manifest
                 .version,
-            "0.13.9"
+            "0.14.0"
         );
 
-        // 2) Real upgrade migrating DB from `16c86712512a` -> `e952c02c1454` and preserving secrets/extensions.
+        // 2) Real upgrade migrating DB from `e952c02c1454` -> `a66108639ed7` and preserving secrets/extensions.
         handle_upgrade(
             &ctx,
             DeploymentUpgradeArgs {
@@ -2141,7 +2141,7 @@ mod tests {
                 .unwrap()
                 .manifest
                 .version,
-            "0.14.0"
+            "0.15.0"
         );
         assert!(deploy.join("src").join("new_feature.py").is_file());
         assert!(!deploy.join("src").join("legacy_only.py").exists());
@@ -2157,20 +2157,20 @@ mod tests {
         assert_eq!(fs::read(&content_upload).unwrap(), b"operator-binary-payload");
         assert!(deploy.join("src/include/extensions/acme_plugin/manifest.toml").is_file());
 
-        // DB migrated cleanly to e952c02c1454 without Python.
+        // DB migrated cleanly to a66108639ed7 without Python.
         let db = ctx.connect_db(&paths).await.unwrap();
-        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("e952c02c1454"));
+        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("a66108639ed7"));
         db.close().await;
 
-        // 3) Patch upgrade 0.14.0 -> 0.14.1 WITH `--backup` + `--backup-key-out` verifies locked pre-mutation export.
-        let v3_pkg = tmp.path().join("cfms-0.14.1.zip");
+        // 3) Patch upgrade 0.15.0 -> 0.15.1 WITH `--backup` + `--backup-key-out` verifies locked pre-mutation export.
+        let v3_pkg = tmp.path().join("cfms-0.15.1.zip");
         let (v3_files, v3_manifest_bytes) = build_release_bundle_map(
-            "0.14.1",
-            &[("16c86712512a", None), ("e952c02c1454", Some("16c86712512a"))],
+            "0.15.1",
+            &[("e952c02c1454", None), ("a66108639ed7", Some("e952c02c1454"))],
             &base_config_template("\n[logging]\nlevel = \"INFO\"\n"),
             &[("src/new_feature.py", b"NEW = 2\n")],
         );
-        write_release_zip(&v3_pkg, "cfms-0.14.1", &v3_files, &v3_manifest_bytes);
+        write_release_zip(&v3_pkg, "cfms-0.15.1", &v3_files, &v3_manifest_bytes);
 
         let bak_file = tmp.path().join("pre_upgrade.confbak");
         let bak_key = tmp.path().join("pre_upgrade.key");
@@ -2198,16 +2198,16 @@ mod tests {
         assert!(bak_file.is_file());
         assert!(bak_key.is_file());
         let header = crate::ops::backup::read_backup_header(&bak_file).unwrap();
-        assert_eq!(header.schema_revision, "e952c02c1454");
+        assert_eq!(header.schema_revision, "a66108639ed7");
         assert_eq!(
             load_manifest_file(&paths.release_manifest_path)
                 .unwrap()
                 .manifest
                 .version,
-            "0.14.1"
+            "0.15.1"
         );
 
-        // After upgrading 0.13.9 -> 0.14.0 -> 0.14.1, versions/ auto-prunes to at most 1 old version (0.14.0).
+        // After upgrading 0.14.0 -> 0.15.0 -> 0.15.1, versions/ auto-prunes to at most 1 old version (0.15.0).
         let v1_valid = parse_and_validate_manifest_bytes(&v1_manifest_bytes, "v1").unwrap();
         let v2_valid = parse_and_validate_manifest_bytes(&v2_manifest_bytes, "v2").unwrap();
         let snaps = list_stored_releases(&paths, None, true).unwrap();
@@ -2226,7 +2226,7 @@ mod tests {
         let v1_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
         let (v1_files, v1_mb) = build_release_bundle_map(
             "0.14.0",
-            &[("e952c02c1454", None)],
+            &[("e952c02c1454", None), ("a66108639ed7", Some("e952c02c1454"))],
             &base_config_template(""),
             &[],
         );
@@ -2235,7 +2235,7 @@ mod tests {
         let v2_pkg = tmp.path().join("cfms-0.14.1.tar.gz");
         let (v2_files, v2_mb) = build_release_bundle_map(
             "0.14.1",
-            &[("e952c02c1454", None)],
+            &[("e952c02c1454", None), ("a66108639ed7", Some("e952c02c1454"))],
             &base_config_template(""),
             &[("src/v141.py", b"V = 141\n")],
         );
@@ -2314,7 +2314,7 @@ mod tests {
         let v1_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
         let (v1_files, v1_mb) = build_release_bundle_map(
             "0.14.0",
-            &[("e952c02c1454", None)],
+            &[("e952c02c1454", None), ("a66108639ed7", Some("e952c02c1454"))],
             &v1_template,
             &[],
         );
@@ -2360,7 +2360,7 @@ client_id = "cfms-web"
         let v2_pkg = tmp.path().join("cfms-0.15.0.zip");
         let (v2_files, mut v2_mb) = build_release_bundle_map(
             "0.15.0",
-            &[("e952c02c1454", None)],
+            &[("e952c02c1454", None), ("a66108639ed7", Some("e952c02c1454"))],
             &v2_template,
             &[],
         );
@@ -2437,10 +2437,10 @@ client_id = "cfms-web"
     #[tokio::test]
     async fn resume_rollback_restores_sqlite_checkpoint_and_source_release_on_explicit_abort() {
         let tmp = TempDir::new().unwrap();
-        let v1_pkg = tmp.path().join("cfms-0.13.0.tar.gz");
+        let v1_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
         let (v1_files, v1_mb) = build_release_bundle_map(
-            "0.13.0",
-            &[("03197fed3401", None)],
+            "0.14.0",
+            &[("e952c02c1454", None)],
             &base_config_template(""),
             &[("src/v1_only.py", b"V1 = True\n")],
         );
@@ -2448,11 +2448,10 @@ client_id = "cfms-web"
         let v1_valid = parse_and_validate_manifest_bytes(&v1_mb, "v1").unwrap();
 
         let (v2_files, v2_mb) = build_release_bundle_map(
-            "0.14.0",
+            "0.15.0",
             &[
-                ("03197fed3401", None),
-                ("16c86712512a", Some("03197fed3401")),
-                ("e952c02c1454", Some("16c86712512a")),
+                ("e952c02c1454", None),
+                ("a66108639ed7", Some("e952c02c1454")),
             ],
             &base_config_template("\n[logging]\nlevel = \"INFO\"\n"),
             &[("src/v2_only.py", b"V2 = True\n")],
@@ -2470,7 +2469,7 @@ client_id = "cfms-web"
         // Seed pre-upgrade SQLite DB at source_head with a sentinel row.
         let db = ctx.connect_db(&paths).await.unwrap();
         create_head_schema(&db, false).await.unwrap();
-        set_alembic_version(&db, "03197fed3401").await.unwrap();
+        set_alembic_version(&db, "e952c02c1454").await.unwrap();
         if let DbPool::Sqlite(ref sq) = db {
             sqlx::query("CREATE TABLE sentinel_state (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
                 .execute(sq)
@@ -2499,14 +2498,14 @@ client_id = "cfms-web"
         apply_swap_with_journal(&paths, Some(&v1_valid), &stage_v2, &v2_valid, &j_dir).unwrap();
 
         // Mutate live config as if 3-way merge ran, then simulate partial DB migration failure
-        // leaving DB at Intermediate revision with extra in-flight DDL and mutated data.
+        // leaving DB at pre-target revision with extra in-flight DDL and mutated data.
         fs::write(
             &paths.config_path,
             format!("{v1_cfg}\n[logging]\nlevel = \"INFO\"\n"),
         )
         .unwrap();
         let db = ctx.connect_db(&paths).await.unwrap();
-        set_alembic_version(&db, "16c86712512a").await.unwrap();
+        set_alembic_version(&db, "e952c02c1454").await.unwrap();
         if let DbPool::Sqlite(ref sq) = db {
             sqlx::query("CREATE TABLE inflight_partial_ddl (id INTEGER PRIMARY KEY)")
                 .execute(sq)
@@ -2527,16 +2526,16 @@ client_id = "cfms-web"
             started_at: Some("2026-11-22T00:00:00Z".to_string()),
             source_release_id: v1_valid.release_id.clone(),
             target_release_id: v2_valid.release_id.clone(),
-            source_version: "0.13.0".to_string(),
-            target_version: "0.14.0".to_string(),
-            source_head: Some("03197fed3401".to_string()),
-            target_head: Some("e952c02c1454".to_string()),
+            source_version: "0.14.0".to_string(),
+            target_version: "0.15.0".to_string(),
+            source_head: Some("e952c02c1454".to_string()),
+            target_head: Some("a66108639ed7".to_string()),
             staging_dir: Some(stage_v2.display().to_string()),
             journal_dir: Some(j_dir.display().to_string()),
             db_checkpoint_path: Some(ckpt_path.display().to_string()),
             db_checkpoint_sha256: Some(ckpt_sha.clone()),
             last_error: Some("simulated migration failure".to_string()),
-            observed_db_revision: Some("16c86712512a".to_string()),
+            observed_db_revision: Some("e952c02c1454".to_string()),
             step_history: vec!["files-swapped".to_string(), "db-migration-failed".to_string()],
         };
         save_transaction(&paths, &tx).unwrap();
@@ -2554,7 +2553,7 @@ client_id = "cfms-web"
         .unwrap();
         assert!(paths.transaction_path().is_file());
         let db = ctx.connect_db(&paths).await.unwrap();
-        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("16c86712512a"));
+        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("e952c02c1454"));
         db.close().await;
 
         // Explicit operator abort (`resume --rollback`) reverts DB + files + config completely.
@@ -2577,13 +2576,13 @@ client_id = "cfms-web"
                 .unwrap()
                 .manifest
                 .version,
-            "0.13.0"
+            "0.14.0"
         );
         assert_eq!(fs::read_to_string(&paths.config_path).unwrap(), v1_cfg);
         assert!(!versions_dir(&paths).join(&v1_valid.release_id).exists());
 
         let db = ctx.connect_db(&paths).await.unwrap();
-        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("03197fed3401"));
+        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("e952c02c1454"));
         if let DbPool::Sqlite(ref sq) = db {
             let val: String = sqlx::query_scalar("SELECT v FROM sentinel_state WHERE k = 'before'")
                 .fetch_one(sq)
@@ -2652,21 +2651,21 @@ client_id = "cfms-web"
                 .unwrap()
                 .manifest
                 .version,
-            "0.13.0"
+            "0.14.0"
         );
         assert_eq!(fs::read_to_string(&paths.config_path).unwrap(), v1_cfg);
         let db = ctx.connect_db(&paths).await.unwrap();
-        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("03197fed3401"));
+        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("e952c02c1454"));
         db.close().await;
     }
 
     #[tokio::test]
     async fn resume_handles_activation_rollback_forward_and_database_recovery_modes() {
         let tmp = TempDir::new().unwrap();
-        let v1_pkg = tmp.path().join("cfms-0.13.0.tar.gz");
+        let v1_pkg = tmp.path().join("cfms-0.13.9.tar.gz");
         let (v1_files, v1_mb) = build_release_bundle_map(
-            "0.13.0",
-            &[("03197fed3401", None)],
+            "0.13.9",
+            &[("d00000000000", None)],
             &base_config_template(""),
             &[],
         );
@@ -2674,11 +2673,11 @@ client_id = "cfms-web"
         let v1_valid = parse_and_validate_manifest_bytes(&v1_mb, "v1").unwrap();
 
         let (v2_files, v2_mb) = build_release_bundle_map(
-            "0.14.0",
+            "0.15.0",
             &[
-                ("03197fed3401", None),
-                ("16c86712512a", Some("03197fed3401")),
-                ("e952c02c1454", Some("16c86712512a")),
+                ("d00000000000", None),
+                ("e952c02c1454", Some("d00000000000")),
+                ("a66108639ed7", Some("e952c02c1454")),
             ],
             &base_config_template(""),
             &[("src/v2_file.py", b"V2 = 1\n")],
@@ -2691,7 +2690,7 @@ client_id = "cfms-web"
         let ctx = test_ctx(&deploy);
         let db = ctx.connect_db(&paths).await.unwrap();
         create_head_schema(&db, false).await.unwrap();
-        set_alembic_version(&db, "03197fed3401").await.unwrap();
+        set_alembic_version(&db, "d00000000000").await.unwrap();
         db.close().await;
 
         snapshot_active_release(&paths, &v1_valid, &DeploymentSettings::default()).unwrap();
@@ -2710,16 +2709,16 @@ client_id = "cfms-web"
             started_at: Some("2026-11-15T00:00:00Z".to_string()),
             source_release_id: v1_valid.release_id.clone(),
             target_release_id: v2_valid.release_id.clone(),
-            source_version: "0.13.0".to_string(),
-            target_version: "0.14.0".to_string(),
-            source_head: Some("03197fed3401".to_string()),
-            target_head: Some("e952c02c1454".to_string()),
+            source_version: "0.13.9".to_string(),
+            target_version: "0.15.0".to_string(),
+            source_head: Some("d00000000000".to_string()),
+            target_head: Some("a66108639ed7".to_string()),
             staging_dir: Some(stage_v2.display().to_string()),
             journal_dir: Some(j_dir.display().to_string()),
             db_checkpoint_path: None,
             db_checkpoint_sha256: None,
             last_error: Some("simulated crash".to_string()),
-            observed_db_revision: Some("03197fed3401".to_string()),
+            observed_db_revision: Some("d00000000000".to_string()),
             step_history: vec!["files-swapped".to_string()],
         };
         save_transaction(&paths, &tx).unwrap();
@@ -2750,22 +2749,22 @@ client_id = "cfms-web"
                 .unwrap()
                 .manifest
                 .version,
-            "0.13.0"
+            "0.13.9"
         );
 
-        // Case 2: Re-stage v2, apply swap, DB stops at INTERMEDIATE revision `16c86712512a` ->
-        // resume --continue-forward advances DB to `e952c02c1454` and cleans tx.
+        // Case 2: Re-stage v2, apply swap, DB stops at INTERMEDIATE revision `e952c02c1454` ->
+        // resume --continue-forward advances DB to `a66108639ed7` and cleans tx.
         write_unpacked_workspace(&stage_v2, &v2_files, Some(&v2_mb));
         let j_dir_2 = paths.maintenance_root.join("tx").join("tx2");
         apply_swap_with_journal(&paths, Some(&v1_valid), &stage_v2, &v2_valid, &j_dir_2).unwrap();
         let db = ctx.connect_db(&paths).await.unwrap();
-        set_alembic_version(&db, "16c86712512a").await.unwrap();
+        set_alembic_version(&db, "e952c02c1454").await.unwrap();
         db.close().await;
 
         tx.transaction_id = "tx2".to_string();
         tx.phase = TransactionPhase::DatabaseRecoveryRequired;
         tx.journal_dir = Some(j_dir_2.display().to_string());
-        tx.observed_db_revision = Some("16c86712512a".to_string());
+        tx.observed_db_revision = Some("e952c02c1454".to_string());
         save_transaction(&paths, &tx).unwrap();
 
         // First dry-run inspects intermediate state without clearing tx.
@@ -2792,7 +2791,7 @@ client_id = "cfms-web"
         .unwrap();
         assert!(!paths.transaction_path().exists());
         let db = ctx.connect_db(&paths).await.unwrap();
-        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("e952c02c1454"));
+        assert_eq!(db.current_revision().await.unwrap().as_deref(), Some("a66108639ed7"));
         db.close().await;
 
         // Case 3: AtTarget recovery finalizes cleanly, and --abort-clear clears unknown tx.
@@ -2831,7 +2830,7 @@ client_id = "cfms-web"
             let extra_path = format!("src/step_{idx}.py");
             let (files, mb) = build_release_bundle_map(
                 ver,
-                &[("e952c02c1454", None)],
+                &[("e952c02c1454", None), ("a66108639ed7", Some("e952c02c1454"))],
                 &base_config_template(""),
                 &[(extra_path.as_str(), ver.as_bytes())],
             );
@@ -2973,8 +2972,8 @@ client_id = "cfms-web"
             target_release_id: ids[2].clone(),
             source_version: "0.14.1".to_string(),
             target_version: "0.14.2".to_string(),
-            source_head: Some("e952c02c1454".to_string()),
-            target_head: Some("e952c02c1454".to_string()),
+            source_head: Some("a66108639ed7".to_string()),
+            target_head: Some("a66108639ed7".to_string()),
             staging_dir: None,
             journal_dir: None,
             db_checkpoint_path: None,
@@ -3034,7 +3033,7 @@ client_id = "cfms-web"
         let v1_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
         let (v1_files, v1_mb) = build_release_bundle_map(
             "0.14.0",
-            &[("e952c02c1454", None)],
+            &[("a66108639ed7", None)],
             &base_config_template(""),
             &[],
         );
@@ -3044,7 +3043,7 @@ client_id = "cfms-web"
         let v2_pkg = tmp.path().join(v2_tar_name);
         let (v2_files, v2_mb) = build_release_bundle_map(
             "0.15.0",
-            &[("e952c02c1454", None)],
+            &[("a66108639ed7", None)],
             &base_config_template("\n[logging]\nlevel = \"DEBUG\"\n"),
             &[("src/online_updated.py", b"ONLINE = True\n")],
         );
@@ -3233,8 +3232,8 @@ client_id = "cfms-web"
     async fn status_diagnostic_succeeds_when_unmanaged_server_version_is_missing() {
         let tmp = TempDir::new().unwrap();
         let (files, _manifest_bytes) = build_release_bundle_map(
-            "0.14.0",
-            &[("e952c02c1454", None)],
+            "0.15.0",
+            &[("a66108639ed7", None)],
             &base_config_template(""),
             &[],
         );

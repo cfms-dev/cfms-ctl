@@ -786,7 +786,6 @@ pub const CORE_TABLES: &[TableDef] = &[
             ColumnDef::req("inherit", ColumnType::Boolean),
             ColumnDef::req("status", ColumnType::Integer),
             ColumnDef::opt("status_operation_id", ColumnType::Varchar(255)),
-            ColumnDef::opt("access_rule_set_id", ColumnType::Varchar(32)),
         ],
         checks: &[CheckDef {
             name: "ck_nodes_root_parent",
@@ -796,24 +795,14 @@ pub const CORE_TABLES: &[TableDef] = &[
             name: "uq_nodes_active_parent_name",
             columns: &["parent_id", "active_name"],
         }],
-        foreign_keys: &[
-            ForeignKeyDef::cyclic(
-                "fk_nodes_parent_id_folders",
-                "parent_id",
-                "folders",
-                "id",
-                OnDelete::Cascade,
-            ),
-            ForeignKeyDef::cyclic(
-                "fk_nodes_access_rule_set_id_compiled_access_rule_sets",
-                "access_rule_set_id",
-                "compiled_access_rule_sets",
-                "id",
-                OnDelete::Restrict,
-            ),
-        ],
+        foreign_keys: &[ForeignKeyDef::cyclic(
+            "fk_nodes_parent_id_folders",
+            "parent_id",
+            "folders",
+            "id",
+            OnDelete::Cascade,
+        )],
         indexes: &[
-            IndexDef::normal("ix_nodes_access_rule_set_id", "access_rule_set_id"),
             IndexDef::normal("ix_nodes_name", "name"),
             IndexDef::functional(
                 "ix_nodes_parent_status_lower_name_id",
@@ -992,161 +981,104 @@ pub const CORE_TABLES: &[TableDef] = &[
         indexes: &[IndexDef::normal("ix_document_metadata_tags_tag", "tag")],
     },
     TableDef {
-        name: "object_access_entries",
-        pk_name: "pk_object_access_entries",
+        name: "dacl_rules",
+        pk_name: "pk_dacl_rules",
         pk_columns: &["id"],
         columns: &[
-            ColumnDef::req("id", ColumnType::Serial),
-            ColumnDef::req("entity_type", ColumnType::Varchar(16)),
-            ColumnDef::req("entity_identifier", ColumnType::Varchar(255)),
-            ColumnDef::req("target_type", ColumnType::Varchar(16)),
-            ColumnDef::req("target_identifier", ColumnType::Varchar(255)),
-            ColumnDef::req("access_type", ColumnType::Varchar(16)),
-            ColumnDef::req("start_time", ColumnType::Double),
-            ColumnDef::opt("end_time", ColumnType::Double),
-        ],
-        checks: &[],
-        uniques: &[],
-        foreign_keys: &[],
-        indexes: &[
-            IndexDef::normal(
-                "ix_object_access_entries_entity_identifier",
-                "entity_identifier",
-            ),
-            IndexDef::normal(
-                "ix_object_access_entries_target_identifier",
-                "target_identifier",
-            ),
-        ],
-    },
-    TableDef {
-        name: "compiled_access_rule_sets",
-        pk_name: "pk_compiled_access_rule_sets",
-        pk_columns: &["id"],
-        columns: &[
-            ColumnDef::req("id", ColumnType::Varchar(32)),
+            ColumnDef::req("id", ColumnType::BigSerial),
             ColumnDef::req("node_id", ColumnType::Varchar(255)),
-            ColumnDef::req("created_at", ColumnType::Double),
+            ColumnDef::req("effect", ColumnType::Varchar(8)),
+            ColumnDef::req("permission_mask", ColumnType::BigInt),
+            ColumnDef::req("scope", ColumnType::Varchar(8)),
+            ColumnDef::opt("valid_from", ColumnType::BigInt),
+            ColumnDef::opt("valid_until", ColumnType::BigInt),
+            ColumnDef::opt("remark", ColumnType::Text),
         ],
-        checks: &[],
+        checks: &[
+            CheckDef {
+                name: "ck_dacl_rules_effect",
+                expr: "effect IN ('allow', 'deny')",
+            },
+            CheckDef {
+                name: "ck_dacl_rules_permission_mask",
+                expr: "permission_mask > 0",
+            },
+            CheckDef {
+                name: "ck_dacl_rules_scope",
+                expr: "scope IN ('self', 'dirs', 'docs', 'all')",
+            },
+            CheckDef {
+                name: "ck_dacl_rules_valid_window",
+                expr: "valid_from IS NULL OR valid_until IS NULL OR valid_from < valid_until",
+            },
+        ],
         uniques: &[],
         foreign_keys: &[ForeignKeyDef::simple(
-            "fk_compiled_access_rule_sets_node_id_nodes",
+            "fk_dacl_rules_node_id_nodes",
             "node_id",
             "nodes",
             "id",
             OnDelete::Cascade,
         )],
-        indexes: &[IndexDef::normal(
-            "ix_compiled_access_rule_sets_node_id",
-            "node_id",
-        )],
-    },
-    TableDef {
-        name: "compiled_access_rules",
-        pk_name: "pk_compiled_access_rules",
-        pk_columns: &["id"],
-        columns: &[
-            ColumnDef::req("id", ColumnType::Serial),
-            ColumnDef::req("rule_set_id", ColumnType::Varchar(32)),
-            ColumnDef::req("access_type", ColumnType::Varchar(64)),
-            ColumnDef::req("match_mode", ColumnType::Varchar(8)),
-        ],
-        checks: &[],
-        uniques: &[],
-        foreign_keys: &[ForeignKeyDef::simple(
-            "fk_compiled_access_rules_rule_set_id_compiled_access_rule_sets",
-            "rule_set_id",
-            "compiled_access_rule_sets",
-            "id",
-            OnDelete::Cascade,
-        )],
         indexes: &[
-            IndexDef::normal("ix_compiled_access_rules_rule_set_id", "rule_set_id"),
-            IndexDef::normal("ix_compiled_access_rules_access_type", "access_type"),
-        ],
-    },
-    TableDef {
-        name: "compiled_access_rule_groups",
-        pk_name: "pk_compiled_access_rule_groups",
-        pk_columns: &["id"],
-        columns: &[
-            ColumnDef::req("id", ColumnType::Varchar(32)),
-            ColumnDef::req("rule_id", ColumnType::Integer),
-            ColumnDef::req("group_index", ColumnType::Integer),
-            ColumnDef::req("match_mode", ColumnType::Varchar(8)),
-            ColumnDef::req("rights_match_mode", ColumnType::Varchar(8)),
-            ColumnDef::req("rights_empty", ColumnType::Boolean),
-            ColumnDef::req("groups_match_mode", ColumnType::Varchar(8)),
-            ColumnDef::req("groups_empty", ColumnType::Boolean),
-        ],
-        checks: &[],
-        uniques: &[],
-        foreign_keys: &[ForeignKeyDef::simple(
-            "fk_compiled_access_rule_groups_rule_id_compiled_access_rules",
-            "rule_id",
-            "compiled_access_rules",
-            "id",
-            OnDelete::Cascade,
-        )],
-        indexes: &[IndexDef::normal(
-            "ix_compiled_access_rule_groups_rule_id",
-            "rule_id",
-        )],
-    },
-    TableDef {
-        name: "compiled_access_rule_memberships",
-        pk_name: "pk_compiled_access_rule_memberships",
-        pk_columns: &["id"],
-        columns: &[
-            ColumnDef::req("id", ColumnType::Serial),
-            ColumnDef::req("group_id", ColumnType::Varchar(32)),
-            ColumnDef::req("group_name", ColumnType::Varchar(255)),
-        ],
-        checks: &[],
-        uniques: &[],
-        foreign_keys: &[ForeignKeyDef {
-            name_sqlite: "fk_compiled_access_rule_memberships_group_id_compiled_access_rule_groups",
-            name_mysql: "fk_compiled_access_rule_memberships_group_id_compiled_ac_46fa",
-            name_postgres: "fk_compiled_access_rule_memberships_group_id_compiled_a_46fa",
-            column: "group_id",
-            ref_table: "compiled_access_rule_groups",
-            ref_column: "id",
-            on_delete: OnDelete::Cascade,
-            cyclic_alter: false,
-        }],
-        indexes: &[
-            IndexDef::normal("ix_compiled_access_rule_memberships_group_id", "group_id"),
             IndexDef::normal(
-                "ix_compiled_access_rule_memberships_group_name",
-                "group_name",
+                "ix_dacl_rules_node_effect_scope",
+                "node_id, effect, scope",
             ),
+            IndexDef::normal("ix_dacl_rules_validity", "node_id, valid_from, valid_until"),
         ],
     },
     TableDef {
-        name: "compiled_access_rule_rights",
-        pk_name: "pk_compiled_access_rule_rights",
+        name: "dacl_rule_clauses",
+        pk_name: "pk_dacl_rule_clauses",
         pk_columns: &["id"],
         columns: &[
-            ColumnDef::req("id", ColumnType::Serial),
-            ColumnDef::req("group_id", ColumnType::Varchar(32)),
-            ColumnDef::req("permission", ColumnType::Varchar(64)),
+            ColumnDef::req("id", ColumnType::BigSerial),
+            ColumnDef::req("rule_id", ColumnType::SqliteIntElseBigInt),
         ],
         checks: &[],
         uniques: &[],
-        foreign_keys: &[ForeignKeyDef {
-            name_sqlite: "fk_compiled_access_rule_rights_group_id_compiled_access_rule_groups",
-            name_mysql: "fk_compiled_access_rule_rights_group_id_compiled_access__ade6",
-            name_postgres: "fk_compiled_access_rule_rights_group_id_compiled_access_ade6",
-            column: "group_id",
-            ref_table: "compiled_access_rule_groups",
-            ref_column: "id",
-            on_delete: OnDelete::Cascade,
-            cyclic_alter: false,
+        foreign_keys: &[ForeignKeyDef::simple(
+            "fk_dacl_rule_clauses_rule_id_dacl_rules",
+            "rule_id",
+            "dacl_rules",
+            "id",
+            OnDelete::Cascade,
+        )],
+        indexes: &[IndexDef::normal(
+            "ix_dacl_rule_clauses_rule_id",
+            "rule_id",
+        )],
+    },
+    TableDef {
+        name: "dacl_rule_atoms",
+        pk_name: "pk_dacl_rule_atoms",
+        pk_columns: &["id"],
+        columns: &[
+            ColumnDef::req("id", ColumnType::BigSerial),
+            ColumnDef::req("clause_id", ColumnType::SqliteIntElseBigInt),
+            ColumnDef::req("predicate_kind", ColumnType::Varchar(16)),
+            ColumnDef::req("predicate_value", ColumnType::Varchar(255)),
+            ColumnDef::req("is_negated", ColumnType::Boolean),
+        ],
+        checks: &[CheckDef {
+            name: "ck_dacl_rule_atoms_kind",
+            expr: "predicate_kind IN ('user', 'group', 'perm')",
         }],
+        uniques: &[],
+        foreign_keys: &[ForeignKeyDef::simple(
+            "fk_dacl_rule_atoms_clause_id_dacl_rule_clauses",
+            "clause_id",
+            "dacl_rule_clauses",
+            "id",
+            OnDelete::Cascade,
+        )],
         indexes: &[
-            IndexDef::normal("ix_compiled_access_rule_rights_group_id", "group_id"),
-            IndexDef::normal("ix_compiled_access_rule_rights_permission", "permission"),
+            IndexDef::normal("ix_dacl_rule_atoms_clause_id", "clause_id"),
+            IndexDef::normal(
+                "ix_dacl_rule_atoms_principal",
+                "predicate_kind, predicate_value",
+            ),
         ],
     },
     TableDef {
@@ -1173,60 +1105,6 @@ pub const CORE_TABLES: &[TableDef] = &[
             OnDelete::SetNull,
         )],
         indexes: &[IndexDef::normal("ix_audit_entries_logged_time", "logged_time")],
-    },
-    TableDef {
-        name: "userblock_entries",
-        pk_name: "pk_userblock_entries",
-        pk_columns: &["block_id"],
-        columns: &[
-            ColumnDef::req("block_id", ColumnType::Varchar(32)),
-            ColumnDef::req("user_id", ColumnType::Uuid),
-            ColumnDef::req("timestamp", ColumnType::Double),
-            ColumnDef::req("not_before", ColumnType::Double),
-            ColumnDef::req("not_after", ColumnType::Double),
-            ColumnDef::req("target_type", ColumnType::Varchar(32)),
-            ColumnDef::opt("target_id", ColumnType::Varchar(255)),
-            ColumnDef::opt("reason_comment_id", ColumnType::SqliteIntElseBigInt),
-        ],
-        checks: &[],
-        uniques: &[],
-        foreign_keys: &[
-            ForeignKeyDef::simple(
-                "fk_userblock_entries_user_id_users",
-                "user_id",
-                "users",
-                "id",
-                OnDelete::Cascade,
-            ),
-            ForeignKeyDef::simple(
-                "fk_userblock_entries_reason_comment_id_comments",
-                "reason_comment_id",
-                "comments",
-                "comment_id",
-                OnDelete::SetNull,
-            ),
-        ],
-        indexes: &[],
-    },
-    TableDef {
-        name: "userblock_sub_entries",
-        pk_name: "pk_userblock_sub_entries",
-        pk_columns: &["id"],
-        columns: &[
-            ColumnDef::req("id", ColumnType::Serial),
-            ColumnDef::req("parent_id", ColumnType::Varchar(32)),
-            ColumnDef::req("block_type", ColumnType::Varchar(64)),
-        ],
-        checks: &[],
-        uniques: &[],
-        foreign_keys: &[ForeignKeyDef::simple(
-            "fk_userblock_sub_entries_parent_id_userblock_entries",
-            "parent_id",
-            "userblock_entries",
-            "block_id",
-            OnDelete::Cascade,
-        )],
-        indexes: &[],
     },
     TableDef {
         name: "banned_subnets",
@@ -1815,7 +1693,7 @@ pub async fn set_alembic_version(pool: &DbPool, revision: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create the full CFMS head schema (40 core tables + optional `user_oidc_credentials`).
+/// Create the full CFMS head schema (35 core tables + optional `user_oidc_credentials`).
 pub async fn create_head_schema(pool: &DbPool, include_oidc_extension: bool) -> Result<()> {
     let stmts = compile_head_schema_statements(pool.kind(), include_oidc_extension);
     execute_ddl_statements(pool, &stmts).await
@@ -1909,7 +1787,7 @@ mod tests {
     #[test]
     fn core_tables_match_application_table_names_count_and_order() {
         let names: Vec<&str> = CORE_TABLES.iter().map(|t| t.name).collect();
-        assert_eq!(names.len(), 40);
+        assert_eq!(names.len(), 35);
         assert_eq!(names.as_slice(), APPLICATION_TABLE_NAMES);
     }
 
@@ -1974,12 +1852,34 @@ mod tests {
                 .compile_create_table(DatabaseKind::Postgresql)
                 .contains("comment_id BIGSERIAL NOT NULL")
         );
+
+        let dacl_rules = table_def("dacl_rules").expect("dacl_rules def");
+        let pg_dacl = dacl_rules.compile_create_table(DatabaseKind::Postgresql);
+        assert!(pg_dacl.contains("id BIGSERIAL NOT NULL"));
+        assert!(pg_dacl.contains("ck_dacl_rules_effect"));
+        assert!(pg_dacl.contains("ck_dacl_rules_valid_window"));
+        let mysql_dacl = dacl_rules.compile_create_table(DatabaseKind::Mysql);
+        assert!(mysql_dacl.contains("id BIGINT NOT NULL AUTO_INCREMENT"));
+        let sqlite_dacl = dacl_rules.compile_create_table(DatabaseKind::Sqlite);
+        assert!(sqlite_dacl.contains("id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT") || sqlite_dacl.contains("id INTEGER NOT NULL"));
+
+        let dacl_clauses = table_def("dacl_rule_clauses").expect("dacl_rule_clauses def");
+        assert!(
+            dacl_clauses
+                .compile_create_table(DatabaseKind::Sqlite)
+                .contains("rule_id INTEGER NOT NULL")
+        );
+        assert!(
+            dacl_clauses
+                .compile_create_table(DatabaseKind::Postgresql)
+                .contains("rule_id BIGINT NOT NULL")
+        );
     }
 
     #[test]
     fn builtin_schema_ir_round_trips_and_matches_table_def_ddl() {
         let ir = builtin_schema_ir(true);
-        assert_eq!(ir.core_table_names().len(), 40);
+        assert_eq!(ir.core_table_names().len(), 35);
         assert_eq!(ir.extension_table_names().len(), 1);
         assert_eq!(
             ir.schema_revision.as_deref(),

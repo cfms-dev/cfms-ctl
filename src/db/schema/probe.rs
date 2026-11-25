@@ -326,6 +326,8 @@ pub async fn extract_code_schema_ir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DatabaseKind;
+    use crate::db::schema::CanonicalType;
     use crate::db::schema::ddl::builtin_schema_ir;
     use crate::db::schema::diff::{DiffOptions, SchemaOp, diff_schemas};
 
@@ -342,19 +344,69 @@ mod tests {
             extract_code_schema_ir(&paths, ExtractorMode::Static, None, None, true, false)
                 .await
                 .expect("static AST extraction");
-        assert!(
-            static_ir.tables.len() >= 40,
-            "expected >=40 tables from static AST scan, got {}",
+        assert_eq!(
+            static_ir.tables.len(),
+            36,
+            "expected 36 tables (35 core + user_oidc_credentials) from static AST scan, got {}",
             static_ir.tables.len()
         );
-        assert_eq!(static_ir.schema_revision.as_deref(), Some("e952c02c1454"));
+        assert_eq!(static_ir.schema_revision.as_deref(), Some("a66108639ed7"));
+        let static_dacl = &static_ir.tables["dacl_rules"];
+        assert_eq!(
+            static_dacl.column("valid_from").unwrap().canonical_type,
+            CanonicalType::BigInt
+        );
+        assert_eq!(
+            static_dacl.column("valid_until").unwrap().canonical_type,
+            CanonicalType::BigInt
+        );
 
         // 2. If a working Python environment is present, verify live Base.metadata probe parity
-        // against built-in 0.14.x contract without writing into the reference repository.
+        // against built-in CEP-0002 CACL contract and static AST without writing into the reference repository.
         if let Ok(probe_ir) =
             extract_code_schema_ir(&paths, ExtractorMode::Python, None, None, true, false).await
         {
-            assert_eq!(probe_ir.schema_revision.as_deref(), Some("e952c02c1454"));
+            assert_eq!(probe_ir.tables.len(), 36);
+            assert_eq!(probe_ir.schema_revision.as_deref(), Some("a66108639ed7"));
+            let probe_dacl = &probe_ir.tables["dacl_rules"];
+            assert_eq!(
+                probe_dacl.column("valid_from").unwrap().canonical_type,
+                CanonicalType::BigInt
+            );
+            assert_eq!(
+                probe_dacl.column("valid_until").unwrap().canonical_type,
+                CanonicalType::BigInt
+            );
+
+            assert_eq!(
+                static_ir.tables.keys().collect::<Vec<_>>(),
+                probe_ir.tables.keys().collect::<Vec<_>>(),
+                "static AST table set drifted from Python Base.metadata probe"
+            );
+            let ast_vs_probe = diff_schemas(
+                &static_ir,
+                &probe_ir,
+                &DiffOptions {
+                    dialect: Some(DatabaseKind::Sqlite),
+                    include_extensions: false,
+                    ..Default::default()
+                },
+            );
+            let dacl_ops: Vec<String> = ast_vs_probe
+                .operations
+                .iter()
+                .map(|op| format!("{op:?}"))
+                .filter(|desc| {
+                    desc.contains("dacl_rules")
+                        || desc.contains("dacl_rule_clauses")
+                        || desc.contains("dacl_rule_atoms")
+                })
+                .collect();
+            assert!(
+                dacl_ops.is_empty(),
+                "static AST vs probe drifted on CEP-0002 DACL tables: {dacl_ops:?}"
+            );
+
             let builtin = builtin_schema_ir(true);
             let plan = diff_schemas(
                 &builtin,

@@ -191,8 +191,8 @@ secret_key = "{secret_key}"
 
         // Coupled hierarchy depth-by-depth: '/' (node+folder) -> '/sub' (node+folder) -> '/sub/spec' (node+document)
         sqlx::query(
-            "INSERT INTO nodes (id, type, name, parent_id, inherit, status, status_operation_id, access_rule_set_id) VALUES \
-             ('/', 'directory', '/', NULL, 1, 0, NULL, NULL)",
+            "INSERT INTO nodes (id, type, name, parent_id, inherit, status, status_operation_id) VALUES \
+             ('/', 'directory', '/', NULL, 1, 0, NULL)",
         )
         .execute(p)
         .await
@@ -203,8 +203,8 @@ secret_key = "{secret_key}"
             .unwrap();
 
         sqlx::query(
-            "INSERT INTO nodes (id, type, name, parent_id, inherit, status, status_operation_id, access_rule_set_id) VALUES \
-             ('/sub', 'directory', 'Subfolder', '/', 1, 0, NULL, NULL)",
+            "INSERT INTO nodes (id, type, name, parent_id, inherit, status, status_operation_id) VALUES \
+             ('/sub', 'directory', 'Subfolder', '/', 1, 0, NULL)",
         )
         .execute(p)
         .await
@@ -215,8 +215,8 @@ secret_key = "{secret_key}"
             .unwrap();
 
         sqlx::query(
-            "INSERT INTO nodes (id, type, name, parent_id, inherit, status, status_operation_id, access_rule_set_id) VALUES \
-             ('/sub/spec', 'document', 'Spec.md', '/sub', 1, 0, NULL, NULL)",
+            "INSERT INTO nodes (id, type, name, parent_id, inherit, status, status_operation_id) VALUES \
+             ('/sub/spec', 'document', 'Spec.md', '/sub', 1, 0, NULL)",
         )
         .execute(p)
         .await
@@ -248,30 +248,26 @@ secret_key = "{secret_key}"
             .await
             .unwrap();
 
-        // Active vs orphaned compiled_access_rule_sets
+        // CEP-0002 DACL rules, clauses, and atoms (empty clause + sysop clause)
         sqlx::query(
-            "INSERT INTO compiled_access_rule_sets (id, node_id, created_at) VALUES \
-             ('ars-active', '/sub', 100.0), \
-             ('ars-empty', '/', 100.0)",
+            "INSERT INTO dacl_rules (id, node_id, effect, permission_mask, scope, valid_from, valid_until, remark) VALUES \
+             (1, '/', 'allow', 1043, 'all', NULL, NULL, 'Default read'), \
+             (2, '/sub', 'allow', 2097151, 'all', 1700000000000000, 1800000000000000, 'Sysop temp')",
         )
         .execute(p)
         .await
         .unwrap();
+        sqlx::query("INSERT INTO dacl_rule_clauses (id, rule_id) VALUES (1, 1), (2, 2)")
+            .execute(p)
+            .await
+            .unwrap();
         sqlx::query(
-            "INSERT INTO compiled_access_rules (id, rule_set_id, access_type, match_mode) VALUES \
-             (1, 'ars-active', 'read', 'allow')",
+            "INSERT INTO dacl_rule_atoms (id, clause_id, predicate_kind, predicate_value, is_negated) VALUES \
+             (1, 2, 'group', 'sysop', 0)",
         )
         .execute(p)
         .await
         .unwrap();
-        sqlx::query("UPDATE nodes SET access_rule_set_id = 'ars-active' WHERE id = '/sub'")
-            .execute(p)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE nodes SET access_rule_set_id = 'ars-empty' WHERE id = '/'")
-            .execute(p)
-            .await
-            .unwrap();
 
         // Banned subnets & audit
         sqlx::query(
@@ -417,19 +413,25 @@ secret_key = "{secret_key}"
                 .unwrap();
         assert_eq!(doc_rev.as_deref(), Some("a-child"));
 
-        let root_ars: Option<String> =
-            sqlx::query_scalar("SELECT access_rule_set_id FROM nodes WHERE id = '/'")
-                .fetch_one(dp)
-                .await
-                .unwrap();
-        assert_eq!(root_ars, None, "orphaned rule set must be cleared to NULL");
+        let dacl_rule_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dacl_rules")
+            .fetch_one(dp)
+            .await
+            .unwrap();
+        assert_eq!(dacl_rule_count, 2);
 
-        let sub_ars: Option<String> =
-            sqlx::query_scalar("SELECT access_rule_set_id FROM nodes WHERE id = '/sub'")
+        let valid_from: Option<i64> =
+            sqlx::query_scalar("SELECT valid_from FROM dacl_rules WHERE id = 2")
                 .fetch_one(dp)
                 .await
                 .unwrap();
-        assert_eq!(sub_ars.as_deref(), Some("ars-active"));
+        assert_eq!(valid_from, Some(1_700_000_000_000_000));
+
+        let atom_val: String =
+            sqlx::query_scalar("SELECT predicate_value FROM dacl_rule_atoms WHERE id = 1")
+                .fetch_one(dp)
+                .await
+                .unwrap();
+        assert_eq!(atom_val, "sysop");
 
         let server_name: Option<String> = sqlx::query_scalar(
             "SELECT option_value FROM options WHERE namespace = 'server' AND option_key = 'name'",
@@ -1099,5 +1101,422 @@ access_key_id = "ONLY_ACCESS_KEY"
         .expect_err("backup export must fail when server version cannot be determined");
         assert!(err.to_string().contains("Unable to determine target CFMS server version"));
         assert!(!archive_path.exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_014_archive_verifies_and_imports_into_blank_db_with_cacl_upgrade() {
+        use crate::db::schema::ir::{
+            CanonicalType, ColumnIr, ConfidenceLevel, ExtractionSource, ForeignKeyIr, IndexIr,
+            PrimaryKeyIr, ReferentialAction, SchemaIr, TableIr, TableOwnership,
+        };
+        use crate::db::schema::{ROOT_SCHEMA_REVISION, compile_full_schema_ddl};
+        use crate::db::schema::ddl::execute_ddl_statements;
+
+        fn col(name: &str, ordinal: usize, ty: CanonicalType, nullable: bool, autoinc: bool) -> ColumnIr {
+            ColumnIr {
+                name: name.to_string(),
+                ordinal,
+                canonical_type: ty,
+                dialect_types: std::collections::BTreeMap::new(),
+                nullable,
+                autoincrement: autoinc,
+                server_default: None,
+                computed: None,
+                comment: None,
+                confidence: ConfidenceLevel::High,
+            }
+        }
+
+        fn empty_tbl(name: &str, cols: Vec<ColumnIr>, pk: &[&str], fks: Vec<ForeignKeyIr>, idxs: Vec<IndexIr>) -> TableIr {
+            TableIr {
+                name: name.to_string(),
+                ownership: TableOwnership::Core,
+                columns: cols,
+                primary_key: PrimaryKeyIr {
+                    name: Some(format!("pk_{name}")),
+                    dialect_names: std::collections::BTreeMap::new(),
+                    columns: pk.iter().map(|s| (*s).to_string()).collect(),
+                },
+                foreign_keys: fks,
+                uniques: Vec::new(),
+                checks: Vec::new(),
+                indexes: idxs,
+                comment: None,
+                confidence: ConfidenceLevel::High,
+            }
+        }
+
+        // Build a synthetic CFMS 0.14.0 (`e952c02c1454`) SchemaIr.
+        let mut ir_014 = SchemaIr::new(
+            ExtractionSource::PrebuiltJson,
+            Some(ROOT_SCHEMA_REVISION.to_string()),
+        );
+        let cacl_ir = builtin_schema_ir(false);
+        for (name, tbl) in &cacl_ir.tables {
+            if !matches!(name.as_str(), "dacl_rules" | "dacl_rule_clauses" | "dacl_rule_atoms") {
+                ir_014.tables.insert(name.clone(), tbl.clone());
+            }
+        }
+        // Add legacy `access_rule_set_id` to `nodes` + the 8 dropped tables.
+        let nodes_tbl = ir_014.tables.get_mut("nodes").unwrap();
+        let next_ord = nodes_tbl.columns.len();
+        nodes_tbl.columns.push(col(
+            "access_rule_set_id",
+            next_ord,
+            CanonicalType::Varchar { length: Some(32) },
+            true,
+            false,
+        ));
+        nodes_tbl.foreign_keys.push(ForeignKeyIr {
+            name: Some("fk_nodes_access_rule_set_id_compiled_access_rule_sets".to_string()),
+            dialect_names: std::collections::BTreeMap::new(),
+            columns: vec!["access_rule_set_id".to_string()],
+            ref_table: "compiled_access_rule_sets".to_string(),
+            ref_columns: vec!["id".to_string()],
+            on_delete: Some(ReferentialAction::Restrict),
+            on_update: None,
+            defer_on_create: true,
+        });
+        nodes_tbl.indexes.push(IndexIr {
+            name: "ix_nodes_access_rule_set_id".to_string(),
+            dialect_names: std::collections::BTreeMap::new(),
+            unique: false,
+            expressions: vec!["access_rule_set_id".to_string()],
+            dialect_clauses: std::collections::BTreeMap::new(),
+            where_clause: None,
+        });
+
+        ir_014.tables.insert(
+            "object_access_entries".to_string(),
+            empty_tbl(
+                "object_access_entries",
+                vec![
+                    col("id", 0, CanonicalType::Serial, false, true),
+                    col("entity_type", 1, CanonicalType::Varchar { length: Some(16) }, false, false),
+                    col("entity_identifier", 2, CanonicalType::Varchar { length: Some(255) }, false, false),
+                    col("target_type", 3, CanonicalType::Varchar { length: Some(16) }, false, false),
+                    col("target_identifier", 4, CanonicalType::Varchar { length: Some(255) }, false, false),
+                    col("access_type", 5, CanonicalType::Varchar { length: Some(16) }, false, false),
+                    col("start_time", 6, CanonicalType::Double, false, false),
+                    col("end_time", 7, CanonicalType::Double, true, false),
+                ],
+                &["id"],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        ir_014.tables.insert(
+            "compiled_access_rule_sets".to_string(),
+            empty_tbl(
+                "compiled_access_rule_sets",
+                vec![
+                    col("id", 0, CanonicalType::Varchar { length: Some(32) }, false, false),
+                    col("node_id", 1, CanonicalType::Varchar { length: Some(255) }, false, false),
+                    col("created_at", 2, CanonicalType::Double, false, false),
+                ],
+                &["id"],
+                vec![ForeignKeyIr {
+                    name: Some("fk_compiled_access_rule_sets_node_id_nodes".to_string()),
+                    dialect_names: std::collections::BTreeMap::new(),
+                    columns: vec!["node_id".to_string()],
+                    ref_table: "nodes".to_string(),
+                    ref_columns: vec!["id".to_string()],
+                    on_delete: Some(ReferentialAction::Cascade),
+                    on_update: None,
+                    defer_on_create: false,
+                }],
+                Vec::new(),
+            ),
+        );
+        ir_014.tables.insert(
+            "compiled_access_rules".to_string(),
+            empty_tbl(
+                "compiled_access_rules",
+                vec![
+                    col("id", 0, CanonicalType::Serial, false, true),
+                    col("rule_set_id", 1, CanonicalType::Varchar { length: Some(32) }, false, false),
+                    col("access_type", 2, CanonicalType::Varchar { length: Some(64) }, false, false),
+                    col("match_mode", 3, CanonicalType::Varchar { length: Some(8) }, false, false),
+                ],
+                &["id"],
+                vec![ForeignKeyIr {
+                    name: Some("fk_compiled_access_rules_rule_set_id_compiled_access_rule_sets".to_string()),
+                    dialect_names: std::collections::BTreeMap::new(),
+                    columns: vec!["rule_set_id".to_string()],
+                    ref_table: "compiled_access_rule_sets".to_string(),
+                    ref_columns: vec!["id".to_string()],
+                    on_delete: Some(ReferentialAction::Cascade),
+                    on_update: None,
+                    defer_on_create: false,
+                }],
+                Vec::new(),
+            ),
+        );
+        ir_014.tables.insert(
+            "compiled_access_rule_groups".to_string(),
+            empty_tbl(
+                "compiled_access_rule_groups",
+                vec![
+                    col("id", 0, CanonicalType::Varchar { length: Some(32) }, false, false),
+                    col("rule_id", 1, CanonicalType::Integer, false, false),
+                    col("group_index", 2, CanonicalType::Integer, false, false),
+                    col("match_mode", 3, CanonicalType::Varchar { length: Some(8) }, false, false),
+                    col("rights_match_mode", 4, CanonicalType::Varchar { length: Some(8) }, false, false),
+                    col("rights_empty", 5, CanonicalType::Boolean, false, false),
+                    col("groups_match_mode", 6, CanonicalType::Varchar { length: Some(8) }, false, false),
+                    col("groups_empty", 7, CanonicalType::Boolean, false, false),
+                ],
+                &["id"],
+                vec![ForeignKeyIr {
+                    name: Some("fk_compiled_access_rule_groups_rule_id_compiled_access_rules".to_string()),
+                    dialect_names: std::collections::BTreeMap::new(),
+                    columns: vec!["rule_id".to_string()],
+                    ref_table: "compiled_access_rules".to_string(),
+                    ref_columns: vec!["id".to_string()],
+                    on_delete: Some(ReferentialAction::Cascade),
+                    on_update: None,
+                    defer_on_create: false,
+                }],
+                Vec::new(),
+            ),
+        );
+        ir_014.tables.insert(
+            "compiled_access_rule_memberships".to_string(),
+            empty_tbl(
+                "compiled_access_rule_memberships",
+                vec![
+                    col("id", 0, CanonicalType::Serial, false, true),
+                    col("group_id", 1, CanonicalType::Varchar { length: Some(32) }, false, false),
+                    col("group_name", 2, CanonicalType::Varchar { length: Some(255) }, false, false),
+                ],
+                &["id"],
+                vec![ForeignKeyIr {
+                    name: Some("fk_compiled_access_rule_memberships_group_id_compiled_access_rule_groups".to_string()),
+                    dialect_names: std::collections::BTreeMap::new(),
+                    columns: vec!["group_id".to_string()],
+                    ref_table: "compiled_access_rule_groups".to_string(),
+                    ref_columns: vec!["id".to_string()],
+                    on_delete: Some(ReferentialAction::Cascade),
+                    on_update: None,
+                    defer_on_create: false,
+                }],
+                Vec::new(),
+            ),
+        );
+        ir_014.tables.insert(
+            "compiled_access_rule_rights".to_string(),
+            empty_tbl(
+                "compiled_access_rule_rights",
+                vec![
+                    col("id", 0, CanonicalType::Serial, false, true),
+                    col("group_id", 1, CanonicalType::Varchar { length: Some(32) }, false, false),
+                    col("permission", 2, CanonicalType::Varchar { length: Some(64) }, false, false),
+                ],
+                &["id"],
+                vec![ForeignKeyIr {
+                    name: Some("fk_compiled_access_rule_rights_group_id_compiled_access_rule_groups".to_string()),
+                    dialect_names: std::collections::BTreeMap::new(),
+                    columns: vec!["group_id".to_string()],
+                    ref_table: "compiled_access_rule_groups".to_string(),
+                    ref_columns: vec!["id".to_string()],
+                    on_delete: Some(ReferentialAction::Cascade),
+                    on_update: None,
+                    defer_on_create: false,
+                }],
+                Vec::new(),
+            ),
+        );
+        ir_014.tables.insert(
+            "userblock_entries".to_string(),
+            empty_tbl(
+                "userblock_entries",
+                vec![
+                    col("block_id", 0, CanonicalType::Varchar { length: Some(32) }, false, false),
+                    col("user_id", 1, CanonicalType::Uuid, false, false),
+                    col("timestamp", 2, CanonicalType::Double, false, false),
+                    col("not_before", 3, CanonicalType::Double, false, false),
+                    col("not_after", 4, CanonicalType::Double, false, false),
+                    col("target_type", 5, CanonicalType::Varchar { length: Some(32) }, false, false),
+                    col("target_id", 6, CanonicalType::Varchar { length: Some(255) }, true, false),
+                    col("reason_comment_id", 7, CanonicalType::SqliteIntElseBigInt, true, false),
+                ],
+                &["block_id"],
+                vec![
+                    ForeignKeyIr {
+                        name: Some("fk_userblock_entries_user_id_users".to_string()),
+                        dialect_names: std::collections::BTreeMap::new(),
+                        columns: vec!["user_id".to_string()],
+                        ref_table: "users".to_string(),
+                        ref_columns: vec!["id".to_string()],
+                        on_delete: Some(ReferentialAction::Cascade),
+                        on_update: None,
+                        defer_on_create: false,
+                    },
+                    ForeignKeyIr {
+                        name: Some("fk_userblock_entries_reason_comment_id_comments".to_string()),
+                        dialect_names: std::collections::BTreeMap::new(),
+                        columns: vec!["reason_comment_id".to_string()],
+                        ref_table: "comments".to_string(),
+                        ref_columns: vec!["comment_id".to_string()],
+                        on_delete: Some(ReferentialAction::SetNull),
+                        on_update: None,
+                        defer_on_create: false,
+                    },
+                ],
+                Vec::new(),
+            ),
+        );
+        ir_014.tables.insert(
+            "userblock_sub_entries".to_string(),
+            empty_tbl(
+                "userblock_sub_entries",
+                vec![
+                    col("id", 0, CanonicalType::Serial, false, true),
+                    col("parent_id", 1, CanonicalType::Varchar { length: Some(32) }, false, false),
+                    col("block_type", 2, CanonicalType::Varchar { length: Some(64) }, false, false),
+                ],
+                &["id"],
+                vec![ForeignKeyIr {
+                    name: Some("fk_userblock_sub_entries_parent_id_userblock_entries".to_string()),
+                    dialect_names: std::collections::BTreeMap::new(),
+                    columns: vec!["parent_id".to_string()],
+                    ref_table: "userblock_entries".to_string(),
+                    ref_columns: vec!["block_id".to_string()],
+                    on_delete: Some(ReferentialAction::Cascade),
+                    on_update: None,
+                    defer_on_create: false,
+                }],
+                Vec::new(),
+            ),
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let src_ws = create_test_workspace(
+            &tmp.path().join("legacy_src"),
+            "legacy.db",
+            "local",
+            "legacy-pepper",
+            "legacy-secret",
+        );
+        fs::write(src_ws.join("src").join("schema.ir.json"), ir_014.to_pretty_json().unwrap())
+            .unwrap();
+
+        let pool = open_sqlite_pool(&src_ws).await;
+        execute_ddl_statements(&pool, &compile_full_schema_ddl(&ir_014, DatabaseKind::Sqlite))
+            .await
+            .unwrap();
+        set_alembic_version(&pool, ROOT_SCHEMA_REVISION).await.unwrap();
+        {
+            let DbPool::Sqlite(ref p) = pool else {
+                unreachable!();
+            };
+            sqlx::query("INSERT INTO user_groups (group_name, group_display_name) VALUES ('sysop', 'Sysop')")
+                .execute(p)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO group_permissions (group_name, permission, granted, start_time) VALUES ('sysop', 'manage_access', 1, 0.0)")
+                .execute(p)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO group_permissions (group_name, permission, granted, start_time) VALUES ('sysop', 'view_settings', 1, 0.0)")
+                .execute(p)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO options (namespace, owner, option_key, schema_version, revision, value_type, option_value, updated_at) VALUES \
+                 ('access', 'builtin', 'enable_access_recursive_check', 1, 1, 'bool', 'true', 1.0), \
+                 ('server', 'builtin', 'name', 1, 1, 'str', '\"Legacy CFMS\"', 1.0)",
+            )
+            .execute(p)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO nodes (id, type, name, parent_id, inherit, status, access_rule_set_id) VALUES ('/', 'directory', '/', NULL, 1, 0, NULL)")
+                .execute(p)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO folders (id, created_time) VALUES ('/', 1.0)")
+                .execute(p)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+
+        let legacy_archive = tmp.path().join("legacy_014.confbak");
+        let legacy_key = tmp.path().join("legacy_014.key");
+        export::run_export(
+            &test_ctx(&src_ws),
+            BackupExportArgs {
+                output_path: Some(legacy_archive.clone()),
+                key_out: Some(legacy_key.clone()),
+                components: vec![],
+                interactive: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        verify::run_verify(
+            &test_ctx(&src_ws),
+            BackupVerifyArgs {
+                backup_path: legacy_archive.clone(),
+                key: None,
+                key_file: Some(legacy_key.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Import legacy 0.14.0 archive into blank DB under a CACL workspace -> auto-upgrades to HEAD (`a66108639ed7`).
+        let dst_ws = create_test_workspace(
+            &tmp.path().join("cacl_dst"),
+            "cacl.db",
+            "local",
+            "old-p",
+            "old-s",
+        );
+        import::run_import(
+            &test_ctx(&dst_ws),
+            BackupImportArgs {
+                backup_path: legacy_archive,
+                key: None,
+                key_file: Some(legacy_key),
+            },
+        )
+        .await
+        .unwrap();
+
+        let dst_pool = open_sqlite_pool(&dst_ws).await;
+        let report = SchemaInspector::inspect(&dst_pool).await.unwrap();
+        assert!(
+            report.healthy,
+            "migrated target drift: missing={:?}, extra={:?}, cols={:?}",
+            report.missing_tables, report.extra_tables, report.column_mismatches
+        );
+        assert_eq!(report.current_revision.as_deref(), Some(LATEST_SCHEMA_REVISION));
+
+        let DbPool::Sqlite(ref dp) = dst_pool else {
+            unreachable!();
+        };
+        let root_dacl_cnt: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dacl_rules WHERE node_id = '/'")
+                .fetch_one(dp)
+                .await
+                .unwrap();
+        assert_eq!(root_dacl_cnt, 2);
+        let opt_gone: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM options WHERE namespace = 'access' AND option_key = 'enable_access_recursive_check'",
+        )
+        .fetch_one(dp)
+        .await
+        .unwrap();
+        assert_eq!(opt_gone, 0);
+        let server_name: String = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE namespace = 'server' AND option_key = 'name'",
+        )
+        .fetch_one(dp)
+        .await
+        .unwrap();
+        assert_eq!(server_name, "\"Legacy CFMS\"");
+        dst_pool.close().await;
     }
 }

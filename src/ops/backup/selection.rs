@@ -1,4 +1,4 @@
-//! Backup component dependency closure, 40-table CFMS domain partitioning,
+//! Backup component dependency closure, 35-table CFMS domain partitioning,
 //! extension table discovery, and partial-export SQL filter construction.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -46,10 +46,10 @@ impl BackupComponent {
     pub const fn description(self) -> &'static str {
         match self {
             Self::Accounts => {
-                "Users, credentials, groups, permissions, keyrings, userblocks, schedules & extensions"
+                "Users, credentials, groups, permissions, keyrings, schedules & extensions"
             }
             Self::Documents => {
-                "Nodes, folders, documents, revisions, metadata, ACLs & rules (requires: accounts)"
+                "Nodes, folders, documents, revisions, metadata & DACL rules (requires: accounts)"
             }
             Self::Audit => "Audit log entries (requires: accounts)",
             Self::BannedSubnets => "Banned IP subnets & linked reason comments",
@@ -118,8 +118,6 @@ pub const ACCOUNTS_TABLES: &[&str] = &[
     "user_memberships",
     "user_permissions",
     "keyrings",
-    "userblock_entries",
-    "userblock_sub_entries",
     "schedules",
 ];
 
@@ -130,6 +128,14 @@ pub const DOCUMENTS_TABLES: &[&str] = &[
     "document_revisions",
     "document_metadata",
     "document_metadata_tags",
+    "dacl_rules",
+    "dacl_rule_clauses",
+    "dacl_rule_atoms",
+];
+
+/// Pre-CACL (`e952c02c1454` / CFMS 0.14.0) legacy account & document tables retained for backward-compatible `.confbak` verify/import.
+pub const LEGACY_PRE_CACL_ACCOUNTS_TABLES: &[&str] = &["userblock_entries", "userblock_sub_entries"];
+pub const LEGACY_PRE_CACL_DOCUMENTS_TABLES: &[&str] = &[
     "object_access_entries",
     "compiled_access_rule_sets",
     "compiled_access_rules",
@@ -233,20 +239,66 @@ pub fn parse_and_validate_manifest_components(names: &[String]) -> Result<Vec<Ba
     Ok(parsed)
 }
 
-/// Compute the exact set of core + extension table names expected for a component selection.
+/// Return true if `ir` describes a pre-CACL (`0.14.0` / `e952c02c1454`) schema instead of CEP-0002 CACL.
+#[must_use]
+pub fn is_legacy_pre_cacl_schema(ir: &SchemaIr) -> bool {
+    if ir.tables.contains_key("dacl_rules") {
+        return false;
+    }
+    ir.tables.contains_key("userblock_entries")
+        || ir.tables.contains_key("compiled_access_rule_sets")
+        || ir.tables.contains_key("object_access_entries")
+        || ir.schema_revision.as_deref() == Some("e952c02c1454")
+}
+
+/// Compute the exact set of core + extension table names expected for a component selection
+/// against HEAD CACL (`a66108639ed7`).
 #[must_use]
 pub fn expected_tables_for(
     components: &[BackupComponent],
     extension_tables: &[ExtensionTableBackupSpec],
 ) -> BTreeSet<String> {
+    expected_tables_for_schema(components, extension_tables, None)
+}
+
+/// Compute expected core + extension table names, adapting cleanly to both CACL (`a66108639ed7`)
+/// and legacy pre-CACL (`e952c02c1454`) schemas/archives when `schema_ir` is supplied.
+#[must_use]
+pub fn expected_tables_for_schema(
+    components: &[BackupComponent],
+    extension_tables: &[ExtensionTableBackupSpec],
+    schema_ir: Option<&SchemaIr>,
+) -> BTreeSet<String> {
+    let legacy_pre_cacl = schema_ir.is_some_and(is_legacy_pre_cacl_schema);
     let comp_set: BTreeSet<BackupComponent> = components.iter().copied().collect();
     let mut tables = BTreeSet::new();
 
     if comp_set.contains(&BackupComponent::Accounts) {
         tables.extend(ACCOUNTS_TABLES.iter().map(|s| (*s).to_string()));
+        if legacy_pre_cacl {
+            tables.extend(
+                LEGACY_PRE_CACL_ACCOUNTS_TABLES
+                    .iter()
+                    .map(|s| (*s).to_string()),
+            );
+        }
     }
     if comp_set.contains(&BackupComponent::Documents) {
-        tables.extend(DOCUMENTS_TABLES.iter().map(|s| (*s).to_string()));
+        if legacy_pre_cacl {
+            tables.extend(
+                DOCUMENTS_TABLES
+                    .iter()
+                    .filter(|s| !matches!(**s, "dacl_rules" | "dacl_rule_clauses" | "dacl_rule_atoms"))
+                    .map(|s| (*s).to_string()),
+            );
+            tables.extend(
+                LEGACY_PRE_CACL_DOCUMENTS_TABLES
+                    .iter()
+                    .map(|s| (*s).to_string()),
+            );
+        } else {
+            tables.extend(DOCUMENTS_TABLES.iter().map(|s| (*s).to_string()));
+        }
     }
     if comp_set.contains(&BackupComponent::Audit) {
         tables.extend(AUDIT_TABLES.iter().map(|s| (*s).to_string()));
@@ -435,7 +487,8 @@ pub(crate) async fn prepare_source_export_plan(
         .map(|e| e.table_name.clone())
         .collect();
 
-    let wanted_tables = expected_tables_for(&selection.selected, &selected_extension_specs);
+    let wanted_tables =
+        expected_tables_for_schema(&selection.selected, &selected_extension_specs, Some(base_ir));
     let active_full_ir = active_schema_subset(base_ir, &selected_ext_names);
     let mut export_ir = SchemaIr::new(active_full_ir.source, Some(source_revision.clone()));
     for (name, table) in active_full_ir.tables {
@@ -504,6 +557,7 @@ pub(crate) struct SourceExportPlan {
 pub fn partial_export_where_clause(
     table_name: &str,
     components: &[BackupComponent],
+    has_userblock_entries: bool,
 ) -> Option<&'static str> {
     let has_accounts = components.contains(&BackupComponent::Accounts);
     let has_documents = components.contains(&BackupComponent::Documents);
@@ -512,11 +566,16 @@ pub fn partial_export_where_clause(
     match table_name {
         "comments" => match (has_accounts, has_banned_subnets) {
             (true, true) => None,
-            (true, false) => Some(
+            (true, false) if has_userblock_entries => Some(
                 "comment_id IN (\
                     SELECT status_comment_id FROM users WHERE status_comment_id IS NOT NULL \
                     UNION \
                     SELECT reason_comment_id FROM userblock_entries WHERE reason_comment_id IS NOT NULL\
+                )",
+            ),
+            (true, false) => Some(
+                "comment_id IN (\
+                    SELECT status_comment_id FROM users WHERE status_comment_id IS NOT NULL\
                 )",
             ),
             (false, true) => Some(
@@ -596,9 +655,9 @@ mod tests {
     use crate::db::schema::registry::APPLICATION_TABLE_NAMES;
 
     #[test]
-    fn all_40_core_tables_are_explicitly_partitioned_without_gaps_or_overlaps() {
+    fn all_35_core_tables_are_explicitly_partitioned_without_gaps_or_overlaps() {
         let backed_up = expected_tables_for(&BackupComponent::ALL, &[]);
-        assert_eq!(backed_up.len(), 30);
+        assert_eq!(backed_up.len(), 25);
 
         let excluded: BTreeSet<String> = EXCLUDED_RUNTIME_TABLES
             .iter()
@@ -607,6 +666,9 @@ mod tests {
         assert_eq!(excluded.len(), 10);
 
         assert!(backed_up.is_disjoint(&excluded));
+        assert!(backed_up.contains("dacl_rules"));
+        assert!(backed_up.contains("dacl_rule_clauses"));
+        assert!(backed_up.contains("dacl_rule_atoms"));
 
         let mut combined = backed_up;
         combined.extend(excluded);
@@ -615,6 +677,42 @@ mod tests {
             .map(|s| (*s).to_string())
             .collect();
         assert_eq!(combined, expected_all);
+    }
+
+    #[test]
+    fn schema_aware_selection_supports_legacy_pre_cacl_and_comments_filter() {
+        let mut legacy_ir = SchemaIr::new(
+            crate::db::schema::ir::ExtractionSource::PrebuiltJson,
+            Some("e952c02c1454".to_string()),
+        );
+        legacy_ir.tables.insert(
+            "userblock_entries".to_string(),
+            crate::db::schema::ir::TableIr {
+                name: "userblock_entries".to_string(),
+                ownership: TableOwnership::Core,
+                columns: Vec::new(),
+                primary_key: Default::default(),
+                foreign_keys: Vec::new(),
+                uniques: Vec::new(),
+                checks: Vec::new(),
+                indexes: Vec::new(),
+                comment: None,
+                confidence: crate::db::schema::ir::ConfidenceLevel::High,
+            },
+        );
+        let legacy_tables =
+            expected_tables_for_schema(&BackupComponent::ALL, &[], Some(&legacy_ir));
+        assert_eq!(legacy_tables.len(), 30);
+        assert!(legacy_tables.contains("compiled_access_rule_sets"));
+        assert!(legacy_tables.contains("userblock_entries"));
+        assert!(!legacy_tables.contains("dacl_rules"));
+
+        let cacl_where =
+            partial_export_where_clause("comments", &[BackupComponent::Accounts], false).unwrap();
+        assert!(!cacl_where.contains("userblock_entries"));
+        let legacy_where =
+            partial_export_where_clause("comments", &[BackupComponent::Accounts], true).unwrap();
+        assert!(legacy_where.contains("userblock_entries"));
     }
 
     #[test]
