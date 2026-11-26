@@ -71,6 +71,16 @@ pub fn validate_sha256_hex(raw: &str, context: &str) -> Result<String> {
     Ok(normalized)
 }
 
+fn matches_dir_prefix(rel_posix: &str, prefix: &str) -> bool {
+    rel_posix.starts_with(prefix) || rel_posix == prefix.trim_end_matches('/')
+}
+
+fn is_operator_owned_file(rel_posix: &str) -> bool {
+    rel_posix == "src/config.toml"
+        || rel_posix.starts_with("src/config.toml.backup-")
+        || rel_posix == ".python-version"
+}
+
 /// Validate and normalize a manifest member path (POSIX `/` separators, relative, non-operator-owned).
 pub fn validate_manifest_rel_path(raw: &str) -> Result<String> {
     if raw.is_empty()
@@ -115,8 +125,13 @@ pub fn validate_manifest_rel_path(raw: &str) -> Result<String> {
             "Manifest contains forbidden workspace-internal path '{raw}'"
         )));
     }
+    if is_operator_owned_file(raw) {
+        return Err(CfmsError::ArchiveIntegrity(format!(
+            "Manifest attempts to manage operator-owned path '{raw}'"
+        )));
+    }
     for prefix in OPERATOR_OWNED_PREFIXES {
-        if raw.starts_with(prefix) {
+        if matches_dir_prefix(raw, prefix) {
             return Err(CfmsError::ArchiveIntegrity(format!(
                 "Manifest attempts to manage operator-owned path '{raw}'"
             )));
@@ -295,14 +310,11 @@ pub fn is_preserved_workspace_path(
     rel_posix: &str,
     managed_extensions: &BTreeSet<String>,
 ) -> bool {
-    if rel_posix == "src/config.toml"
-        || rel_posix.starts_with("src/config.toml.backup-")
-        || rel_posix == ".python-version"
-    {
+    if is_operator_owned_file(rel_posix) {
         return true;
     }
     for prefix in PRESERVED_WORKSPACE_PREFIXES {
-        if rel_posix.starts_with(prefix) || rel_posix == prefix.trim_end_matches('/') {
+        if matches_dir_prefix(rel_posix, prefix) {
             return true;
         }
     }
@@ -373,13 +385,66 @@ pub(crate) mod tests {
     fn rejects_operator_owned_and_reserved_paths_in_manifest() {
         for bad in [
             "src/.maintenance/settings.json",
+            "src/.maintenance",
             "src/content/files/blob",
+            "src/content/files",
+            "src/content/logs/server.log",
+            "src/logs/server.log",
+            "src/config.toml",
+            "src/config.toml.backup-2026",
+            ".python-version",
             "src/__pycache__/main.cpython-315.pyc",
             "src/COM1.py",
             "../outside.py",
             ".venv/bin/python",
         ] {
             assert!(validate_manifest_rel_path(bad).is_err(), "expected error for {bad}");
+        }
+    }
+
+    #[test]
+    fn allows_release_managed_content_and_aligns_prefix_rules() {
+        let managed: BTreeSet<String> = ["builtin", "oidc_sso"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        for rel in ["src/content/hello", "src/content/ssl/client/01234567.0"] {
+            assert!(validate_manifest_rel_path(rel).is_ok(), "expected valid manifest path {rel}");
+            assert!(
+                !is_preserved_workspace_path(rel, &managed),
+                "expected release-managed path {rel} not to be preserved"
+            );
+        }
+
+        for preserved in [
+            "src/content/files/upload.bin",
+            "src/content/logs/app.log",
+            "src/logs/app.log",
+            "src/.maintenance/settings.json",
+            ".venv/bin/python",
+        ] {
+            assert!(
+                is_preserved_workspace_path(preserved, &managed),
+                "expected preserved path {preserved}"
+            );
+        }
+
+        for prefix in PRESERVED_WORKSPACE_PREFIXES {
+            assert!(
+                validate_manifest_rel_path(&format!("{prefix}probe")).is_err(),
+                "expected preserved prefix child {prefix}probe to be rejected"
+            );
+            assert!(
+                validate_manifest_rel_path(prefix.trim_end_matches('/')).is_err(),
+                "expected preserved prefix root {prefix} to be rejected"
+            );
+        }
+        for prefix in OPERATOR_OWNED_PREFIXES {
+            assert!(
+                is_preserved_workspace_path(&format!("{prefix}probe"), &managed),
+                "expected operator-owned prefix child {prefix}probe to be preserved"
+            );
         }
     }
 

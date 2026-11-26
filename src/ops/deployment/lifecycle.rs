@@ -2056,7 +2056,11 @@ mod tests {
             "0.14.0",
             &[("e952c02c1454", None)],
             &base_config_template(""),
-            &[("src/legacy_only.py", b"# will be removed on upgrade\n")],
+            &[
+                ("src/legacy_only.py", b"# will be removed on upgrade\n"),
+                ("src/content/hello", b"hello v1\n"),
+                ("src/content/ssl/client/01234567.0", b"ca-bundle-v1\n"),
+            ],
         );
         write_release_targz(&v1_pkg, "cfms-0.14.0", &v1_files, &v1_manifest_bytes);
 
@@ -2077,15 +2081,25 @@ mod tests {
         let content_upload = deploy.join("src").join("content").join("files").join("upload.bin");
         fs::create_dir_all(content_upload.parent().unwrap()).unwrap();
         fs::write(&content_upload, b"operator-binary-payload").unwrap();
+        let content_log = deploy.join("src").join("content").join("logs").join("server.log");
+        fs::create_dir_all(content_log.parent().unwrap()).unwrap();
+        fs::write(&content_log, b"operator-log-line\n").unwrap();
+        let server_key = deploy.join("src").join("content").join("ssl").join("server.key");
+        fs::create_dir_all(server_key.parent().unwrap()).unwrap();
+        fs::write(&server_key, b"operator-private-key\n").unwrap();
         install_dummy_third_party_extension(&deploy, "acme_plugin", Some("0.14.0"), Some("0.15.9"));
 
-        // Build v0.15.0 ZIP bundle adding a new file, removing legacy_only.py, adding [logging] config, advancing DB head to a66108639ed7.
+        // Build v0.15.0 ZIP bundle adding a new file, removing legacy_only.py, updating release assets under src/content/, adding [logging] config, advancing DB head to a66108639ed7.
         let v2_pkg = tmp.path().join("cfms-0.15.0.zip");
         let (v2_files, v2_manifest_bytes) = build_release_bundle_map(
             "0.15.0",
             &[("e952c02c1454", None), ("a66108639ed7", Some("e952c02c1454"))],
             &base_config_template("\n[logging]\nlevel = \"INFO\"\n"),
-            &[("src/new_feature.py", b"NEW = True\n")],
+            &[
+                ("src/new_feature.py", b"NEW = True\n"),
+                ("src/content/hello", b"hello v2\n"),
+                ("src/content/ssl/client/01234567.0", b"ca-bundle-v2\n"),
+            ],
         );
         write_release_zip(&v2_pkg, "cfms-0.15.0", &v2_files, &v2_manifest_bytes);
 
@@ -2153,8 +2167,18 @@ mod tests {
         assert_eq!(new_cfg["database"]["file"].as_str(), Some("custom_cfms.db"));
         assert_eq!(new_cfg["logging"]["level"].as_str(), Some("INFO"));
 
-        // Preserved operator content + third-party extension.
+        // Updated release assets under src/content/ + preserved operator content + third-party extension.
+        assert_eq!(
+            fs::read(deploy.join("src/content/hello")).unwrap(),
+            b"hello v2\n"
+        );
+        assert_eq!(
+            fs::read(deploy.join("src/content/ssl/client/01234567.0")).unwrap(),
+            b"ca-bundle-v2\n"
+        );
         assert_eq!(fs::read(&content_upload).unwrap(), b"operator-binary-payload");
+        assert_eq!(fs::read(&content_log).unwrap(), b"operator-log-line\n");
+        assert_eq!(fs::read(&server_key).unwrap(), b"operator-private-key\n");
         assert!(deploy.join("src/include/extensions/acme_plugin/manifest.toml").is_file());
 
         // DB migrated cleanly to a66108639ed7 without Python.
@@ -2168,7 +2192,11 @@ mod tests {
             "0.15.1",
             &[("e952c02c1454", None), ("a66108639ed7", Some("e952c02c1454"))],
             &base_config_template("\n[logging]\nlevel = \"INFO\"\n"),
-            &[("src/new_feature.py", b"NEW = 2\n")],
+            &[
+                ("src/new_feature.py", b"NEW = 2\n"),
+                ("src/content/hello", b"hello v2\n"),
+                ("src/content/ssl/client/01234567.0", b"ca-bundle-v2\n"),
+            ],
         );
         write_release_zip(&v3_pkg, "cfms-0.15.1", &v3_files, &v3_manifest_bytes);
 

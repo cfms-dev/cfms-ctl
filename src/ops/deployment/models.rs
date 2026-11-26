@@ -40,11 +40,13 @@ pub const OPERATOR_OWNED_PREFIXES: &[&str] = &[
     "src/.maintenance/",
     "src/content/files/",
     "src/content/logs/",
+    "src/logs/",
 ];
 
 pub const PRESERVED_WORKSPACE_PREFIXES: &[&str] = &[
     "src/.maintenance/",
-    "src/content/",
+    "src/content/files/",
+    "src/content/logs/",
     "src/logs/",
     ".venv/",
 ];
