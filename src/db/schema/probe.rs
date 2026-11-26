@@ -392,22 +392,35 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let dacl_ops: Vec<String> = ast_vs_probe
-                .operations
-                .iter()
-                .map(|op| format!("{op:?}"))
-                .filter(|desc| {
-                    desc.contains("dacl_rules")
-                        || desc.contains("dacl_rule_clauses")
-                        || desc.contains("dacl_rule_atoms")
-                })
-                .collect();
             assert!(
-                dacl_ops.is_empty(),
-                "static AST vs probe drifted on CEP-0002 DACL tables: {dacl_ops:?}"
+                ast_vs_probe.operations.is_empty(),
+                "static AST vs probe drifted across core tables: {:?}",
+                ast_vs_probe.operations
+            );
+            assert!(
+                !ast_vs_probe
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("Primary key changed")),
+                "static AST vs probe had PK drift warnings: {:?}",
+                ast_vs_probe.warnings
             );
 
             let builtin = builtin_schema_ir(true);
+            let static_vs_builtin = diff_schemas(
+                &builtin,
+                &static_ir,
+                &DiffOptions {
+                    dialect: Some(DatabaseKind::Sqlite),
+                    include_extensions: false,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                static_vs_builtin.operations.is_empty(),
+                "static AST vs builtin drifted on SQLite: {:?}",
+                static_vs_builtin.operations
+            );
             let plan = diff_schemas(
                 &builtin,
                 &probe_ir,

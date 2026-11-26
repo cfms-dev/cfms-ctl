@@ -5,7 +5,6 @@ edition = "2024"
 description = "Standalone, high-performance, multi-database maintenance CLI for CFMS servers."
 license = "Apache-2.0"
 repository = "https://github.com/cfms-dev/cfms-ctl"
-homepage = "https://github.com/cfms-dev/cfms-ctl"
 
 [lib]
 name = "cfms_ctl"

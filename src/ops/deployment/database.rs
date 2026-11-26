@@ -12,8 +12,8 @@ use crate::db::backend::{DatabaseKind, DbPool};
 use crate::db::schema::probe::ExtractorMode;
 use crate::db::schema::{
     AlembicDirectoryAnalysis, AlembicDirection, HybridUpgradeOptions, SchemaDriftReport,
-    SchemaInspector, analyze_alembic_directory, builtin_schema_ir, execute_hybrid_upgrade,
-    extract_code_schema_ir, plan_hybrid_upgrade, run_alembic_revision,
+    SchemaInspector, UpgradeStrategy, analyze_alembic_directory, builtin_schema_ir,
+    execute_hybrid_upgrade, extract_code_schema_ir, plan_hybrid_upgrade, run_alembic_revision,
 };
 use crate::ops::AppContext;
 use crate::ops::backup::export::{BackupExportReport, export_pre_mutation_backup};
@@ -28,6 +28,7 @@ pub struct DatabaseUpgradePreflight {
     pub source_head: String,
     pub target_head: String,
     pub live_revision: String,
+    pub strategy: Option<UpgradeStrategy>,
     pub planned_sql_count: usize,
     pub dml_revisions: Vec<String>,
     pub warnings: Vec<String>,
@@ -174,6 +175,7 @@ pub async fn preflight_upgrade_database(
     }
 
     let mut warnings = Vec::new();
+    let mut strategy = None;
     let mut planned_sql_count = 0usize;
     let mut dml_revisions = Vec::new();
 
@@ -223,16 +225,30 @@ pub async fn preflight_upgrade_database(
             ..Default::default()
         };
         if let Ok(plan) = plan_hybrid_upgrade(&pool, Some(&staged_paths), &target_ir, &opts).await {
+            strategy = Some(plan.strategy);
             dml_revisions = plan
                 .dml_revisions
                 .iter()
                 .map(|(rev, _)| rev.clone())
                 .collect();
-            if let Some(diff) = plan.diff_plan {
-                planned_sql_count = diff.operations.len();
-            }
-            for f in &plan.risk_audit.findings {
-                warnings.push(format!("[{}] {}", f.level, f.summary));
+            if plan.strategy == UpgradeStrategy::DelegateAlembic {
+                // When data-DML scripts trigger Alembic delegation, native DDL diff ops
+                // will not be executed; surface only the Alembic-delegation notice.
+                for f in &plan.risk_audit.findings {
+                    if f.code == "CFMS-MIG-008" {
+                        warnings.push(format!(
+                            "[{}] {} (database upgrade will run via Alembic)",
+                            f.level, f.summary
+                        ));
+                    }
+                }
+            } else {
+                if let Some(diff) = plan.diff_plan {
+                    planned_sql_count = diff.operations.len();
+                }
+                for f in &plan.risk_audit.findings {
+                    warnings.push(format!("[{}] {}", f.level, f.summary));
+                }
             }
         }
     }
@@ -243,6 +259,7 @@ pub async fn preflight_upgrade_database(
         source_head,
         target_head,
         live_revision: live_rev,
+        strategy,
         planned_sql_count,
         dml_revisions,
         warnings,
@@ -454,17 +471,18 @@ pub async fn maybe_create_safety_backup(
 }
 
 /// Execute database upgrade after active code & `.venv` & `config.toml` are in place.
+/// Returns `(verified_revision, post_upgrade_warnings)`.
 pub async fn execute_deployment_db_upgrade(
     ctx: &AppContext,
     paths: &WorkspacePaths,
     expected_target_head: &str,
     allow_destructive: bool,
-) -> Result<String> {
+) -> Result<(String, Vec<String>)> {
     let pool = ctx.connect_db(paths).await?;
     let current = pool.current_revision().await?;
     if current.as_deref() == Some(expected_target_head) {
         pool.close().await;
-        return Ok(expected_target_head.to_string());
+        return Ok((expected_target_head.to_string(), Vec::new()));
     }
 
     let target_ir = extract_code_schema_ir(paths, ExtractorMode::Auto, None, None, true, true)
@@ -484,7 +502,7 @@ pub async fn execute_deployment_db_upgrade(
             "Database migration finished at revision '{verified_rev}' instead of expected head '{expected_target_head}'"
         )));
     }
-    Ok(verified_rev)
+    Ok((verified_rev, outcome.warnings))
 }
 
 /// Internal helper: execute Alembic downgrade against active target code ONLY when aborting an

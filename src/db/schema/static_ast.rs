@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use ruff_python_ast::{
-    self as ast, Expr, ModModule, Operator, Stmt, UnaryOp,
+    self as ast, CmpOp, Expr, ModModule, Operator, Stmt, UnaryOp,
 };
 use ruff_python_parser::parse_module;
 
@@ -515,7 +515,7 @@ pub fn extract_static_schema_ir(
         }
         let mut class_chain = Vec::new();
         let mut seen = BTreeSet::new();
-        resolve_mro(class_name, &classes, &mut seen, &mut class_chain);
+        resolve_mro(class_name, true, &classes, &mut seen, &mut class_chain);
 
         let (raw_cols, table_ir) = build_table_from_chain(
             tablename,
@@ -813,6 +813,7 @@ fn collect_enum_members(
 
 fn resolve_mro<'a>(
     class_name: &'a str,
+    is_root: bool,
     classes: &'a HashMap<String, ClassRecord>,
     seen: &mut BTreeSet<&'a str>,
     out: &mut Vec<&'a ClassRecord>,
@@ -823,8 +824,16 @@ fn resolve_mro<'a>(
     let Some(rec) = classes.get(class_name) else {
         return;
     };
+    // In SQLAlchemy joined-table inheritance, a concrete mapped base class
+    // (`__tablename__` set and not `__abstract__ = True`) owns its own table's
+    // columns and constraints; child tables do NOT duplicate them. Only unmapped
+    // mixins (`tablename.is_none()`) and abstract bases (`is_abstract`) flow into
+    // subclasses.
+    if !is_root && rec.tablename.is_some() && !rec.is_abstract {
+        return;
+    }
     for base in &rec.bases {
-        resolve_mro(base, classes, seen, out);
+        resolve_mro(base, false, classes, seen, out);
     }
     out.push(rec);
 }
@@ -1176,24 +1185,25 @@ fn parse_column_call(
         }
     }
     if is_pk {
-        pk_cols.push(col_name.clone());
+        if !pk_cols.contains(&col_name) {
+            pk_cols.push(col_name.clone());
+        }
         nullable = Some(false);
-    }
-    if unique_flag {
-        uniques.push(UniqueIr {
-            name: Some(format!("uq_{table_name}_{col_name}")),
-            dialect_names: BTreeMap::new(),
-            columns: vec![col_name.clone()],
-        });
     }
     if index_flag {
         indexes.push(IndexIr {
             name: format!("ix_{table_name}_{col_name}"),
             dialect_names: BTreeMap::new(),
-            unique: false,
+            unique: unique_flag,
             expressions: vec![col_name.clone()],
             dialect_clauses: BTreeMap::new(),
             where_clause: None,
+        });
+    } else if unique_flag {
+        uniques.push(UniqueIr {
+            name: Some(format!("uq_{table_name}_{col_name}")),
+            dialect_names: BTreeMap::new(),
+            columns: vec![col_name.clone()],
         });
     }
 
@@ -1563,7 +1573,9 @@ fn parse_table_args(
                     .arguments
                     .args
                     .first()
-                    .and_then(|e| eval_sql_template_expr(e, env))
+                    .and_then(|e| {
+                        eval_sql_template_expr(e, env).or_else(|| eval_sa_sql_expr(e, env))
+                    })
                     .unwrap_or_default();
                 let explicit_name = kwarg_expr(&call.arguments, "name").and_then(eval_string_expr);
                 if !sql_expr.is_empty() {
@@ -1763,6 +1775,190 @@ fn eval_sql_template_expr(expr: &Expr, env: &HashMap<String, StaticScalar>) -> O
             }
             Some(out)
         }
+        _ => None,
+    }
+}
+
+fn format_sql_scalar(scalar: &StaticScalar) -> String {
+    match scalar {
+        StaticScalar::Int(v) => v.to_string(),
+        StaticScalar::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        StaticScalar::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+    }
+}
+
+fn is_sql_or_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinOp(b) => matches!(b.op, Operator::BitOr),
+        Expr::Call(call) => expr_dotted_name(&call.func)
+            .is_some_and(|name| matches!(name.as_str(), "or_" | "sa.or_")),
+        _ => false,
+    }
+}
+
+fn eval_sa_sql_seq_items(expr: &Expr, env: &HashMap<String, StaticScalar>) -> Option<Vec<String>> {
+    let elts = match expr {
+        Expr::Tuple(t) => &t.elts,
+        Expr::List(l) => &l.elts,
+        Expr::Set(s) => &s.elts,
+        _ => return None,
+    };
+    elts.iter().map(|e| eval_sa_sql_expr(e, env)).collect()
+}
+
+/// Translate SQLAlchemy Core column/boolean expressions (e.g. `(id == ROOT_ID) & parent_id.is_(None)`)
+/// into SQL predicate strings for static `CheckConstraint` extraction.
+fn eval_sa_sql_expr(expr: &Expr, env: &HashMap<String, StaticScalar>) -> Option<String> {
+    if let Some(scalar) = eval_scalar(expr, env) {
+        return Some(format_sql_scalar(&scalar));
+    }
+    match expr {
+        Expr::NoneLiteral(_) => Some("NULL".to_string()),
+        Expr::BinOp(b) => {
+            let left = eval_sa_sql_expr(&b.left, env)?;
+            let right = eval_sa_sql_expr(&b.right, env)?;
+            match b.op {
+                Operator::BitOr => Some(format!("{left} OR {right}")),
+                Operator::BitAnd => {
+                    let l_sql = if is_sql_or_expr(&b.left) {
+                        format!("({left})")
+                    } else {
+                        left
+                    };
+                    let r_sql = if is_sql_or_expr(&b.right) {
+                        format!("({right})")
+                    } else {
+                        right
+                    };
+                    Some(format!("{l_sql} AND {r_sql}"))
+                }
+                Operator::Add => Some(format!("{left} + {right}")),
+                Operator::Sub => Some(format!("{left} - {right}")),
+                Operator::Mult => Some(format!("{left} * {right}")),
+                Operator::Div => Some(format!("{left} / {right}")),
+                _ => None,
+            }
+        }
+        Expr::UnaryOp(u) if matches!(u.op, UnaryOp::Invert | UnaryOp::Not) => {
+            let inner = eval_sa_sql_expr(&u.operand, env)?;
+            Some(format!("NOT ({inner})"))
+        }
+        Expr::Compare(cmp) if cmp.ops.len() == 1 && cmp.operands.len() == 2 => {
+            let left = eval_sa_sql_expr(&cmp.operands[0], env)?;
+            let rhs_expr = &cmp.operands[1];
+            let rhs_is_none = matches!(rhs_expr, Expr::NoneLiteral(_));
+            let right = eval_sa_sql_expr(rhs_expr, env)?;
+            match cmp.ops[0] {
+                CmpOp::Eq => Some(if rhs_is_none {
+                    format!("{left} IS NULL")
+                } else {
+                    format!("{left} = {right}")
+                }),
+                CmpOp::NotEq => Some(if rhs_is_none {
+                    format!("{left} IS NOT NULL")
+                } else {
+                    format!("{left} != {right}")
+                }),
+                CmpOp::Is => Some(if rhs_is_none {
+                    format!("{left} IS NULL")
+                } else {
+                    format!("{left} IS {right}")
+                }),
+                CmpOp::IsNot => Some(if rhs_is_none {
+                    format!("{left} IS NOT NULL")
+                } else {
+                    format!("{left} IS NOT {right}")
+                }),
+                CmpOp::Lt => Some(format!("{left} < {right}")),
+                CmpOp::LtE => Some(format!("{left} <= {right}")),
+                CmpOp::Gt => Some(format!("{left} > {right}")),
+                CmpOp::GtE => Some(format!("{left} >= {right}")),
+                _ => None,
+            }
+        }
+        Expr::Call(call) => {
+            if let Expr::Attribute(attr) = call.func.as_ref()
+                && call.arguments.args.len() == 1
+                && call.arguments.keywords.is_empty()
+            {
+                let arg0 = &call.arguments.args[0];
+                match attr.attr.as_str() {
+                    "is_" => {
+                        let obj = eval_sa_sql_expr(&attr.value, env)?;
+                        return if matches!(arg0, Expr::NoneLiteral(_)) {
+                            Some(format!("{obj} IS NULL"))
+                        } else {
+                            let val = eval_sa_sql_expr(arg0, env)?;
+                            Some(format!("{obj} IS {val}"))
+                        };
+                    }
+                    "is_not" | "isnot" => {
+                        let obj = eval_sa_sql_expr(&attr.value, env)?;
+                        return if matches!(arg0, Expr::NoneLiteral(_)) {
+                            Some(format!("{obj} IS NOT NULL"))
+                        } else {
+                            let val = eval_sa_sql_expr(arg0, env)?;
+                            Some(format!("{obj} IS NOT {val}"))
+                        };
+                    }
+                    "in_" => {
+                        let obj = eval_sa_sql_expr(&attr.value, env)?;
+                        let items = eval_sa_sql_seq_items(arg0, env)?;
+                        return Some(format!("{obj} IN ({})", items.join(", ")));
+                    }
+                    "not_in" | "notin_" => {
+                        let obj = eval_sa_sql_expr(&attr.value, env)?;
+                        let items = eval_sa_sql_seq_items(arg0, env)?;
+                        return Some(format!("{obj} NOT IN ({})", items.join(", ")));
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(dotted) = expr_dotted_name(&call.func) {
+                match dotted.as_str() {
+                    "and_" | "sa.and_" => {
+                        let mut parts = Vec::with_capacity(call.arguments.args.len());
+                        for arg in &call.arguments.args {
+                            let rendered = eval_sa_sql_expr(arg, env)?;
+                            if is_sql_or_expr(arg) {
+                                parts.push(format!("({rendered})"));
+                            } else {
+                                parts.push(rendered);
+                            }
+                        }
+                        return (!parts.is_empty()).then(|| parts.join(" AND "));
+                    }
+                    "or_" | "sa.or_" => {
+                        let parts = call
+                            .arguments
+                            .args
+                            .iter()
+                            .map(|arg| eval_sa_sql_expr(arg, env))
+                            .collect::<Option<Vec<_>>>()?;
+                        return (!parts.is_empty()).then(|| parts.join(" OR "));
+                    }
+                    "not_" | "sa.not_" if call.arguments.args.len() == 1 => {
+                        let inner = eval_sa_sql_expr(&call.arguments.args[0], env)?;
+                        return Some(format!("NOT ({inner})"));
+                    }
+                    _ => {
+                        if let Some(fn_name) = dotted.strip_prefix("func.") {
+                            let args = call
+                                .arguments
+                                .args
+                                .iter()
+                                .map(|arg| eval_sa_sql_expr(arg, env))
+                                .collect::<Option<Vec<_>>>()?;
+                            return Some(format!("{fn_name}({})", args.join(", ")));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Expr::Name(n) => Some(n.id.to_string()),
+        Expr::Attribute(a) => Some(a.attr.to_string()),
         _ => None,
     }
 }
@@ -2002,5 +2198,102 @@ class DynTable(DynMixin, Base):
         assert_eq!(pending.pending_revisions, vec!["rev2".to_string()]);
         assert!(pending.has_data_dml);
         assert_eq!(pending.dml_revisions[0].0, "rev2");
+    }
+
+    #[test]
+    fn static_ast_handles_joined_inheritance_unique_index_and_expr_check() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let src = root.join("src");
+        let cfg_dir = src.join("include").join("config");
+        let models_dir = src.join("include").join("database").join("models");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir config");
+        std::fs::create_dir_all(&models_dir).expect("mkdir models");
+        std::fs::write(src.join("main.py"), "# entry").expect("write main.py");
+        std::fs::write(cfg_dir.join("constants.py"), "ROOT_DIRECTORY_ID = '/'\n").expect("constants");
+
+        std::fs::write(
+            models_dir.join("hierarchy.py"),
+            r#"
+from enum import StrEnum
+from sqlalchemy import VARCHAR, CheckConstraint, Double, ForeignKey, String, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
+
+class NodeType(StrEnum):
+    DOCUMENT = "document"
+    DIRECTORY = "directory"
+
+class Node(Base):
+    __tablename__ = "nodes"
+    id: Mapped[str] = mapped_column(VARCHAR(255), primary_key=True)
+    type: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(VARCHAR(255), nullable=False, index=True)
+    parent_id: Mapped[str | None] = mapped_column(VARCHAR(255), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            ((id == ROOT_DIRECTORY_ID) & parent_id.is_(None) & (type == NodeType.DIRECTORY.value))
+            | ((id != ROOT_DIRECTORY_ID) & parent_id.is_not(None)),
+            name="ck_nodes_root_parent",
+        ),
+        UniqueConstraint("parent_id", "name", name="uq_nodes_parent_name"),
+    )
+
+class Folder(Node):
+    __tablename__ = "folders"
+    id: Mapped[str] = mapped_column(VARCHAR(255), ForeignKey("nodes.id", ondelete="CASCADE"), primary_key=True)
+    created_time: Mapped[float] = mapped_column(Double, nullable=False)
+
+class Document(Node):
+    __tablename__ = "documents"
+    id: Mapped[str] = mapped_column(VARCHAR(255), ForeignKey("nodes.id", ondelete="CASCADE"), primary_key=True)
+    created_time: Mapped[float] = mapped_column(Double, nullable=False)
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(256), unique=True, nullable=False, index=True)
+    token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+"#,
+        )
+        .expect("write hierarchy.py");
+
+        let paths = WorkspacePaths::discover(Some(&src), None).expect("discover");
+        let ir = extract_static_schema_ir(&paths, false).expect("extract");
+
+        let folders = &ir.tables["folders"];
+        assert_eq!(
+            folders.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["id", "created_time"]
+        );
+        assert_eq!(folders.primary_key.columns, vec!["id"]);
+        assert!(folders.uniques.is_empty());
+        assert!(folders.checks.is_empty());
+        assert_eq!(folders.foreign_keys.len(), 1);
+        assert_eq!(folders.foreign_keys[0].ref_table, "nodes");
+
+        let docs = &ir.tables["documents"];
+        assert_eq!(
+            docs.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["id", "created_time"]
+        );
+        assert_eq!(docs.primary_key.columns, vec!["id"]);
+        assert!(docs.uniques.is_empty());
+        assert!(docs.checks.is_empty());
+
+        let nodes = &ir.tables["nodes"];
+        assert_eq!(nodes.checks.len(), 1);
+        assert_eq!(nodes.checks[0].name.as_deref(), Some("ck_nodes_root_parent"));
+        assert_eq!(
+            nodes.checks[0].expression,
+            "id = '/' AND parent_id IS NULL AND type = 'directory' OR id != '/' AND parent_id IS NOT NULL"
+        );
+
+        let users = &ir.tables["users"];
+        assert_eq!(users.indexes.len(), 1);
+        assert_eq!(users.indexes[0].name, "ix_users_username");
+        assert!(users.indexes[0].unique);
+        assert_eq!(users.uniques.len(), 1);
+        assert_eq!(users.uniques[0].name.as_deref(), Some("uq_users_token"));
     }
 }

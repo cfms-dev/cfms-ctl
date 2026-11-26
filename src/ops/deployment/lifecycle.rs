@@ -25,7 +25,7 @@ use crate::ops::extension::version::{
 };
 use crate::ui::{OutputFormat, confirm_or_abort};
 
-use super::archive::{stage_release_archive, verify_staged_release_tree};
+use super::archive::{stage_release_archive_with_source, verify_staged_release_tree};
 use super::database::{
     ResumeDbClassification, analyze_release_alembic, capture_sqlite_upgrade_checkpoint,
     diagnose_resume_database, execute_deployment_db_upgrade, initialize_fresh_database,
@@ -347,19 +347,22 @@ pub async fn run_check_with_config(
 /// Stage, verify, migrate, and atomically activate a local archive upgrade.
 pub async fn handle_upgrade(ctx: &AppContext, args: DeploymentUpgradeArgs) -> Result<()> {
     let paths = ctx.resolve_paths()?;
-    run_upgrade_flow(
+    let report = run_upgrade_flow(
         ctx,
         &paths,
         "upgrade",
         &args.package,
         &args.checksum,
+        None,
         &args.env,
         &args.backup,
         args.allow_destructive,
         args.dry_run,
         Vec::new(),
     )
-    .await
+    .await?;
+    ctx.ui.render(&report);
+    Ok(())
 }
 
 /// Download and activate an official GitHub release when newer or pinned.
@@ -374,6 +377,16 @@ pub async fn run_update_with_config(
     args: DeploymentUpdateArgs,
     cfg: &OnlineClientConfig,
 ) -> Result<()> {
+    let report = execute_update_with_config(ctx, args, cfg).await?;
+    ctx.ui.render(&report);
+    Ok(())
+}
+
+async fn execute_update_with_config(
+    ctx: &AppContext,
+    args: DeploymentUpdateArgs,
+    cfg: &OnlineClientConfig,
+) -> Result<DeploymentMutationReport> {
     let paths = ctx.resolve_paths()?;
     validate_workspace_layout(&paths, true)?;
     let _pre_lock = if args.dry_run {
@@ -392,7 +405,7 @@ pub async fn run_update_with_config(
     .await?;
 
     if !check.update_available {
-        let report = DeploymentMutationReport {
+        return Ok(DeploymentMutationReport {
             operation: "update".to_string(),
             dry_run: args.dry_run,
             outcome: "up-to-date".to_string(),
@@ -413,9 +426,7 @@ pub async fn run_update_with_config(
             backup_generated_key: None,
             warnings: check.warnings,
             next_steps: Vec::new(),
-        };
-        ctx.ui.render(&report);
-        return Ok(());
+        });
     }
 
     let resolved =
@@ -427,6 +438,7 @@ pub async fn run_update_with_config(
         sha256: Some(downloaded.sha256.clone()),
         checksums: None,
     };
+    let checksum_source = downloaded.checksum_source_label();
 
     // Release `_pre_lock` cleanly right before `run_upgrade_flow` acquires its own RAII lock.
     drop(_pre_lock);
@@ -436,6 +448,7 @@ pub async fn run_update_with_config(
         "update",
         &downloaded.package_path,
         &checksum,
+        Some(&checksum_source),
         &args.env,
         &args.backup,
         args.allow_destructive,
@@ -452,12 +465,13 @@ async fn run_upgrade_flow(
     op_label: &str,
     package_path: &Path,
     checksum: &LocalChecksumArgs,
+    checksum_source_override: Option<&str>,
     env_args: &crate::cli::deployment::DeploymentEnvArgs,
     backup_args: &crate::cli::deployment::SafetyBackupArgs,
     allow_destructive: bool,
     dry_run: bool,
     mut warnings: Vec<String>,
-) -> Result<()> {
+) -> Result<DeploymentMutationReport> {
     validate_workspace_layout(paths, true)?;
     let _lock = if dry_run {
         None
@@ -495,9 +509,10 @@ async fn run_upgrade_flow(
     }
 
     let staging_parent = (!dry_run).then(|| staging_dir(paths));
-    let staged = stage_release_archive(
+    let staged = stage_release_archive_with_source(
         package_path,
         checksum.sha256.as_deref(),
+        checksum_source_override,
         checksum.checksums.as_deref(),
         staging_parent.as_deref(),
     )?;
@@ -522,7 +537,7 @@ async fn run_upgrade_flow(
 
     let db_pre =
         preflight_upgrade_database(ctx, paths, &staged.extracted_dir, allow_destructive).await?;
-    warnings.extend(db_pre.warnings);
+    let preflight_warnings = db_pre.warnings;
 
     let delta = compute_delta_counts(Some(&source_manifest.manifest), &staged.manifest.manifest);
     let base_template_doc = paths
@@ -538,7 +553,13 @@ async fn run_upgrade_flow(
     validate_target_manifest_paths(Some(&source_manifest), &staged.manifest)?;
 
     if dry_run {
-        let report = DeploymentMutationReport {
+        let mut preview_warnings = warnings;
+        for w in preflight_warnings {
+            if !preview_warnings.contains(&w) {
+                preview_warnings.push(w);
+            }
+        }
+        return Ok(DeploymentMutationReport {
             operation: op_label.to_string(),
             dry_run: true,
             outcome: "ready".to_string(),
@@ -557,13 +578,17 @@ async fn run_upgrade_flow(
             db_revision_after: Some(db_pre.target_head),
             backup_archive_path: None,
             backup_generated_key: None,
-            warnings,
+            warnings: preview_warnings,
             next_steps: vec![
                 "Re-run without `--dry-run` to execute the upgrade".to_string(),
             ],
-        };
-        ctx.ui.render(&report);
-        return Ok(());
+        });
+    }
+
+    // Surface preflight advisories (such as SQLite non-transactional DDL / `--backup`
+    // recommendations and pending migration notices) BEFORE asking for confirmation.
+    for w in &preflight_warnings {
+        ctx.ui.print_warning(w);
     }
 
     ensure_confirmed(
@@ -691,7 +716,7 @@ async fn run_upgrade_flow(
     tx.step_history.push("environment-and-config-synced".to_string());
     save_transaction(paths, &tx)?;
 
-    let db_rev_after = match execute_deployment_db_upgrade(
+    let (db_rev_after, db_warnings) = match execute_deployment_db_upgrade(
         ctx,
         paths,
         &db_pre.target_head,
@@ -699,7 +724,7 @@ async fn run_upgrade_flow(
     )
     .await
     {
-        Ok(rev) => rev,
+        Ok(res) => res,
         Err(err) => {
             // Preserve intermediate DB recovery state; only undo in-flight DB changes when
             // the operator explicitly aborts via `cfms-ctl deployment resume --rollback`.
@@ -712,6 +737,11 @@ async fn run_upgrade_flow(
             )));
         }
     };
+    for w in db_warnings {
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
 
     save_settings(
         paths,
@@ -730,7 +760,7 @@ async fn run_upgrade_flow(
     let staged_checksum = staged.checksum.clone();
     drop(staged);
 
-    let report = DeploymentMutationReport {
+    Ok(DeploymentMutationReport {
         operation: op_label.to_string(),
         dry_run: false,
         outcome: "upgraded".to_string(),
@@ -751,9 +781,7 @@ async fn run_upgrade_flow(
         backup_generated_key: safety_bak.and_then(|b| b.generated_key),
         warnings,
         next_steps: Vec::new(),
-    };
-    ctx.ui.render(&report);
-    Ok(())
+    })
 }
 
 /// Inspect, continue forward, or explicitly roll back an interrupted deployment transaction (`transaction.json`).
@@ -921,7 +949,14 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                 )
                 .await
                 {
-                    Ok(rev) => rev,
+                    Ok((rev, db_warnings)) => {
+                        for w in db_warnings {
+                            if !warnings.contains(&w) {
+                                warnings.push(w);
+                            }
+                        }
+                        rev
+                    }
                     Err(err) => {
                         tx.phase = TransactionPhase::DatabaseRecoveryRequired;
                         tx.last_error = Some(err.to_string());
@@ -1045,7 +1080,14 @@ pub async fn handle_resume(ctx: &AppContext, args: DeploymentResumeArgs) -> Resu
                     )
                     .await
                     {
-                        Ok(rev) => rev,
+                        Ok((rev, db_warnings)) => {
+                            for w in db_warnings {
+                                if !warnings.contains(&w) {
+                                    warnings.push(w);
+                                }
+                            }
+                            rev
+                        }
                         Err(err) => {
                             tx.phase = TransactionPhase::DatabaseRecoveryRequired;
                             tx.last_error = Some(err.to_string());
@@ -1313,7 +1355,7 @@ pub async fn handle_install(ctx: &AppContext, args: DeploymentInstallArgs) -> Re
 
     let mut warnings = Vec::new();
     let _downloaded_holder;
-    let (pkg_path, csum_args) = if args.from_github {
+    let (pkg_path, csum_args, csum_source) = if args.from_github {
         let resolved = fetch_and_resolve_release(&args.online, args.require_github_digest).await?;
         warnings.extend(resolved.warnings.clone());
         _downloaded_holder = download_verified_github_release(resolved, ctx.ui.format()).await?;
@@ -1323,6 +1365,7 @@ pub async fn handle_install(ctx: &AppContext, args: DeploymentInstallArgs) -> Re
                 sha256: Some(_downloaded_holder.sha256.clone()),
                 checksums: None,
             },
+            Some(_downloaded_holder.checksum_source_label()),
         )
     } else {
         (
@@ -1330,12 +1373,14 @@ pub async fn handle_install(ctx: &AppContext, args: DeploymentInstallArgs) -> Re
                 CfmsError::InvalidArgument("Pass a local package path or `--from-github`".to_string())
             })?,
             args.checksum.clone(),
+            None,
         )
     };
 
-    let staged = stage_release_archive(
+    let staged = stage_release_archive_with_source(
         &pkg_path,
         csum_args.sha256.as_deref(),
+        csum_source.as_deref(),
         csum_args.checksums.as_deref(),
         None,
     )?;
@@ -1516,7 +1561,7 @@ pub async fn handle_adopt(ctx: &AppContext, args: DeploymentAdoptArgs) -> Result
 
     let mut warnings = Vec::new();
     let _dl_guard;
-    let (pkg_path, csum_args) = if args.from_github {
+    let (pkg_path, csum_args, csum_source) = if args.from_github {
         let resolved = fetch_and_resolve_release(&args.online, args.require_github_digest).await?;
         warnings.extend(resolved.warnings.clone());
         _dl_guard = download_verified_github_release(resolved, ctx.ui.format()).await?;
@@ -1526,6 +1571,7 @@ pub async fn handle_adopt(ctx: &AppContext, args: DeploymentAdoptArgs) -> Result
                 sha256: Some(_dl_guard.sha256.clone()),
                 checksums: None,
             },
+            Some(_dl_guard.checksum_source_label()),
         )
     } else {
         (
@@ -1533,12 +1579,14 @@ pub async fn handle_adopt(ctx: &AppContext, args: DeploymentAdoptArgs) -> Result
                 CfmsError::InvalidArgument("Pass a reference package path or `--from-github`".to_string())
             })?,
             args.checksum.clone(),
+            None,
         )
     };
 
-    let staged = stage_release_archive(
+    let staged = stage_release_archive_with_source(
         &pkg_path,
         csum_args.sha256.as_deref(),
+        csum_source.as_deref(),
         csum_args.checksums.as_deref(),
         None,
     )?;
@@ -3207,7 +3255,7 @@ client_id = "cfms-web"
         .await
         .unwrap();
 
-        run_update_with_config(
+        let update_report = execute_update_with_config(
             &ctx,
             DeploymentUpdateArgs {
                 online: OnlineReleaseArgs {
@@ -3227,6 +3275,24 @@ client_id = "cfms-web"
         )
         .await
         .unwrap();
+        let csum = update_report
+            .checksum
+            .as_ref()
+            .expect("online update report must include checksum info");
+        assert!(
+            csum.source.starts_with("github:cfms-dev/cfms_on_websocket@v0.15.0"),
+            "unexpected online checksum source: {}",
+            csum.source
+        );
+        assert_ne!(csum.source, "cli:--sha256");
+        assert!(
+            !update_report
+                .warnings
+                .iter()
+                .any(|w| w.contains("will be captured")),
+            "completed upgrade summary must not repeat future-tense preflight advice: {:?}",
+            update_report.warnings
+        );
 
         let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
         assert_eq!(
@@ -3239,7 +3305,7 @@ client_id = "cfms-web"
         assert!(deploy.join("src").join("online_updated.py").is_file());
 
         // Second `update` reports already up-to-date.
-        run_update_with_config(
+        let up_to_date_report = execute_update_with_config(
             &ctx,
             DeploymentUpdateArgs {
                 online: OnlineReleaseArgs {
@@ -3259,6 +3325,8 @@ client_id = "cfms-web"
         )
         .await
         .unwrap();
+        assert_eq!(up_to_date_report.outcome, "up-to-date");
+        assert!(up_to_date_report.checksum.is_none());
 
         // Requesting an older version via `--version` is rejected (downgrades prohibited).
         let down_err = run_check_with_config(
@@ -3308,4 +3376,102 @@ client_id = "cfms-web"
             .expect("diagnostic status must still succeed without detectable server version");
     }
 
+    #[tokio::test]
+    async fn preflight_delegates_alembic_dml_without_false_ddl_findings_and_dry_run_surfaces_advisories() {
+        let tmp = TempDir::new().unwrap();
+        let v1_pkg = tmp.path().join("cfms-0.14.0.tar.gz");
+        let (v1_files, v1_mb) = build_release_bundle_map(
+            "0.14.0",
+            &[("e952c02c1454", None)],
+            &base_config_template(""),
+            &[],
+        );
+        write_release_targz(&v1_pkg, "", &v1_files, &v1_mb);
+
+        let deploy = tmp.path().join("preflight-deploy");
+        install_fixture_release(&deploy, &v1_pkg, true).await;
+        let paths = WorkspacePaths::discover(Some(&deploy), None).unwrap();
+        let ctx = test_ctx(&deploy);
+        let db = ctx.connect_db(&paths).await.unwrap();
+        create_head_schema(&db, false).await.unwrap();
+        set_alembic_version(&db, "e952c02c1454").await.unwrap();
+        db.close().await;
+
+        let v2_pkg = tmp.path().join("cfms-0.15.0.zip");
+        let (mut v2_files, mut v2_mb) = build_release_bundle_map(
+            "0.15.0",
+            &[("e952c02c1454", None)],
+            &base_config_template(""),
+            &[],
+        );
+        let dml_script = b"revision = 'a66108639ed7'\ndown_revision = 'e952c02c1454'\nfrom alembic import op\n\ndef upgrade():\n    bind = op.get_bind()\n    bind.execute('SELECT 1')\n\ndef downgrade():\n    pass\n";
+        v2_files.insert(
+            "src/alembic/versions/01_a66108639ed7.py".to_string(),
+            dml_script.to_vec(),
+        );
+        // Add a dummy model whose column would trigger CFMS-MIG-003 if native DDL ran,
+        // confirming DelegateAlembic suppresses unused native-DDL diff findings.
+        v2_files.insert(
+            "src/include/database/models/extra.py".to_string(),
+            b"from sqlalchemy import String\nfrom sqlalchemy.orm import Mapped, mapped_column\nclass ExtraDoc(Base):\n    __tablename__ = 'documents'\n    extra_req: Mapped[str] = mapped_column(String(64), nullable=False)\n".to_vec(),
+        );
+        let mut manifest: ReleaseManifest = serde_json::from_slice(&v2_mb).unwrap();
+        for (rel, bytes) in &v2_files {
+            manifest.files.insert(rel.clone(), sha256_hex(bytes));
+        }
+        v2_mb = serde_json::to_vec_pretty(&manifest).unwrap();
+        write_release_zip(&v2_pkg, "cfms-0.15.0", &v2_files, &v2_mb);
+
+        let staged = stage_release_archive_with_source(&v2_pkg, None, None, None, None).unwrap();
+        let pre = preflight_upgrade_database(&ctx, &paths, &staged.extracted_dir, false)
+            .await
+            .unwrap();
+        assert_eq!(pre.strategy, Some(crate::db::schema::UpgradeStrategy::DelegateAlembic));
+        assert!(
+            pre.warnings
+                .iter()
+                .any(|w| w.contains("SQLite DDL/batch rebuilds are non-transactional")),
+            "expected SQLite checkpoint advisory: {:?}",
+            pre.warnings
+        );
+        assert!(
+            pre.warnings
+                .iter()
+                .any(|w| w.contains("will run via Alembic")),
+            "expected Alembic delegation notice: {:?}",
+            pre.warnings
+        );
+        assert!(
+            !pre.warnings.iter().any(|w| w.contains("extra_req")),
+            "unused native-DDL diff finding must not leak under DelegateAlembic: {:?}",
+            pre.warnings
+        );
+
+        let dry_report = run_upgrade_flow(
+            &ctx,
+            &paths,
+            "upgrade",
+            &v2_pkg,
+            &LocalChecksumArgs::default(),
+            None,
+            &DeploymentEnvArgs {
+                skip_env: true,
+                ..Default::default()
+            },
+            &SafetyBackupArgs::default(),
+            false,
+            true,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            dry_report
+                .warnings
+                .iter()
+                .any(|w| w.contains("will be captured")),
+            "dry-run report should preserve preflight advisory: {:?}",
+            dry_report.warnings
+        );
+    }
 }

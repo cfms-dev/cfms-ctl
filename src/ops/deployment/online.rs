@@ -59,6 +59,24 @@ pub struct DownloadedGitHubPackage {
     _temp_dir: TempDir,
 }
 
+impl DownloadedGitHubPackage {
+    /// Human-readable checksum provenance label for GitHub-downloaded release bundles.
+    #[must_use]
+    pub fn checksum_source_label(&self) -> String {
+        if self.release.asset.digest_sha256.is_some() {
+            format!(
+                "github:{}@{} (SHA256SUMS.txt + asset digest)",
+                self.release.repository, self.release.tag_name
+            )
+        } else {
+            format!(
+                "github:{}@{} (SHA256SUMS.txt)",
+                self.release.repository, self.release.tag_name
+            )
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ApiRelease {
     tag_name: String,

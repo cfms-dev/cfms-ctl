@@ -144,6 +144,17 @@ pub fn verify_package_checksum(
     explicit_sha256: Option<&str>,
     explicit_checksums: Option<&Path>,
 ) -> Result<ChecksumVerificationInfo> {
+    verify_package_checksum_with_source(package_path, explicit_sha256, None, explicit_checksums)
+}
+
+/// Variant of [`verify_package_checksum`] allowing callers (such as online GitHub updates) to
+/// supply a custom provenance label when passing an already-verified explicit SHA-256 digest.
+pub fn verify_package_checksum_with_source(
+    package_path: &Path,
+    explicit_sha256: Option<&str>,
+    explicit_sha256_source: Option<&str>,
+    explicit_checksums: Option<&Path>,
+) -> Result<ChecksumVerificationInfo> {
     let meta = fs::symlink_metadata(package_path)?;
     if is_symlink_or_reparse_point(&meta) || !meta.is_file() {
         return Err(CfmsError::ArchiveIntegrity(format!(
@@ -181,7 +192,7 @@ pub fn verify_package_checksum(
         return Ok(ChecksumVerificationInfo {
             package_sha256: actual_sha256,
             package_bytes,
-            source: "cli:--sha256".to_string(),
+            source: explicit_sha256_source.unwrap_or("cli:--sha256").to_string(),
             verified_against_external: true,
         });
     }
@@ -267,7 +278,29 @@ pub fn stage_release_archive(
     explicit_checksums: Option<&Path>,
     staging_parent: Option<&Path>,
 ) -> Result<StagedRelease> {
-    let checksum = verify_package_checksum(package_path, explicit_sha256, explicit_checksums)?;
+    stage_release_archive_with_source(
+        package_path,
+        explicit_sha256,
+        None,
+        explicit_checksums,
+        staging_parent,
+    )
+}
+
+/// Variant of [`stage_release_archive`] allowing callers to supply a custom checksum source label.
+pub fn stage_release_archive_with_source(
+    package_path: &Path,
+    explicit_sha256: Option<&str>,
+    explicit_sha256_source: Option<&str>,
+    explicit_checksums: Option<&Path>,
+    staging_parent: Option<&Path>,
+) -> Result<StagedRelease> {
+    let checksum = verify_package_checksum_with_source(
+        package_path,
+        explicit_sha256,
+        explicit_sha256_source,
+        explicit_checksums,
+    )?;
 
     let (temp_guard, extracted_dir) = if let Some(parent) = staging_parent {
         fs::create_dir_all(parent)?;
