@@ -319,11 +319,10 @@ pub fn is_preserved_workspace_path(
         }
     }
     if let Some(rest) = rel_posix.strip_prefix("src/include/extensions/")
-        && let Some(ext_id) = rest.split('/').next()
+        && let Some((ext_id, _subpath)) = rest.split_once('/')
         && !ext_id.is_empty()
         && !ext_id.starts_with('.')
-        && ext_id != "__pycache__"
-        && ext_id != "__init__.py"
+        && !ext_id.starts_with('_')
         && !managed_extensions.contains(ext_id)
     {
         return true;
@@ -463,8 +462,20 @@ pub(crate) mod tests {
         assert!(is_preserved_workspace_path("src/config.toml", &managed));
         assert!(is_preserved_workspace_path("src/config.toml.backup-2026", &managed));
         assert!(is_preserved_workspace_path("src/include/extensions/custom_ext/_extension.py", &managed));
+        assert!(is_preserved_workspace_path("src/include/extensions/custom_ext/manifest.toml", &managed));
         assert!(!is_preserved_workspace_path("src/include/extensions/oidc_sso/_extension.py", &managed));
         assert!(!is_preserved_workspace_path("src/include/extensions/builtin/_extension.py", &managed));
+        for framework_module in [
+            "src/include/extensions/__init__.py",
+            "src/include/extensions/data.py",
+            "src/include/extensions/identifiers.py",
+            "src/include/extensions/manager.py",
+        ] {
+            assert!(
+                !is_preserved_workspace_path(framework_module, &managed),
+                "expected framework module {framework_module} not to be preserved"
+            );
+        }
     }
 
     #[test]

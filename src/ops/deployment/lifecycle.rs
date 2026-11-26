@@ -53,7 +53,7 @@ use super::repository::{
     remove_stored_release_dir, requirements_lock_path, resolve_stored_release,
     restore_snapshot_config, rollback_swap_journal, save_settings, save_transaction,
     snapshot_active_release, staging_dir, sync_persisted_requirements_lock, tx_root_dir,
-    versions_dir,
+    validate_target_manifest_paths, versions_dir,
 };
 
 fn ensure_confirmed(ctx: &AppContext, prompt: &str, dry_run: bool) -> Result<()> {
@@ -534,6 +534,8 @@ async fn run_upgrade_flow(
     let (config_changed, _, cfg_warnings) =
         preview_or_apply_config_merge(paths, base_template_doc.as_ref(), &staged_template, false)?;
     warnings.extend(cfg_warnings);
+
+    validate_target_manifest_paths(Some(&source_manifest), &staged.manifest)?;
 
     if dry_run {
         let report = DeploymentMutationReport {
@@ -2060,6 +2062,9 @@ mod tests {
                 ("src/legacy_only.py", b"# will be removed on upgrade\n"),
                 ("src/content/hello", b"hello v1\n"),
                 ("src/content/ssl/client/01234567.0", b"ca-bundle-v1\n"),
+                ("src/include/extensions/data.py", b"# ext data v1\n"),
+                ("src/include/extensions/identifiers.py", b"# ext ids v1\n"),
+                ("src/include/extensions/manager.py", b"# ext mgr v1\n"),
             ],
         );
         write_release_targz(&v1_pkg, "cfms-0.14.0", &v1_files, &v1_manifest_bytes);
@@ -2099,6 +2104,9 @@ mod tests {
                 ("src/new_feature.py", b"NEW = True\n"),
                 ("src/content/hello", b"hello v2\n"),
                 ("src/content/ssl/client/01234567.0", b"ca-bundle-v2\n"),
+                ("src/include/extensions/data.py", b"# ext data v2\n"),
+                ("src/include/extensions/identifiers.py", b"# ext ids v2\n"),
+                ("src/include/extensions/manager.py", b"# ext mgr v2\n"),
             ],
         );
         write_release_zip(&v2_pkg, "cfms-0.15.0", &v2_files, &v2_manifest_bytes);
@@ -2176,6 +2184,18 @@ mod tests {
             fs::read(deploy.join("src/content/ssl/client/01234567.0")).unwrap(),
             b"ca-bundle-v2\n"
         );
+        assert_eq!(
+            fs::read(deploy.join("src/include/extensions/data.py")).unwrap(),
+            b"# ext data v2\n"
+        );
+        assert_eq!(
+            fs::read(deploy.join("src/include/extensions/identifiers.py")).unwrap(),
+            b"# ext ids v2\n"
+        );
+        assert_eq!(
+            fs::read(deploy.join("src/include/extensions/manager.py")).unwrap(),
+            b"# ext mgr v2\n"
+        );
         assert_eq!(fs::read(&content_upload).unwrap(), b"operator-binary-payload");
         assert_eq!(fs::read(&content_log).unwrap(), b"operator-log-line\n");
         assert_eq!(fs::read(&server_key).unwrap(), b"operator-private-key\n");
@@ -2196,6 +2216,9 @@ mod tests {
                 ("src/new_feature.py", b"NEW = 2\n"),
                 ("src/content/hello", b"hello v2\n"),
                 ("src/content/ssl/client/01234567.0", b"ca-bundle-v2\n"),
+                ("src/include/extensions/data.py", b"# ext data v2\n"),
+                ("src/include/extensions/identifiers.py", b"# ext ids v2\n"),
+                ("src/include/extensions/manager.py", b"# ext mgr v2\n"),
             ],
         );
         write_release_zip(&v3_pkg, "cfms-0.15.1", &v3_files, &v3_manifest_bytes);

@@ -756,20 +756,11 @@ pub fn compute_delta_counts(
     }
 }
 
-/// Atomically replace/update files in `paths.project_root` from `target_tree` while recording every
-/// overwritten/removed/added path in `journal_dir` so any subsequent failure can roll back cleanly.
-pub fn apply_swap_with_journal(
-    paths: &WorkspacePaths,
+fn combined_managed_extensions(
     source_manifest: Option<&ValidatedManifest>,
-    target_tree: &Path,
     target_manifest: &ValidatedManifest,
-    journal_dir: &Path,
-) -> Result<DeltaSwapCounts> {
-    fs::create_dir_all(journal_dir)?;
-    let backup_dir = journal_dir.join("backup");
-    fs::create_dir_all(&backup_dir)?;
-
-    let managed: BTreeSet<String> = target_manifest
+) -> BTreeSet<String> {
+    target_manifest
         .manifest
         .managed_extensions
         .iter()
@@ -780,7 +771,40 @@ pub fn apply_swap_with_journal(
                 .into_iter()
                 .flatten(),
         )
-        .collect();
+        .collect()
+}
+
+/// Verify that no file declared in `target_manifest` targets a preserved operator or third-party workspace path.
+pub fn validate_target_manifest_paths(
+    source_manifest: Option<&ValidatedManifest>,
+    target_manifest: &ValidatedManifest,
+) -> Result<()> {
+    let managed = combined_managed_extensions(source_manifest, target_manifest);
+    for rel_posix in target_manifest.manifest.files.keys() {
+        if is_preserved_workspace_path(rel_posix, &managed) {
+            return Err(CfmsError::ArchiveIntegrity(format!(
+                "Target release attempts to overwrite protected workspace path '{rel_posix}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Atomically replace/update files in `paths.project_root` from `target_tree` while recording every
+/// overwritten/removed/added path in `journal_dir` so any subsequent failure can roll back cleanly.
+pub fn apply_swap_with_journal(
+    paths: &WorkspacePaths,
+    source_manifest: Option<&ValidatedManifest>,
+    target_tree: &Path,
+    target_manifest: &ValidatedManifest,
+    journal_dir: &Path,
+) -> Result<DeltaSwapCounts> {
+    validate_target_manifest_paths(source_manifest, target_manifest)?;
+    fs::create_dir_all(journal_dir)?;
+    let backup_dir = journal_dir.join("backup");
+    fs::create_dir_all(&backup_dir)?;
+
+    let managed = combined_managed_extensions(source_manifest, target_manifest);
 
     let mut added_files = Vec::new();
     let mut backed_up_files = Vec::new();
@@ -814,11 +838,6 @@ pub fn apply_swap_with_journal(
     // Determine which files differ or are new.
     let mut files_to_write = Vec::new();
     for (rel_posix, target_hash) in &target_manifest.manifest.files {
-        if is_preserved_workspace_path(rel_posix, &managed) {
-            return Err(CfmsError::ArchiveIntegrity(format!(
-                "Target release attempts to overwrite protected workspace path '{rel_posix}'"
-            )));
-        }
         let dest = paths.project_root.join(rel_posix);
         if dest.exists() {
             let meta = fs::symlink_metadata(&dest)?;
