@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- git-cliff: end of header -->
 
+## [0.5.1] - 2026-11-26
+
+### Fixed
+
+- Update release asset management and enhance manifest validation for operator-owned paths; fix incorrect rejection of overriding the `content/hello` template file
+
+**Full Changelog**: https://github.com/cfms-dev/cfms-ctl/compare/v0.5.0..v0.5.1
+
 ## [0.5.0] - 2026-11-25
 
 ### Added
