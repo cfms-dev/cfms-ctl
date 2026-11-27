@@ -431,6 +431,7 @@ struct RawColumn {
     nullable: Option<bool>,
     is_pk: bool,
     autoincrement: Option<bool>,
+    has_python_default: bool,
     server_default: Option<ServerDefaultIr>,
     computed: Option<ComputedColumnIr>,
     comment: Option<String>,
@@ -553,7 +554,9 @@ pub fn extract_static_schema_ir(
 
             let is_single_pk = pk_count == 1 && rc.is_pk;
             let autoinc = is_single_pk
-                && rc.autoincrement.unwrap_or_else(|| rc.fk_ref.is_none())
+                && rc.autoincrement.unwrap_or_else(|| {
+                    rc.fk_ref.is_none() && !rc.has_python_default && rc.server_default.is_none()
+                })
                 && ty.is_integer_like();
 
             if autoinc {
@@ -1119,6 +1122,7 @@ fn parse_column_call(
     let mut nullable: Option<bool> = None;
     let mut is_pk = false;
     let mut autoincrement: Option<bool> = None;
+    let mut has_python_default = false;
     let mut server_default: Option<ServerDefaultIr> = None;
     let mut computed: Option<ComputedColumnIr> = None;
     let mut comment: Option<String> = None;
@@ -1165,6 +1169,9 @@ fn parse_column_call(
                 }
                 "nullable" => nullable = eval_bool_expr(&kw.value),
                 "autoincrement" => autoincrement = eval_bool_expr(&kw.value),
+                "default" => {
+                    has_python_default = !matches!(&kw.value, Expr::NoneLiteral(_));
+                }
                 "unique" => unique_flag = eval_bool_expr(&kw.value).unwrap_or(false),
                 "index" => index_flag = eval_bool_expr(&kw.value).unwrap_or(false),
                 "comment" => comment = eval_string_expr(&kw.value),
@@ -1216,6 +1223,7 @@ fn parse_column_call(
         nullable,
         is_pk,
         autoincrement,
+        has_python_default,
         server_default,
         computed,
         comment,
@@ -2295,5 +2303,36 @@ class User(Base):
         assert!(users.indexes[0].unique);
         assert_eq!(users.uniques.len(), 1);
         assert_eq!(users.uniques[0].name.as_deref(), Some("uq_users_token"));
+    }
+
+    #[test]
+    fn static_ast_does_not_mark_integer_pk_with_default_as_serial() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let src = root.join("src");
+        let models_dir = src.join("include").join("database").join("models");
+        std::fs::create_dir_all(&models_dir).expect("mkdir models");
+        std::fs::write(src.join("main.py"), "# entry").expect("write main.py");
+
+        std::fs::write(
+            models_dir.join("scheduling.py"),
+            r#"
+from sqlalchemy import Integer, VARCHAR
+from sqlalchemy.orm import Mapped, mapped_column
+
+class SchedulingRuntimeState(Base):
+    __tablename__ = "scheduling_runtime_state"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    provider: Mapped[str] = mapped_column(VARCHAR(16), nullable=False)
+"#,
+        )
+        .expect("write scheduling.py");
+
+        let paths = WorkspacePaths::discover(Some(&src), None).expect("discover");
+        let ir = extract_static_schema_ir(&paths, false).expect("extract");
+        let tbl = &ir.tables["scheduling_runtime_state"];
+        let id_col = tbl.column("id").expect("id col");
+        assert_eq!(id_col.canonical_type, CanonicalType::Integer);
+        assert!(!id_col.autoincrement);
     }
 }

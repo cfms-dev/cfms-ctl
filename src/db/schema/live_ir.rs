@@ -623,7 +623,7 @@ async fn introspect_mysql(pool: &sqlx::MySqlPool) -> Result<BTreeMap<String, Tab
                 table.checks.push(CheckIr {
                     name: Some(cname),
                     dialect_names: BTreeMap::new(),
-                    expression: clause,
+                    expression: unescape_mysql_check_clause(&clause),
                     dialect_expressions: BTreeMap::new(),
                 });
             }
@@ -663,7 +663,8 @@ async fn introspect_mysql(pool: &sqlx::MySqlPool) -> Result<BTreeMap<String, Tab
                 .uniques
                 .iter()
                 .any(|u| u.name.as_deref() == Some(idx_name.as_str()));
-            if !backs_unique {
+            let backs_fk = is_mysql_implicit_fk_index(table, &idx_name, unique, &exprs);
+            if !backs_unique && !backs_fk {
                 table.indexes.push(IndexIr {
                     name: idx_name,
                     dialect_names: BTreeMap::new(),
@@ -677,6 +678,44 @@ async fn introspect_mysql(pool: &sqlx::MySqlPool) -> Result<BTreeMap<String, Tab
     }
 
     Ok(tables)
+}
+
+/// Unescape MySQL `information_schema.check_constraints.check_clause` backslash escapes (`\'` and `\\`).
+fn unescape_mysql_check_clause(clause: &str) -> String {
+    let mut out = String::with_capacity(clause.len());
+    let mut chars = clause.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek().copied() {
+                Some('\'') => {
+                    chars.next();
+                    out.push('\'');
+                }
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                _ => out.push(ch),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Return `true` when `idx_name` is an InnoDB implicit index created solely to back a foreign key.
+fn is_mysql_implicit_fk_index(
+    table: &TableIr,
+    idx_name: &str,
+    unique: bool,
+    exprs: &[String],
+) -> bool {
+    !unique
+        && table
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.name.as_deref() == Some(idx_name) && fk.columns == exprs)
 }
 
 async fn introspect_postgres(pool: &sqlx::PgPool) -> Result<BTreeMap<String, TableIr>> {
@@ -1196,5 +1235,76 @@ mod tests {
             .iter()
             .any(|idx| idx.name == "ix_nodes_parent_status_lower_name_id"
                 && idx.expressions == vec!["parent_id", "status", "lower(name)", "id"]));
+    }
+
+    #[test]
+    fn mysql_check_clause_unescapes_single_quotes_and_backslashes() {
+        let raw = r"(`predicate_kind` in (_utf8mb4\'user\',_utf8mb4\'group\',_utf8mb4\'perm\'))";
+        assert_eq!(
+            unescape_mysql_check_clause(raw),
+            "(`predicate_kind` in (_utf8mb4'user',_utf8mb4'group',_utf8mb4'perm'))"
+        );
+
+        let root_raw = r"(((`id` = _utf8mb4\'/\') and (`parent_id` is null) and (`type` = _utf8mb4\'directory\')) or ((`id` <> _utf8mb4\'/\') and (`parent_id` is not null)))";
+        assert_eq!(
+            unescape_mysql_check_clause(root_raw),
+            "(((`id` = _utf8mb4'/') and (`parent_id` is null) and (`type` = _utf8mb4'directory')) or ((`id` <> _utf8mb4'/') and (`parent_id` is not null)))"
+        );
+
+        let escaped_slash = r"(`path` <> _utf8mb4\'a\\b\')";
+        assert_eq!(
+            unescape_mysql_check_clause(escaped_slash),
+            r"(`path` <> _utf8mb4'a\b')"
+        );
+    }
+
+    #[test]
+    fn mysql_implicit_fk_index_detection_filters_only_fk_backing_indexes() {
+        let table = TableIr {
+            name: "audit_entries".to_string(),
+            ownership: TableOwnership::Core,
+            columns: Vec::new(),
+            primary_key: PrimaryKeyIr::default(),
+            foreign_keys: vec![ForeignKeyIr {
+                name: Some("fk_audit_entries_user_id_users".to_string()),
+                dialect_names: BTreeMap::new(),
+                columns: vec!["user_id".to_string()],
+                ref_table: "users".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: None,
+                on_update: None,
+                defer_on_create: false,
+            }],
+            uniques: Vec::new(),
+            checks: Vec::new(),
+            indexes: Vec::new(),
+            comment: None,
+            confidence: ConfidenceLevel::High,
+        };
+
+        assert!(is_mysql_implicit_fk_index(
+            &table,
+            "fk_audit_entries_user_id_users",
+            false,
+            &["user_id".to_string()],
+        ));
+        assert!(!is_mysql_implicit_fk_index(
+            &table,
+            "ix_audit_entries_user_id",
+            false,
+            &["user_id".to_string()],
+        ));
+        assert!(!is_mysql_implicit_fk_index(
+            &table,
+            "fk_audit_entries_user_id_users",
+            true,
+            &["user_id".to_string()],
+        ));
+        assert!(!is_mysql_implicit_fk_index(
+            &table,
+            "fk_audit_entries_user_id_users",
+            false,
+            &["other_col".to_string()],
+        ));
     }
 }

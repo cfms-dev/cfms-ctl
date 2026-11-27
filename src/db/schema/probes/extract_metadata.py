@@ -144,8 +144,18 @@ def _map_canonical_type(
     is_autoinc = False
     if is_single_pk and isinstance(base_type, sa.Integer):
         auto_val = col.autoincrement
-        if auto_val is True or (auto_val == "auto" and not col.foreign_keys):
+        table = getattr(col, "table", None)
+        if auto_val is True:
             is_autoinc = True
+        elif auto_val == "auto":
+            if table is not None:
+                is_autoinc = getattr(table, "_autoincrement_column", None) is col
+            else:
+                is_autoinc = (
+                    not col.foreign_keys
+                    and col.default is None
+                    and col.server_default is None
+                )
 
     def _compile_upper(d_name: str) -> str:
         return str(col_type.compile(dialect=dialects[d_name])).strip().upper()

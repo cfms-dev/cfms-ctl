@@ -659,7 +659,7 @@ fn diff_single_table(
         }
     }
 
-    // Unique Constraints
+    // Unique Constraints & Indexes
     let old_uniques: Vec<UniqueIr> = old_table
         .uniques
         .iter()
@@ -668,17 +668,30 @@ fn diff_single_table(
             ..u.clone()
         })
         .collect();
+    let old_indexes: Vec<IndexIr> = old_table
+        .indexes
+        .iter()
+        .map(|idx| IndexIr {
+            expressions: substitute_col_list(&idx.expressions, &rename_col_map),
+            ..idx.clone()
+        })
+        .collect();
+    let is_mysql = opts.dialect == Some(DatabaseKind::Mysql);
+    let uq_touches_dropped =
+        |uq: &UniqueIr| uq.columns.iter().any(|c| dropped_col_set.contains(c.as_str()));
+    let idx_touches_dropped =
+        |idx: &IndexIr| idx.expressions.iter().any(|e| dropped_col_set.contains(e.trim()));
+
     for old_uq in &old_uniques {
-        let touches_dropped = old_uq
-            .columns
+        let kept = new_table
+            .uniques
             .iter()
-            .any(|c| dropped_col_set.contains(c.as_str()));
-        if touches_dropped
-            || !new_table
-                .uniques
-                .iter()
-                .any(|nu| nu.columns == old_uq.columns)
-        {
+            .any(|nu| nu.columns == old_uq.columns)
+            || (is_mysql
+                && new_table.indexes.iter().any(|ni| {
+                    plain_unique_index_columns(ni).as_deref() == Some(old_uq.columns.as_slice())
+                }));
+        if uq_touches_dropped(old_uq) || !kept {
             pre_ops.push(SchemaOp::DropUnique {
                 table: new_table.name.clone(),
                 unique: old_uq.clone(),
@@ -686,7 +699,16 @@ fn diff_single_table(
         }
     }
     for new_uq in &new_table.uniques {
-        if !old_uniques.iter().any(|ou| ou.columns == new_uq.columns) {
+        let existed = old_uniques
+            .iter()
+            .any(|ou| !uq_touches_dropped(ou) && ou.columns == new_uq.columns)
+            || (is_mysql
+                && old_indexes.iter().any(|oi| {
+                    !idx_touches_dropped(oi)
+                        && plain_unique_index_columns(oi).as_deref()
+                            == Some(new_uq.columns.as_slice())
+                }));
+        if !existed {
             post_ops.push(SchemaOp::AddUnique {
                 table: new_table.name.clone(),
                 unique: new_uq.clone(),
@@ -723,14 +745,6 @@ fn diff_single_table(
     }
 
     // Indexes
-    let old_indexes: Vec<IndexIr> = old_table
-        .indexes
-        .iter()
-        .map(|idx| IndexIr {
-            expressions: substitute_col_list(&idx.expressions, &rename_col_map),
-            ..idx.clone()
-        })
-        .collect();
     let idx_sig = |idx: &IndexIr| {
         (
             idx.unique,
@@ -743,11 +757,11 @@ fn diff_single_table(
     };
     for old_idx in &old_indexes {
         let sig = idx_sig(old_idx);
-        let touches_dropped = old_idx
-            .expressions
-            .iter()
-            .any(|e| dropped_col_set.contains(e.trim()));
-        if touches_dropped || !new_table.indexes.iter().any(|ni| idx_sig(ni) == sig) {
+        let kept = new_table.indexes.iter().any(|ni| idx_sig(ni) == sig)
+            || (is_mysql
+                && plain_unique_index_columns(old_idx)
+                    .is_some_and(|cols| new_table.uniques.iter().any(|nu| nu.columns == cols)));
+        if idx_touches_dropped(old_idx) || !kept {
             pre_ops.push(SchemaOp::DropIndex {
                 table: new_table.name.clone(),
                 index: old_idx.clone(),
@@ -756,7 +770,16 @@ fn diff_single_table(
     }
     for new_idx in &new_table.indexes {
         let sig = idx_sig(new_idx);
-        if !old_indexes.iter().any(|oi| idx_sig(oi) == sig) {
+        let existed = old_indexes
+            .iter()
+            .any(|oi| !idx_touches_dropped(oi) && idx_sig(oi) == sig)
+            || (is_mysql
+                && plain_unique_index_columns(new_idx).is_some_and(|cols| {
+                    old_uniques
+                        .iter()
+                        .any(|ou| !uq_touches_dropped(ou) && ou.columns == cols)
+                }));
+        if !existed {
             post_ops.push(SchemaOp::CreateIndex {
                 table: new_table.name.clone(),
                 index: new_idx.clone(),
@@ -877,23 +900,450 @@ fn computed_semantic_eq(a: &ColumnIr, b: &ColumnIr) -> bool {
     }
 }
 
-fn normalize_sql_expr(expr: &str) -> String {
-    let collapsed = expr
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace('`', "");
-    let trimmed = collapsed.trim();
-    if let Some(inner) = trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-        return inner.trim().to_ascii_lowercase();
+fn plain_unique_index_columns(idx: &IndexIr) -> Option<Vec<String>> {
+    if !idx.unique || idx.where_clause.is_some() || idx.expressions.is_empty() {
+        return None;
     }
-    trimmed.to_ascii_lowercase()
+    let mut cols = Vec::with_capacity(idx.expressions.len());
+    for expr in &idx.expressions {
+        let cleaned = expr.trim().trim_matches('`').trim_matches('"');
+        if cleaned.is_empty()
+            || !cleaned
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return None;
+        }
+        cols.push(cleaned.to_string());
+    }
+    Some(cols)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SqlToken {
+    Word(String),
+    StringLit(String),
+    Number(String),
+    Op(String),
+    LParen,
+    RParen,
+    Comma,
+}
+
+fn is_mysql_charset_introducer(word: &str) -> bool {
+    word.starts_with('_')
+        && word.len() > 1
+        && word[1..]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn is_sql_keyword_before_paren(word: &str) -> bool {
+    matches!(
+        word,
+        "and"
+            | "or"
+            | "not"
+            | "case"
+            | "when"
+            | "then"
+            | "else"
+            | "end"
+            | "is"
+            | "in"
+            | "like"
+            | "ilike"
+            | "between"
+            | "where"
+            | "check"
+    )
+}
+
+fn tokenize_sql_expr(expr: &str) -> Vec<SqlToken> {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        match ch {
+            '(' => {
+                tokens.push(SqlToken::LParen);
+                i += 1;
+            }
+            ')' => {
+                tokens.push(SqlToken::RParen);
+                i += 1;
+            }
+            ',' => {
+                tokens.push(SqlToken::Comma);
+                i += 1;
+            }
+            '\'' => {
+                i += 1;
+                let mut lit = String::new();
+                while i < chars.len() {
+                    if chars[i] == '\'' {
+                        if chars.get(i + 1) == Some(&'\'') {
+                            lit.push('\'');
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else if chars[i] == '\\' && i + 1 < chars.len() {
+                        match chars[i + 1] {
+                            '\'' => {
+                                lit.push('\'');
+                                i += 2;
+                            }
+                            '\\' => {
+                                lit.push('\\');
+                                i += 2;
+                            }
+                            other => {
+                                lit.push('\\');
+                                lit.push(other);
+                                i += 2;
+                            }
+                        }
+                    } else {
+                        lit.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                if matches!(tokens.last(), Some(SqlToken::Word(w)) if is_mysql_charset_introducer(w)) {
+                    tokens.pop();
+                }
+                tokens.push(SqlToken::StringLit(lit));
+            }
+            '\\' if chars.get(i + 1) == Some(&'\'') => {
+                // Handle raw MySQL CHECK_CLAUSE `\'...\'` string delimiters if not pre-unescaped.
+                i += 2;
+                let mut lit = String::new();
+                while i < chars.len() {
+                    if chars[i] == '\\' && chars.get(i + 1) == Some(&'\'') {
+                        i += 2;
+                        break;
+                    } else if chars[i] == '\\' && chars.get(i + 1) == Some(&'\\') {
+                        lit.push('\\');
+                        i += 2;
+                    } else if chars[i] == '\'' && chars.get(i + 1) == Some(&'\'') {
+                        lit.push('\'');
+                        i += 2;
+                    } else {
+                        lit.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                if matches!(tokens.last(), Some(SqlToken::Word(w)) if is_mysql_charset_introducer(w)) {
+                    tokens.pop();
+                }
+                tokens.push(SqlToken::StringLit(lit));
+            }
+            '`' | '"' => {
+                let quote = ch;
+                i += 1;
+                let mut ident = String::new();
+                while i < chars.len() {
+                    if chars[i] == quote {
+                        if chars.get(i + 1) == Some(&quote) {
+                            ident.push(quote);
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        ident.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                tokens.push(SqlToken::Word(ident.to_ascii_lowercase()));
+            }
+            '!' if chars.get(i + 1) == Some(&'=') => {
+                tokens.push(SqlToken::Op("!=".to_string()));
+                i += 2;
+            }
+            '<' if chars.get(i + 1) == Some(&'>') => {
+                tokens.push(SqlToken::Op("!=".to_string()));
+                i += 2;
+            }
+            '<' if chars.get(i + 1) == Some(&'=') => {
+                tokens.push(SqlToken::Op("<=".to_string()));
+                i += 2;
+            }
+            '>' if chars.get(i + 1) == Some(&'=') => {
+                tokens.push(SqlToken::Op(">=".to_string()));
+                i += 2;
+            }
+            ':' if chars.get(i + 1) == Some(&':') => {
+                tokens.push(SqlToken::Op("::".to_string()));
+                i += 2;
+            }
+            '=' | '<' | '>' | '+' | '-' | '*' | '/' | '%' | '.' => {
+                tokens.push(SqlToken::Op(ch.to_string()));
+                i += 1;
+            }
+            c if c.is_ascii_digit() => {
+                let start = i;
+                i += 1;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if chars.get(i) == Some(&'.')
+                    && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit())
+                {
+                    i += 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                let num: String = chars[start..i].iter().collect();
+                tokens.push(SqlToken::Number(num));
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                i += 1;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                tokens.push(SqlToken::Word(word.to_ascii_lowercase()));
+            }
+            _ => {
+                tokens.push(SqlToken::Op(ch.to_string()));
+                i += 1;
+            }
+        }
+    }
+    tokens
+}
+
+fn is_non_grouping_lparen(tokens: &[SqlToken], lparen_idx: usize) -> bool {
+    let Some(prev) = lparen_idx.checked_sub(1).and_then(|idx| tokens.get(idx)) else {
+        return false;
+    };
+    match prev {
+        SqlToken::Word(w) => w == "in" || !is_sql_keyword_before_paren(w),
+        _ => false,
+    }
+}
+
+fn find_matching_rparen(tokens: &[SqlToken], lparen_idx: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, tok) in tokens.iter().enumerate().skip(lparen_idx) {
+        match tok {
+            SqlToken::LParen => depth += 1,
+            SqlToken::RParen => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn has_top_level_comma(inner: &[SqlToken]) -> bool {
+    let mut depth = 0usize;
+    for tok in inner {
+        match tok {
+            SqlToken::LParen => depth += 1,
+            SqlToken::RParen => depth = depth.saturating_sub(1),
+            SqlToken::Comma if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn lowest_top_level_prec(inner: &[SqlToken]) -> u8 {
+    let mut depth = 0usize;
+    let mut case_depth = 0usize;
+    let mut min_prec = 10u8;
+
+    for (idx, tok) in inner.iter().enumerate() {
+        match tok {
+            SqlToken::LParen => depth += 1,
+            SqlToken::RParen => depth = depth.saturating_sub(1),
+            SqlToken::Word(w) if depth == 0 && w == "case" => case_depth += 1,
+            SqlToken::Word(w) if depth == 0 && w == "end" => {
+                case_depth = case_depth.saturating_sub(1);
+            }
+            _ if depth == 0 && case_depth == 0 => match tok {
+                SqlToken::Word(w) => {
+                    let prec = match w.as_str() {
+                        "or" => 1,
+                        "and" => 2,
+                        "not" => {
+                            let after_is = matches!(
+                                idx.checked_sub(1).and_then(|k| inner.get(k)),
+                                Some(SqlToken::Word(p)) if p == "is"
+                            );
+                            let before_cmp = matches!(
+                                inner.get(idx + 1),
+                                Some(SqlToken::Word(n))
+                                    if matches!(n.as_str(), "in" | "like" | "ilike" | "between")
+                            );
+                            if after_is || before_cmp { 4 } else { 3 }
+                        }
+                        "is" | "in" | "like" | "ilike" | "between" => 4,
+                        _ => 10,
+                    };
+                    min_prec = min_prec.min(prec);
+                }
+                SqlToken::Op(op) => {
+                    let prec = match op.as_str() {
+                        "=" | "!=" | "<" | "<=" | ">" | ">=" => 4,
+                        "+" | "-" => {
+                            let is_unary = match idx.checked_sub(1).and_then(|k| inner.get(k)) {
+                                None
+                                | Some(SqlToken::LParen | SqlToken::Comma | SqlToken::Op(_)) => true,
+                                Some(SqlToken::Word(w)) => is_sql_keyword_before_paren(w),
+                                _ => false,
+                            };
+                            if is_unary { 7 } else { 5 }
+                        }
+                        "*" | "/" | "%" => 6,
+                        _ => 10,
+                    };
+                    min_prec = min_prec.min(prec);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    min_prec
+}
+
+fn left_required_prec(prev: Option<&SqlToken>) -> u8 {
+    match prev {
+        None | Some(SqlToken::LParen | SqlToken::Comma) => 0,
+        Some(SqlToken::Word(w)) => match w.as_str() {
+            "case" | "when" | "then" | "else" | "where" | "check" => 0,
+            "or" => 1,
+            "and" => 2,
+            "not" => 10,
+            "is" | "in" | "like" | "ilike" | "between" => 5,
+            _ => 10,
+        },
+        Some(SqlToken::Op(op)) => match op.as_str() {
+            "+" => 5,
+            "-" | "*" | "/" | "%" => 10,
+            "=" | "!=" | "<" | "<=" | ">" | ">=" => 5,
+            _ => 10,
+        },
+        Some(SqlToken::RParen | SqlToken::StringLit(_) | SqlToken::Number(_)) => 10,
+    }
+}
+
+fn right_required_prec(next: Option<&SqlToken>) -> u8 {
+    match next {
+        None | Some(SqlToken::RParen | SqlToken::Comma) => 0,
+        Some(SqlToken::Word(w)) => match w.as_str() {
+            "when" | "then" | "else" | "end" => 0,
+            "or" => 1,
+            "and" => 2,
+            "not" | "is" | "in" | "like" | "ilike" | "between" => 5,
+            _ => 10,
+        },
+        Some(SqlToken::Op(op)) => match op.as_str() {
+            "+" | "-" => 5,
+            "*" | "/" | "%" => 10,
+            "=" | "!=" | "<" | "<=" | ">" | ">=" => 5,
+            _ => 10,
+        },
+        Some(SqlToken::LParen | SqlToken::StringLit(_) | SqlToken::Number(_)) => 10,
+    }
+}
+
+fn remove_redundant_parens(tokens: &mut Vec<SqlToken>) {
+    loop {
+        let mut removed = false;
+        for i in 0..tokens.len() {
+            if tokens[i] != SqlToken::LParen || is_non_grouping_lparen(tokens, i) {
+                continue;
+            }
+            let Some(j) = find_matching_rparen(tokens, i) else {
+                continue;
+            };
+            if j <= i + 1 {
+                continue;
+            }
+            let inner = &tokens[i + 1..j];
+            if has_top_level_comma(inner) {
+                continue;
+            }
+            let min_prec = lowest_top_level_prec(inner);
+            let left_req = left_required_prec(i.checked_sub(1).and_then(|k| tokens.get(k)));
+            let right_req = right_required_prec(tokens.get(j + 1));
+            if min_prec >= left_req.max(right_req) {
+                tokens.remove(j);
+                tokens.remove(i);
+                removed = true;
+                break;
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
+}
+
+fn render_sql_tokens(tokens: &[SqlToken]) -> String {
+    let mut out = String::new();
+    for (idx, tok) in tokens.iter().enumerate() {
+        if idx > 0 {
+            let prev = &tokens[idx - 1];
+            let no_space = matches!(prev, SqlToken::LParen)
+                || matches!(tok, SqlToken::RParen | SqlToken::Comma)
+                || matches!(prev, SqlToken::Op(o) if o == ".")
+                || matches!(tok, SqlToken::Op(o) if o == "." || o == "::")
+                || matches!(prev, SqlToken::Op(o) if o == "::")
+                || matches!(
+                    (prev, tok),
+                    (SqlToken::Word(w), SqlToken::LParen) if !is_sql_keyword_before_paren(w)
+                );
+            if !no_space {
+                out.push(' ');
+            }
+        }
+        match tok {
+            SqlToken::Word(w) | SqlToken::Number(w) | SqlToken::Op(w) => out.push_str(w),
+            SqlToken::StringLit(s) => {
+                out.push('\'');
+                out.push_str(&s.replace('\'', "''"));
+                out.push('\'');
+            }
+            SqlToken::LParen => out.push('('),
+            SqlToken::RParen => out.push(')'),
+            SqlToken::Comma => out.push(','),
+        }
+    }
+    out
+}
+
+fn normalize_sql_expr(expr: &str) -> String {
+    let mut tokens = tokenize_sql_expr(expr);
+    remove_redundant_parens(&mut tokens);
+    render_sql_tokens(&tokens)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::schema::ddl::builtin_schema_ir;
+    use crate::db::schema::ir::{
+        CanonicalType, ConfidenceLevel, ExtractionSource, PrimaryKeyIr,
+    };
 
     #[test]
     fn identical_builtin_schemas_produce_empty_diff() {
@@ -901,6 +1351,183 @@ mod tests {
         let b = builtin_schema_ir(true);
         let plan = diff_schemas(&a, &b, &DiffOptions::default());
         assert!(plan.is_empty(), "ops: {:?}", plan.operations);
+    }
+
+    #[test]
+    fn normalize_sql_expr_matches_mysql_check_and_generated_expressions() {
+        let pairs = [
+            (
+                r"(`predicate_kind` in (_utf8mb4\'user\',_utf8mb4\'group\',_utf8mb4\'perm\'))",
+                "predicate_kind IN ('user', 'group', 'perm')",
+            ),
+            (
+                "(`effect` in (_utf8mb4'allow',_utf8mb4'deny'))",
+                "effect IN ('allow', 'deny')",
+            ),
+            (
+                "((`valid_from` is null) or (`valid_until` is null) or (`valid_from` < `valid_until`))",
+                "valid_from IS NULL OR valid_until IS NULL OR valid_from < valid_until",
+            ),
+            (
+                "(`phase` in (0,1))",
+                "phase IN (0, 1)",
+            ),
+            (
+                "(`status` in (0,1,2,3,4))",
+                "status IN (0, 1, 2, 3, 4)",
+            ),
+            (
+                r"(((`id` = _utf8mb4\'/\') and (`parent_id` is null) and (`type` = _utf8mb4\'directory\')) or ((`id` <> _utf8mb4\'/\') and (`parent_id` is not null)))",
+                "id = '/' AND parent_id IS NULL AND type = 'directory' OR id != '/' AND parent_id IS NOT NULL",
+            ),
+            (
+                "(length(`secret_key`) > 0)",
+                "length(secret_key) > 0",
+            ),
+            (
+                "(case when (`status` = 1) then NULL else `name` end)",
+                "CASE WHEN status = 1 THEN NULL ELSE name END",
+            ),
+            (
+                "(lower(`name`))",
+                "lower(name)",
+            ),
+        ];
+
+        for (mysql_expr, code_expr) in pairs {
+            assert_eq!(
+                normalize_sql_expr(mysql_expr),
+                normalize_sql_expr(code_expr),
+                "mismatch for {mysql_expr} vs {code_expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_sql_expr_preserves_precedence_and_string_case() {
+        assert_ne!(
+            normalize_sql_expr("(a = 1 OR b = 2) AND c = 3"),
+            normalize_sql_expr("a = 1 OR b = 2 AND c = 3")
+        );
+        assert_ne!(
+            normalize_sql_expr("a - (b + c)"),
+            normalize_sql_expr("a - b + c")
+        );
+        assert_ne!(
+            normalize_sql_expr("NOT (a = 1 OR b = 2)"),
+            normalize_sql_expr("NOT a = 1 OR b = 2")
+        );
+        assert_ne!(
+            normalize_sql_expr("status = 'Active'"),
+            normalize_sql_expr("status = 'active'")
+        );
+    }
+
+    #[test]
+    fn mysql_live_unique_key_matches_code_unique_index_and_detects_real_drops() {
+        let mut live = builtin_schema_ir(false);
+        let mut code = builtin_schema_ir(false);
+
+        // Simulate MySQL introspection: ix_users_username appears in `uniques`, not `indexes`.
+        let live_users = live.tables.get_mut("users").unwrap();
+        live_users.indexes.retain(|i| i.name != "ix_users_username");
+        live_users.uniques.push(UniqueIr {
+            name: Some("ix_users_username".to_string()),
+            dialect_names: BTreeMap::new(),
+            columns: vec!["username".to_string()],
+        });
+
+        let mysql_opts = DiffOptions {
+            dialect: Some(DatabaseKind::Mysql),
+            coalesce_sqlite_rebuilds: true,
+            include_extensions: false,
+            compare_comments: false,
+            ..DiffOptions::default()
+        };
+        let plan = diff_schemas(&live, &code, &mysql_opts);
+        assert!(plan.is_empty(), "expected no ops, got: {:?}", plan.operations);
+
+        // If code removes the unique index, diff must still emit DropUnique.
+        code.tables
+            .get_mut("users")
+            .unwrap()
+            .indexes
+            .retain(|i| i.name != "ix_users_username");
+        let drop_plan = diff_schemas(&live, &code, &mysql_opts);
+        assert!(
+            drop_plan
+                .operations
+                .iter()
+                .any(|op| matches!(op, SchemaOp::DropUnique { table, unique } if table == "users" && unique.columns == ["username"])),
+            "expected DropUnique when removed from code, got: {:?}",
+            drop_plan.operations
+        );
+    }
+
+    #[test]
+    fn mysql_live_snapshot_against_builtin_produces_zero_false_positives() {
+        let code = builtin_schema_ir(false);
+        let mut live = code.clone();
+        live.source = ExtractionSource::LiveDatabase;
+
+        // Apply MySQL-specific reflection artifacts on representative tables.
+        if let Some(users) = live.tables.get_mut("users") {
+            users.indexes.retain(|i| i.name != "ix_users_username");
+            users.uniques.push(UniqueIr {
+                name: Some("ix_users_username".to_string()),
+                dialect_names: BTreeMap::new(),
+                columns: vec!["username".to_string()],
+            });
+            users.checks[0].expression = "(length(`secret_key`) > 0)".to_string();
+        }
+        if let Some(nodes) = live.tables.get_mut("nodes") {
+            if let Some(col) = nodes.columns.iter_mut().find(|c| c.name == "active_name")
+                && let Some(comp) = &mut col.computed
+            {
+                comp.expression = "(case when (`status` = 1) then NULL else `name` end)".to_string();
+            }
+            nodes.checks[0].expression = "(((`id` = _utf8mb4'/') and (`parent_id` is null) and (`type` = _utf8mb4'directory')) or ((`id` <> _utf8mb4'/') and (`parent_id` is not null)))".to_string();
+        }
+        if let Some(dacl_rules) = live.tables.get_mut("dacl_rules") {
+            for ck in &mut dacl_rules.checks {
+                match ck.name.as_deref() {
+                    Some("ck_dacl_rules_effect") => {
+                        ck.expression = "(`effect` in (_utf8mb4'allow',_utf8mb4'deny'))".to_string();
+                    }
+                    Some("ck_dacl_rules_scope") => {
+                        ck.expression = "(`scope` in (_utf8mb4'self',_utf8mb4'dirs',_utf8mb4'docs',_utf8mb4'all'))".to_string();
+                    }
+                    Some("ck_dacl_rules_valid_window") => {
+                        ck.expression = "((`valid_from` is null) or (`valid_until` is null) or (`valid_from` < `valid_until`))".to_string();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(sched_rt) = live.tables.get_mut("scheduling_runtime_state") {
+            let id_col = sched_rt.columns.iter_mut().find(|c| c.name == "id").unwrap();
+            id_col.canonical_type = CanonicalType::Integer;
+            id_col.autoincrement = false;
+            sched_rt.primary_key = PrimaryKeyIr {
+                name: Some("pk_scheduling_runtime_state".to_string()),
+                dialect_names: BTreeMap::new(),
+                columns: vec!["id".to_string()],
+            };
+            sched_rt.confidence = ConfidenceLevel::High;
+        }
+
+        let plan = diff_schemas(
+            &live,
+            &code,
+            &DiffOptions {
+                dialect: Some(DatabaseKind::Mysql),
+                coalesce_sqlite_rebuilds: true,
+                include_extensions: false,
+                compare_comments: false,
+                ..DiffOptions::default()
+            },
+        );
+        assert!(plan.is_empty(), "expected zero ops, got: {:?}", plan.operations);
     }
 
     #[test]
