@@ -11,7 +11,7 @@ pub enum ExtensionCommand {
     /// Show manifest details and state of a single installed extension.
     Info(ExtensionIdentifierArgs),
 
-    /// Install a local extension ZIP package without enabling it.
+    /// Install a local extension package (.zip, .tar.gz, or .tgz) without enabling it.
     Install(ExtensionPackageArgs),
 
     /// Replace an installed third-party extension with a strictly newer version.
@@ -61,7 +61,7 @@ pub struct ExtensionDisableArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct ExtensionPackageArgs {
-    /// Path to the local extension ZIP package.
+    /// Path to the local extension archive (.zip, .tar.gz, or .tgz).
     #[arg(value_name = "PACKAGE")]
     pub package: PathBuf,
 
@@ -190,6 +190,33 @@ mod tests {
                 assert_eq!(args.package, std::path::PathBuf::from("pkg_v2.zip"));
                 assert!(args.sha256.is_none());
                 assert!(args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let install_targz = Cli::try_parse_from([
+            "cfms-ctl",
+            "extension",
+            "install",
+            "pkg.tar.gz",
+            "--dry-run",
+        ])
+        .expect("parse install tar.gz");
+        match install_targz.command {
+            Commands::Extension(ExtensionCommand::Install(args)) => {
+                assert_eq!(args.package, std::path::PathBuf::from("pkg.tar.gz"));
+                assert!(args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let upgrade_tgz =
+            Cli::try_parse_from(["cfms-ctl", "extension", "upgrade", "pkg_v2.tgz"])
+                .expect("parse upgrade tgz");
+        match upgrade_tgz.command {
+            Commands::Extension(ExtensionCommand::Upgrade(args)) => {
+                assert_eq!(args.package, std::path::PathBuf::from("pkg_v2.tgz"));
+                assert!(!args.dry_run);
             }
             other => panic!("unexpected command: {other:?}"),
         }

@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use sha2::{Digest, Sha256};
 use tar::{Archive as TarArchive, EntryType};
 use tempfile::TempDir;
@@ -605,10 +605,52 @@ fn extract_zip_raw_entries(package_path: &Path, dest: &Path) -> Result<Extracted
     Ok(ExtractedRawState { files_rel, dirs_rel })
 }
 
+const MAX_TAR_STREAM_BYTES: u64 = MAX_UNCOMPRESSED_BYTES + 32 * 1024 * 1024;
+
+struct BoundedTarStream<R> {
+    inner: R,
+    remaining: u64,
+    limit: u64,
+}
+
+impl<R> BoundedTarStream<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            limit,
+        }
+    }
+}
+
+impl<R: Read> Read for BoundedTarStream<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            let n = self.inner.read(&mut probe)?;
+            if n > 0 {
+                return Err(std::io::Error::other(format!(
+                    "Release tar.gz stream exceeded {}-byte decompressed safety limit",
+                    self.limit
+                )));
+            }
+            return Ok(0);
+        }
+        let max_read = (buf.len() as u64).min(self.remaining) as usize;
+        let n = self.inner.read(&mut buf[..max_read])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 fn extract_targz_raw_entries(package_path: &Path, dest: &Path) -> Result<ExtractedRawState> {
     let file = File::open(package_path)?;
-    let gz = GzDecoder::new(BufReader::with_capacity(64 * 1024, file));
-    let mut archive = TarArchive::new(gz);
+    let gz = MultiGzDecoder::new(BufReader::with_capacity(64 * 1024, file));
+    let bounded_gz = BoundedTarStream::new(gz, MAX_TAR_STREAM_BYTES);
+    let mut archive = TarArchive::new(bounded_gz);
     archive.set_ignore_zeros(false);
 
     let mut remaining_budget = MAX_UNCOMPRESSED_BYTES;
@@ -619,87 +661,100 @@ fn extract_targz_raw_entries(package_path: &Path, dest: &Path) -> Result<Extract
     let mut files_rel = Vec::new();
     let mut dirs_rel = Vec::new();
 
-    let entries = archive.entries().map_err(|err| {
-        CfmsError::ArchiveIntegrity(format!(
-            "Unable to read tar.gz entries in '{}': {err}",
-            package_path.display()
-        ))
-    })?;
-
-    for entry_res in entries {
-        let mut entry = entry_res.map_err(|err| {
+    {
+        let entries = archive.entries().map_err(|err| {
             CfmsError::ArchiveIntegrity(format!(
-                "Corrupt tar.gz entry in '{}': {err}",
+                "Unable to read tar.gz entries in '{}': {err}",
                 package_path.display()
             ))
         })?;
-        count += 1;
-        if count > MAX_ARCHIVE_MEMBERS {
-            return Err(CfmsError::ArchiveIntegrity(format!(
-                "Release archive '{}' exceeds {MAX_ARCHIVE_MEMBERS}-member limit",
-                package_path.display()
-            )));
-        }
 
-        let etype = entry.header().entry_type();
-        let is_dir = match etype {
-            EntryType::Directory => true,
-            EntryType::Regular | EntryType::Continuous => false,
-            _ => {
+        for entry_res in entries {
+            let mut entry = entry_res.map_err(|err| {
+                CfmsError::ArchiveIntegrity(format!(
+                    "Corrupt tar.gz entry in '{}': {err}",
+                    package_path.display()
+                ))
+            })?;
+            count += 1;
+            if count > MAX_ARCHIVE_MEMBERS {
                 return Err(CfmsError::ArchiveIntegrity(format!(
-                    "Unsupported tar entry type '{etype:?}' (symlinks/hardlinks/devices forbidden) in '{}'",
+                    "Release archive '{}' exceeds {MAX_ARCHIVE_MEMBERS}-member limit",
                     package_path.display()
                 )));
             }
-        };
 
-        let raw_path_cow = entry.path_bytes();
-        let raw_name = std::str::from_utf8(&raw_path_cow).map_err(|_| {
-            CfmsError::ArchiveIntegrity(format!(
-                "Non-UTF-8 member path in '{}'",
-                package_path.display()
-            ))
-        })?;
-        let raw_name_owned = raw_name.strip_prefix("./").unwrap_or(raw_name).to_string();
-        if raw_name_owned.is_empty() || raw_name_owned == "." {
-            continue;
-        }
-        let norm = validate_raw_archive_path(&raw_name_owned, is_dir, package_path)?;
-        if norm.is_empty() {
-            continue;
-        }
-        record_path_uniqueness(
-            &norm,
-            is_dir,
-            &mut seen_lower,
-            &mut dir_lower,
-            &mut file_lower,
-            package_path,
-        )?;
+            let etype = entry.header().entry_type();
+            if etype == EntryType::XGlobalHeader {
+                continue;
+            }
+            let is_dir = match etype {
+                EntryType::Directory => true,
+                EntryType::Regular | EntryType::Continuous => false,
+                _ => {
+                    return Err(CfmsError::ArchiveIntegrity(format!(
+                        "Unsupported tar entry type '{etype:?}' (symlinks/hardlinks/devices forbidden) in '{}'",
+                        package_path.display()
+                    )));
+                }
+            };
 
-        let rel_path = Path::new(&norm);
-        if is_dir {
-            ensure_safe_directory_chain(dest, rel_path)?;
-            dirs_rel.push(norm);
-        } else {
-            if let Some(parent) = rel_path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                ensure_safe_directory_chain(dest, parent)?;
+            let raw_path_cow = entry.path_bytes();
+            let raw_name = std::str::from_utf8(&raw_path_cow).map_err(|_| {
+                CfmsError::ArchiveIntegrity(format!(
+                    "Non-UTF-8 member path in '{}'",
+                    package_path.display()
+                ))
+            })?;
+            let raw_name_owned = raw_name.strip_prefix("./").unwrap_or(raw_name).to_string();
+            if raw_name_owned.is_empty() || raw_name_owned == "." {
+                continue;
             }
-            let target = dest.join(rel_path);
-            let mut out = OpenOptions::new().write(true).create_new(true).open(&target)?;
-            copy_bounded_stream(&mut entry, &mut out, &mut remaining_budget, package_path, &norm)?;
-            out.sync_all()?;
-            #[cfg(unix)]
-            if let Ok(mode) = entry.header().mode() {
-                use std::os::unix::fs::PermissionsExt;
-                let safe_mode = (mode & 0o755) | 0o600;
-                fs::set_permissions(&target, fs::Permissions::from_mode(safe_mode))?;
+            let norm = validate_raw_archive_path(&raw_name_owned, is_dir, package_path)?;
+            if norm.is_empty() {
+                continue;
             }
-            files_rel.push(norm);
+            record_path_uniqueness(
+                &norm,
+                is_dir,
+                &mut seen_lower,
+                &mut dir_lower,
+                &mut file_lower,
+                package_path,
+            )?;
+
+            let rel_path = Path::new(&norm);
+            if is_dir {
+                ensure_safe_directory_chain(dest, rel_path)?;
+                dirs_rel.push(norm);
+            } else {
+                if let Some(parent) = rel_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    ensure_safe_directory_chain(dest, parent)?;
+                }
+                let target = dest.join(rel_path);
+                let mut out = OpenOptions::new().write(true).create_new(true).open(&target)?;
+                copy_bounded_stream(&mut entry, &mut out, &mut remaining_budget, package_path, &norm)?;
+                out.sync_all()?;
+                #[cfg(unix)]
+                if let Ok(mode) = entry.header().mode() {
+                    use std::os::unix::fs::PermissionsExt;
+                    let safe_mode = (mode & 0o755) | 0o600;
+                    fs::set_permissions(&target, fs::Permissions::from_mode(safe_mode))?;
+                }
+                files_rel.push(norm);
+            }
         }
     }
+
+    let mut bounded_gz = archive.into_inner();
+    std::io::copy(&mut bounded_gz, &mut std::io::sink()).map_err(|err| {
+        CfmsError::ArchiveIntegrity(format!(
+            "Corrupt or truncated gzip stream in '{}': {err}",
+            package_path.display()
+        ))
+    })?;
 
     Ok(ExtractedRawState { files_rel, dirs_rel })
 }
@@ -959,5 +1014,56 @@ pub(crate) mod tests {
             .unwrap();
         tar.into_inner().unwrap().finish().unwrap();
         assert!(stage_release_archive(&tgz_path, None, None, None).is_err());
+    }
+
+    #[test]
+    fn stages_tgz_multistream_and_pax_global_header() {
+        let tmp = TempDir::new().unwrap();
+        let (entries, _) = build_sample_entries("0.17.0", b"print('v17')\n");
+        let prefix = "cfms-on-websocket-0.17.0";
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut tar = TarBuilder::new(&mut tar_bytes);
+            let mut pax = tar::Header::new_gnu();
+            let pax_data = b"52 comment=0123456789abcdef0123456789abcdef01234567\n";
+            pax.set_entry_type(tar::EntryType::XGlobalHeader);
+            pax.set_size(pax_data.len() as u64);
+            pax.set_mode(0o644);
+            pax.set_cksum();
+            tar.append_data(&mut pax, "pax_global_header", &pax_data[..])
+                .unwrap();
+
+            for (rel, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append_data(&mut header, format!("{prefix}/{rel}"), &data[..])
+                    .unwrap();
+            }
+            tar.finish().unwrap();
+        }
+
+        let split_at = tar_bytes.len() / 2;
+        let mut combined = Vec::new();
+        for chunk in [&tar_bytes[..split_at], &tar_bytes[split_at..]] {
+            let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+            gz.write_all(chunk).unwrap();
+            combined.extend_from_slice(&gz.finish().unwrap());
+        }
+
+        let tgz_path = tmp.path().join("cfms-on-websocket-0.17.0.tgz");
+        fs::write(&tgz_path, &combined).unwrap();
+        let staged = stage_release_archive(&tgz_path, None, None, None).unwrap();
+        assert_eq!(staged.manifest.manifest.version, "0.17.0");
+        assert!(staged.extracted_dir.join("src/main.py").is_file());
+        assert!(!staged.extracted_dir.join("pax_global_header").exists());
+
+        // Trailing non-gzip garbage must fail closed
+        let bad_path = tmp.path().join("cfms-on-websocket-0.17.0-bad.tgz");
+        combined.extend_from_slice(b"TRAILING_GARBAGE");
+        fs::write(&bad_path, &combined).unwrap();
+        assert!(stage_release_archive(&bad_path, None, None, None).is_err());
     }
 }

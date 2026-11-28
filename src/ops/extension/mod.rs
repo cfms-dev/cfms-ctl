@@ -2114,4 +2114,116 @@ mod tests {
         assert!(oidc_audit.contains("\"user_oidc_credentials\":1"));
         verify_pool.close().await;
     }
+
+    fn write_test_targz(
+        pkg_path: &Path,
+        prefix: Option<&str>,
+        manifest: &str,
+        extra_files: &[(&str, &[u8])],
+    ) {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tar::Builder as TarBuilder;
+
+        let file = std::fs::File::create(pkg_path).expect("create tar.gz");
+        let gz = GzEncoder::new(file, Compression::default());
+        let mut tar = TarBuilder::new(gz);
+        let format_name = |name: &str| match prefix {
+            Some(p) => format!("{p}/{name}"),
+            None => name.to_string(),
+        };
+
+        let mut append = |name: String, data: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, data)
+                .expect("append tar entry");
+        };
+
+        append(format_name("manifest.toml"), manifest.as_bytes());
+        append(format_name("_extension.py"), b"# tar extension entrypoint\n");
+        for (name, content) in extra_files {
+            append(format_name(name), content);
+        }
+        let gz = tar.into_inner().expect("finish tar");
+        gz.finish().expect("finish gzip");
+    }
+
+    #[tokio::test]
+    async fn install_and_upgrade_extension_from_targz_and_tgz_packages() {
+        let dir = setup_workspace("[extensions]\nenabled = []\n");
+        let ext_root = dir.path().join("src").join("include").join("extensions");
+        let pkgs_dir = dir.path().join("packages");
+        std::fs::create_dir_all(&pkgs_dir).expect("pkgs dir");
+
+        let v1_pkg = pkgs_dir.join("linux_ext-1.0.0.tar.gz");
+        write_test_targz(
+            &v1_pkg,
+            None,
+            "manifest_version = 3\n[extension]\nidentifier = \"linux_ext\"\nname = \"Linux Ext\"\nversion = \"1.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+            &[("lib/util.py", b"VERSION = 1\n")],
+        );
+
+        let opened_v1 = OpenedExtensionPackage::open_and_verify(&v1_pkg, None).expect("hash v1");
+        let v1_sha = opened_v1.summary.package_sha256.clone();
+        drop(opened_v1);
+
+        let json_no_yes = test_ctx(dir.path(), OutputFormat::Json, false);
+        handle(
+            &json_no_yes,
+            ExtensionCommand::Install(ExtensionPackageArgs {
+                package: v1_pkg.clone(),
+                sha256: Some(v1_sha.clone()),
+                dry_run: true,
+            }),
+        )
+        .await
+        .expect("tar.gz dry-run install succeeds");
+        assert!(!ext_root.join("linux_ext").exists());
+
+        let json_yes = test_ctx(dir.path(), OutputFormat::Json, true);
+        handle(
+            &json_yes,
+            ExtensionCommand::Install(ExtensionPackageArgs {
+                package: v1_pkg,
+                sha256: Some(v1_sha),
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect("tar.gz install succeeds");
+        assert_eq!(
+            std::fs::read_to_string(ext_root.join("linux_ext").join("lib").join("util.py"))
+                .unwrap(),
+            "VERSION = 1\n"
+        );
+
+        // Upgrade via `.tgz` wrapped in a single top-level directory
+        let v2_pkg = pkgs_dir.join("linux_ext-2.0.0.tgz");
+        write_test_targz(
+            &v2_pkg,
+            Some("linux_ext-2.0.0"),
+            "manifest_version = 3\n[extension]\nidentifier = \"linux_ext\"\nname = \"Linux Ext\"\nversion = \"2.0.0\"\nauthors = [\"CFMS\"]\nlicense = \"MIT\"\n",
+            &[("lib/util.py", b"VERSION = 2\n")],
+        );
+
+        handle(
+            &json_yes,
+            ExtensionCommand::Upgrade(ExtensionPackageArgs {
+                package: v2_pkg,
+                sha256: None,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect("tgz upgrade succeeds");
+        assert_eq!(
+            std::fs::read_to_string(ext_root.join("linux_ext").join("lib").join("util.py"))
+                .unwrap(),
+            "VERSION = 2\n"
+        );
+        assert!(!ext_root.join("linux_ext").join("linux_ext-2.0.0").exists());
+    }
 }

@@ -282,7 +282,7 @@ pub struct DeploymentInstallArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct DeploymentAdoptArgs {
-    /// Local CFMS release archive matching the installed files.
+    /// Local CFMS release archive (.zip, .tar.gz, or .tgz) matching the installed files.
     #[arg(value_name = "PACKAGE", required_unless_present = "from_github")]
     pub package: Option<PathBuf>,
 
